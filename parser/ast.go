@@ -168,8 +168,9 @@ func (n *NegativeLookbehind) expr() {}
 
 // Backreference represents a backreference \n or \k<name>
 type Backreference struct {
-	Index int    // 0 if using name
-	Name  string // empty if using index
+	Index      int    // primary group index (1-indexed)
+	Name       string // empty if using numeric index
+	AltIndices []int  // additional group indices for ES2022 duplicate named groups
 }
 
 func (b *Backreference) node() {}

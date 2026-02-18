@@ -403,7 +403,7 @@ func (c *Compiler) compileNamedGroup(g *parser.NamedGroup) error {
 }
 
 func (c *Compiler) compileBackreference(b *parser.Backreference) error {
-	c.emit(vm.Instruction{Op: vm.OpBackref, A: b.Index})
+	c.emit(vm.Instruction{Op: vm.OpBackref, A: b.Index, AltA: b.AltIndices})
 	return nil
 }
 

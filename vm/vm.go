@@ -78,6 +78,7 @@ type Instruction struct {
 	Prop   string      // For unicode properties
 	Class  []ClassAtom // For OpClass
 	Negate bool        // For OpClass
+	AltA   []int       // Alternative group indices (for duplicate named groups in \k<name>)
 }
 
 // RuneRange represents a range of runes
@@ -575,14 +576,28 @@ func (vm *VM) exec(pos, pc int, groups []int) matchResult {
 			return matchResult{matched: false}
 
 		case OpBackref:
-			groupIdx := inst.A - 1 // 1-indexed to 0-indexed
-			if groupIdx < 0 || groupIdx >= vm.NumGroups {
-				return matchResult{matched: false}
+			// For duplicate named groups (ES2022), try all alternative group indices
+			// to find one that participated in the current match.
+			groupIndices := []int{inst.A}
+			for _, altIdx := range inst.AltA {
+				groupIndices = append(groupIndices, altIdx)
 			}
-			start := groups[groupIdx*2+2] // +2 because group 0 is full match
-			end := groups[groupIdx*2+2+1]
+
+			start, end := -1, -1
+			for _, gidx := range groupIndices {
+				groupIdx := gidx - 1 // 1-indexed to 0-indexed
+				if groupIdx < 0 || groupIdx >= vm.NumGroups {
+					continue
+				}
+				s := groups[groupIdx*2+2] // +2 because group 0 is full match
+				e := groups[groupIdx*2+2+1]
+				if s >= 0 && e >= 0 {
+					start, end = s, e
+					break
+				}
+			}
 			if start < 0 || end < 0 {
-				// Group hasn't been captured yet — ECMA-262: match empty string
+				// No group with this name was captured — ECMA-262: match empty string
 				pc++
 				continue
 			}

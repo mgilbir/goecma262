@@ -18,9 +18,9 @@ type Parser struct {
 	peekToken      Token
 	flags          Flags
 	groupCount     int
-	namedGroups    map[string]int // name -> group number
-	backreferences []backrefInfo  // to resolve after parsing
-	depth          int            // current nesting depth
+	namedGroups    map[string][]int // name -> all group numbers (ES2022: duplicates allowed across alternatives)
+	backreferences []backrefInfo    // to resolve after parsing
+	depth          int              // current nesting depth
 }
 
 type backrefInfo struct {
@@ -35,7 +35,7 @@ func New(pattern string, flags Flags) *Parser {
 	p := &Parser{
 		lexer:       l,
 		flags:       flags,
-		namedGroups: make(map[string]int),
+		namedGroups: make(map[string][]int),
 	}
 	// Read two tokens so curToken and peekToken are set
 	p.nextToken()
@@ -66,9 +66,13 @@ func (p *Parser) Parse() (*Pattern, error) {
 	// Resolve backreferences
 	for _, br := range p.backreferences {
 		if br.name != "" {
-			if idx, ok := p.namedGroups[br.name]; ok {
-				br.node.Index = idx
+			if indices, ok := p.namedGroups[br.name]; ok && len(indices) > 0 {
+				br.node.Index = indices[0] // primary index
 				br.node.Name = br.name
+				// For ES2022 duplicate names: store all alternative indices
+				if len(indices) > 1 {
+					br.node.AltIndices = indices[1:]
+				}
 			} else {
 				return nil, fmt.Errorf("unknown named group: %s", br.name)
 			}
@@ -439,9 +443,8 @@ func (p *Parser) parseNamedGroup() (Expression, error) {
 	p.nextToken() // consume >
 
 	p.groupCount++
-	if _, exists := p.namedGroups[name]; !exists {
-		p.namedGroups[name] = p.groupCount
-	}
+	// ES2022: allow duplicate named groups across alternatives; track all indices
+	p.namedGroups[name] = append(p.namedGroups[name], p.groupCount)
 
 	body, err := p.parseDisjunction()
 	if err != nil {

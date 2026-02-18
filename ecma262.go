@@ -524,13 +524,20 @@ func (re *Regexp) expandRepl(repl, src string, groups []int) string {
 
 			if hasNamedGroups {
 				// Pattern has named groups: consume the whole $<name> and look up.
-				// If name doesn't match any group (or is invalid), expand to "".
+				// For ES2022 duplicate names, find whichever group with this name participated.
 				i = nameEnd
 				groupIdx := -1
 				for gi := 1; gi < len(re.names); gi++ {
 					if re.names[gi] == name {
-						groupIdx = gi
-						break
+						// Prefer the group that actually participated in this match
+						if gi*2+1 < len(groups) && groups[gi*2] >= 0 && groups[gi*2+1] >= 0 {
+							groupIdx = gi
+							break
+						}
+						// Remember first match as fallback
+						if groupIdx < 0 {
+							groupIdx = gi
+						}
 					}
 				}
 				if groupIdx >= 0 && groupIdx*2+1 < len(groups) &&
