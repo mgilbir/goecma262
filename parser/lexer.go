@@ -200,8 +200,12 @@ func (l *Lexer) readEscape() Token {
 	case 'd', 'D', 'w', 'W', 's', 'S':
 		return Token{Type: TokenBackslash, Value: "\\" + string(ch), Pos: pos}
 	case 'p', 'P':
-		// Unicode property escape
-		return l.readUnicodeProperty(ch, pos)
+		// Unicode property escape (requires unicode mode)
+		if l.flags.Unicode || l.flags.UnicodeSets {
+			return l.readUnicodeProperty(ch, pos)
+		}
+		// Identity escape when not in unicode mode
+		return Token{Type: TokenLiteral, Value: string(ch), Pos: pos}
 	case 'k':
 		// Named backreference
 		return l.readNamedBackreference(pos)

@@ -4,6 +4,7 @@ package vm
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"unicode"
 	"unicode/utf8"
 )
@@ -770,31 +771,68 @@ func isLineTerminator(r rune) bool {
 }
 
 func matchUnicodeProperty(r rune, prop string) bool {
-	switch prop {
-	case "L", "Letter":
+	name, value := splitUnicodeProperty(prop)
+	if name != "" {
+		if isGeneralCategoryName(name) {
+			return matchUnicodePropertyValue(r, value)
+		}
+		return false
+	}
+	return matchUnicodePropertyValue(r, prop)
+}
+
+func matchUnicodePropertyValue(r rune, prop string) bool {
+	norm := normalizeUnicodeProperty(prop)
+	switch norm {
+	case "l", "letter":
 		return unicode.IsLetter(r)
-	case "N", "Number":
+	case "n", "number":
 		return unicode.IsNumber(r)
-	case "P", "Punctuation":
+	case "p", "punctuation":
 		return unicode.IsPunct(r)
-	case "S", "Symbol":
+	case "s", "symbol":
 		return unicode.IsSymbol(r)
-	case "Z", "Separator":
+	case "z", "separator":
 		return unicode.IsSpace(r)
-	case "C", "Other":
+	case "c", "other":
 		return unicode.IsControl(r)
-	case "Ll":
+	case "ll", "lowercaseletter":
 		return unicode.IsLower(r)
-	case "Lu":
+	case "lu", "uppercaseletter":
 		return unicode.IsUpper(r)
-	case "Lt":
+	case "lt", "titlecaseletter":
 		return unicode.IsTitle(r)
-	case "Nd":
-		// For \p{Nd} (Unicode Number, Decimal Digit), use full Unicode
+	case "nd", "decimalnumber", "digit":
+		// Decimal_Number (Nd) includes all Unicode decimal digits
 		return unicode.IsDigit(r)
-	case "White_Space":
+	case "whitespace":
 		return unicode.IsSpace(r)
 	default:
 		return false
 	}
+}
+
+func splitUnicodeProperty(prop string) (string, string) {
+	parts := strings.SplitN(prop, "=", 2)
+	if len(parts) != 2 {
+		return "", ""
+	}
+	return normalizeUnicodeProperty(parts[0]), parts[1]
+}
+
+func isGeneralCategoryName(name string) bool {
+	switch normalizeUnicodeProperty(name) {
+	case "gc", "generalcategory":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeUnicodeProperty(prop string) string {
+	prop = strings.TrimSpace(prop)
+	prop = strings.ReplaceAll(prop, "_", "")
+	prop = strings.ReplaceAll(prop, "-", "")
+	prop = strings.ReplaceAll(prop, " ", "")
+	return strings.ToLower(prop)
 }

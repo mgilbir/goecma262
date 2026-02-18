@@ -23,9 +23,9 @@ This library implements ECMA-262 regular expressions with support for:
 - ✅ Named capture groups: `(?<name>abc)` and backreferences `\k<name>`
 - ✅ Lookahead: `(?=...)` and `(?!...)`
 - ⚠️ Lookbehind: `(?<=...)` and `(?<!...)` (basic support)
-- ⚠️ Unicode property escapes: `\p{...}` and `\P{...}` (partial)
+- ⚠️ Unicode property escapes: `\p{...}` and `\P{...}` (partial; requires `u`/`v`)
 - ✅ Hex escapes: `\xFF`
-- ✅ Unicode escapes: `\uFFFF` and `\u{...}`
+- ✅ Unicode escapes: `\uFFFF` and `\u{...}` (requires `u`/`v` for code point escapes)
 - ✅ Control characters: `\cA`
 - ✅ Special escapes: `\n`, `\r`, `\t`, `\f`, `\v`
 
@@ -123,6 +123,24 @@ re = ecma262.MustCompile(`\d+(?! dollars)`, flags.Flags(0))
 match = re.FindString("Price: 42 euros") // "42"
 ```
 
+### Unicode Property Escapes (ECMA-262 Feature)
+
+Unicode property escapes require the `u` (Unicode) or `v` (UnicodeSets) flag.
+
+```go
+re := ecma262.MustCompile(`\p{digit}+`, flags.Unicode)
+fmt.Println(re.MatchString("42"))           // true
+fmt.Println(re.MatchString("\u09EA"))       // true (Bengali digit ৪)
+
+re = ecma262.MustCompile(`\p{Nd}+`, flags.Unicode)
+fmt.Println(re.MatchString("\u09EA"))       // true
+
+re = ecma262.MustCompile(`\p{General_Category=Decimal_Number}+`, flags.Unicode)
+fmt.Println(re.MatchString("\u09EA"))       // true
+```
+
+Without `u`/`v`, `\p`/`\P` are treated as identity escapes (literal `p`/`P`).
+
 ### Using All ECMA-262 Flags
 
 ```go
@@ -144,7 +162,7 @@ re, _ := ecma262.Compile(`pattern`, flags.IgnoreCase|flags.Multiline|flags.DotAl
 | `g` | Global - find all matches (used by FindAll functions) |
 | `m` | Multiline - `^` and `$` match start/end of lines |
 | `s` | DotAll - `.` matches newline characters |
-| `u` | Unicode - enable Unicode features |
+| `u` | Unicode - enable Unicode features (required for `\p{...}` and `\u{...}`) |
 | `v` | UnicodeSets - extended Unicode features (cannot use with `u`) |
 | `y` | Sticky - match only from lastIndex position |
 | `d` | HasIndices - include match indices in results |
@@ -187,7 +205,7 @@ go test ./tests/... -bench=. -benchmem
 ## Known Limitations
 
 1. **Lookbehind assertions** - Basic support is implemented but edge cases may not be fully covered
-2. **Unicode property escapes** - Limited to common properties (Letter, Number, Punctuation, etc.)
+2. **Unicode property escapes** - Limited to common properties (Letter, Number, Punctuation, etc.) and selected aliases
 3. **Sticky flag** (`y`) - Not fully implemented in matching semantics
 4. **HasIndices flag** (`d`) - Flag is parsed but indices are not exposed in API yet
 5. **Atomic groups and possessive quantifiers** - Not implemented

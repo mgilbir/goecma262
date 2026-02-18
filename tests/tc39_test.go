@@ -995,6 +995,36 @@ func TestTC39UnicodeProperty_NegLetter(t *testing.T) {
 	}
 }
 
+func TestTC39UnicodeProperty_DigitAliases(t *testing.T) {
+	re := ecma262.MustCompile(`^\p{digit}+$`, flags.Unicode)
+	if !re.MatchString("42") {
+		t.Error(`\p{digit} should match ASCII digits`)
+	}
+	if !re.MatchString("\u09EA\u09E8") { // Bengali digits ৪২
+		t.Error(`\p{digit} should match Bengali digits`)
+	}
+	if re.MatchString("-%#") {
+		t.Error(`\p{digit} should NOT match punctuation`)
+	}
+
+	re = ecma262.MustCompile(`^\p{Nd}+$`, flags.Unicode)
+	if !re.MatchString("\u09EA\u09E8") {
+		t.Error(`\p{Nd} should match Bengali digits`)
+	}
+
+	re = ecma262.MustCompile(`^\p{General_Category=Decimal_Number}+$`, flags.Unicode)
+	if !re.MatchString("\u09EA\u09E8") {
+		t.Error(`\p{General_Category=Decimal_Number} should match Bengali digits`)
+	}
+}
+
+func TestTC39UnicodeProperty_RequiresUnicodeFlag(t *testing.T) {
+	re := ecma262.MustCompile(`^\p+$`, flags.Flags(0))
+	if !re.MatchString("ppp") {
+		t.Error(`\p should be a literal 'p' without unicode flag`)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // MustCompile – panic behavior
 // ---------------------------------------------------------------------------

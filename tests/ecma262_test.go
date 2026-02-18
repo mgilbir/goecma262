@@ -54,44 +54,45 @@ func TestCharacterClasses(t *testing.T) {
 	tests := []struct {
 		name    string
 		pattern string
+		flags   flags.Flags
 		input   string
 		want    bool
 	}{
-		{"digit class", `\d`, "5", true},
-		{"digit class no match", `\d`, "a", false},
-		{"non-digit class", `\D`, "a", true},
-		{"non-digit class no match", `\D`, "5", false},
-		{"word class", `\w`, "a", true},
-		{"word class underscore", `\w`, "_", true},
-		{"word class no match", `\w`, "!", false},
-		{"non-word class", `\W`, "!", true},
-		{"non-word class no match", `\W`, "a", false},
-		{"space class", `\s`, " ", true},
-		{"space class tab", `\s`, "\t", true},
-		{"space class no match", `\s`, "a", false},
-		{"non-space class", `\S`, "a", true},
-		{"non-space class no match", `\S`, " ", false},
-		{"char class match", `[abc]`, "b", true},
-		{"char class no match", `[abc]`, "d", false},
-		{"char class negated", `[^abc]`, "d", true},
-		{"char class negated no match", `[^abc]`, "a", false},
-		{"char class range", `[a-z]`, "m", true},
-		{"char class range no match", `[a-z]`, "5", false},
-		{"class escape digit", `[\d]+`, "123", true},
-		{"class escape non-digit", `[\D]+`, "abc", true},
-		{"class escape word", `[\w]+`, "abc_123", true},
-		{"class escape space", `[\s]+`, " \t", true},
-		{"class escape unicode property", `[\p{L}]+`, "abc", true},
-		{"class escape unicode property negated", `[\P{L}]+`, "123", true},
-		{"class escape unicode property upper", `[\p{Lu}]+`, "ABC", true},
-		{"class escape unicode property upper no match", `[\p{Lu}]+`, "abc", false},
-		{"class negate unicode property", `[^\p{L}]+`, "123", true},
-		{"class negate unicode property no match", `[^\p{L}]+`, "abc", false},
+		{"digit class", `\d`, flags.Flags(0), "5", true},
+		{"digit class no match", `\d`, flags.Flags(0), "a", false},
+		{"non-digit class", `\D`, flags.Flags(0), "a", true},
+		{"non-digit class no match", `\D`, flags.Flags(0), "5", false},
+		{"word class", `\w`, flags.Flags(0), "a", true},
+		{"word class underscore", `\w`, flags.Flags(0), "_", true},
+		{"word class no match", `\w`, flags.Flags(0), "!", false},
+		{"non-word class", `\W`, flags.Flags(0), "!", true},
+		{"non-word class no match", `\W`, flags.Flags(0), "a", false},
+		{"space class", `\s`, flags.Flags(0), " ", true},
+		{"space class tab", `\s`, flags.Flags(0), "\t", true},
+		{"space class no match", `\s`, flags.Flags(0), "a", false},
+		{"non-space class", `\S`, flags.Flags(0), "a", true},
+		{"non-space class no match", `\S`, flags.Flags(0), " ", false},
+		{"char class match", `[abc]`, flags.Flags(0), "b", true},
+		{"char class no match", `[abc]`, flags.Flags(0), "d", false},
+		{"char class negated", `[^abc]`, flags.Flags(0), "d", true},
+		{"char class negated no match", `[^abc]`, flags.Flags(0), "a", false},
+		{"char class range", `[a-z]`, flags.Flags(0), "m", true},
+		{"char class range no match", `[a-z]`, flags.Flags(0), "5", false},
+		{"class escape digit", `[\d]+`, flags.Flags(0), "123", true},
+		{"class escape non-digit", `[\D]+`, flags.Flags(0), "abc", true},
+		{"class escape word", `[\w]+`, flags.Flags(0), "abc_123", true},
+		{"class escape space", `[\s]+`, flags.Flags(0), " \t", true},
+		{"class escape unicode property", `[\p{L}]+`, flags.Unicode, "abc", true},
+		{"class escape unicode property negated", `[\P{L}]+`, flags.Unicode, "123", true},
+		{"class escape unicode property upper", `[\p{Lu}]+`, flags.Unicode, "ABC", true},
+		{"class escape unicode property upper no match", `[\p{Lu}]+`, flags.Unicode, "abc", false},
+		{"class negate unicode property", `[^\p{L}]+`, flags.Unicode, "123", true},
+		{"class negate unicode property no match", `[^\p{L}]+`, flags.Unicode, "abc", false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			re, err := ecma262.Compile(tt.pattern, flags.Flags(0))
+			re, err := ecma262.Compile(tt.pattern, tt.flags)
 			if err != nil {
 				t.Fatalf("Compile error: %v", err)
 			}

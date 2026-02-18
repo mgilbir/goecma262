@@ -135,7 +135,7 @@ func (p *Parser) parseSequence() (Expression, error) {
 			p.curToken.Type == TokenPlus ||
 			p.curToken.Type == TokenQuestion {
 			atom = p.parseQuantifier(atom)
-		} else if p.curToken.Type == TokenLBrace {
+		} else if p.curToken.Type == TokenLBrace && p.peekToken.Type == TokenDigit {
 			quant, err := p.parseBracedQuantifier(atom)
 			if err != nil {
 				return nil, err
@@ -201,6 +201,16 @@ func (p *Parser) parseAtom() (Expression, error) {
 		// Comma is a literal outside of character classes and quantifiers
 		p.nextToken()
 		return &Literal{Char: ','}, nil
+
+	case TokenLBrace:
+		// '{' is a literal when not part of a valid quantifier
+		p.nextToken()
+		return &Literal{Char: '{'}, nil
+
+	case TokenRBrace:
+		// '}' is a literal when not part of a valid quantifier
+		p.nextToken()
+		return &Literal{Char: '}'}, nil
 
 	case TokenHyphen:
 		// Hyphen is a literal outside of character classes
