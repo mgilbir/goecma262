@@ -179,7 +179,8 @@ type VM struct {
 	MaxSteps   int // 0 means use DefaultMaxSteps
 	Err        error
 
-	steps int // current step count
+	steps         int             // current step count
+	visitedSplits map[[2]int]bool // shared cycle detection for empty-match loops
 }
 
 // New creates a new VM with the given code
@@ -204,6 +205,7 @@ func (vm *VM) Match(input string, pos int) (bool, int, []int) {
 	vm.Input = input
 	vm.steps = 0
 	vm.Err = nil
+	vm.visitedSplits = nil // reset per match attempt
 
 	totalGroups := vm.NumGroups + 1
 	groups := make([]int, totalGroups*2)
@@ -471,6 +473,19 @@ func (vm *VM) exec(pos, pc int, groups []int) matchResult {
 			pc = inst.A
 
 		case OpSplit:
+			// Cycle detection: if we've visited this same (pos, pc) before,
+			// the loop body is matching empty strings — exit via branch B.
+			key := [2]int{pos, pc}
+			if vm.visitedSplits == nil {
+				vm.visitedSplits = make(map[[2]int]bool)
+			}
+			if vm.visitedSplits[key] {
+				// Empty-match cycle detected — skip A, take exit (B)
+				pc = inst.B
+				continue
+			}
+			vm.visitedSplits[key] = true
+
 			// Try branch A first; if it fails, try branch B.
 			// Each branch gets its own copy of groups.
 			res := vm.exec(pos, inst.A, copyGroups(groups))

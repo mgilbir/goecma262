@@ -33,6 +33,8 @@ type Regexp struct {
 	multiline  bool
 	dotAll     bool
 	unicode    bool
+	global     bool
+	sticky     bool
 	maxSteps   int
 }
 
@@ -72,6 +74,8 @@ func Compile(expr string, f flags.Flags) (*Regexp, error) {
 		multiline:  f.Has(flags.Multiline),
 		dotAll:     f.Has(flags.DotAll),
 		unicode:    f.Has(flags.Unicode) || f.Has(flags.UnicodeSets),
+		global:     f.Has(flags.Global),
+		sticky:     f.Has(flags.Sticky),
 		maxSteps:   0,
 	}, nil
 }
@@ -391,6 +395,11 @@ func (re *Regexp) ReplaceAllString(src, repl string) string {
 			lastEnd = matchEnd
 			pos = matchEnd
 		}
+
+		// Without the global flag, only replace the first match
+		if !re.global {
+			break
+		}
 	}
 
 	result.WriteString(src[lastEnd:])
@@ -495,20 +504,39 @@ func (re *Regexp) expandRepl(repl, src string, groups []int) string {
 			i++ // skip <
 			end := strings.IndexByte(repl[i:], '>')
 			if end == -1 {
+				// Unclosed $< — emit literally
 				result.WriteString("$<")
 				continue
 			}
 			name := repl[i : i+end]
 			i += end + 1 // skip name and >
 
-			// Find group by name
+			// If the pattern has no named groups, $<name> is a literal (per spec).
+			// Check whether any named group exists (re.names contains non-empty entries beyond index 0).
+			hasNamedGroups := false
+			for gi := 1; gi < len(re.names); gi++ {
+				if re.names[gi] != "" {
+					hasNamedGroups = true
+					break
+				}
+			}
+			if !hasNamedGroups {
+				// No named groups: emit $<name> literally
+				result.WriteString("$<")
+				result.WriteString(name)
+				result.WriteString(">")
+				continue
+			}
+
+			// Find group by name (skip group 0 which always has empty name)
 			groupIdx := -1
-			for gi, gn := range re.names {
-				if gn == name {
+			for gi := 1; gi < len(re.names); gi++ {
+				if re.names[gi] == name {
 					groupIdx = gi
 					break
 				}
 			}
+			// If name not found or group didn't participate in match, expand to ""
 			if groupIdx >= 0 && groupIdx*2+1 < len(groups) &&
 				groups[groupIdx*2] >= 0 && groups[groupIdx*2+1] >= 0 {
 				result.WriteString(src[groups[groupIdx*2]:groups[groupIdx*2+1]])
