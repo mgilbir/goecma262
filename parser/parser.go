@@ -268,6 +268,21 @@ func (p *Parser) parseEscape(val string) (Expression, error) {
 		if err != nil {
 			return nil, err
 		}
+		// In Unicode mode, combine surrogate pairs: \uD800-\uDBFF followed by \uDC00-\uDFFF
+		if (p.flags.Unicode || p.flags.UnicodeSets) && r >= 0xD800 && r <= 0xDBFF {
+			// r is a high surrogate; check if curToken is a low surrogate \uXXXX
+			next := p.curToken
+			if next.Type == TokenLiteral && strings.HasPrefix(next.Value, "\\u") &&
+				!strings.HasPrefix(next.Value, "\\u{") && len(next.Value) == 6 {
+				low, err2 := decodeEscape(next.Value)
+				if err2 == nil && low >= 0xDC00 && low <= 0xDFFF {
+					// Combine into a single code point
+					combined := 0x10000 + (r-0xD800)*0x400 + (low - 0xDC00)
+					p.nextToken() // consume the low surrogate token
+					return &Literal{Char: combined}, nil
+				}
+			}
+		}
 		return &Literal{Char: r}, nil
 	}
 }

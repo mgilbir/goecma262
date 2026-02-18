@@ -11,6 +11,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/mgilbir/goecma262/compiler"
@@ -500,19 +501,19 @@ func (re *Regexp) expandRepl(repl, src string, groups []int) string {
 			}
 			i++
 		case '<':
-			// $<name> → named capture group
-			i++ // skip <
-			end := strings.IndexByte(repl[i:], '>')
+			// $<name> → named capture group (per ECMA-262 GetSubstitution)
+			nameStart := i + 1 // position right after '<'
+			end := strings.IndexByte(repl[i+1:], '>')
 			if end == -1 {
-				// Unclosed $< — emit literally
+				// Unclosed $< — emit $< literally, continue from nameStart
 				result.WriteString("$<")
+				i = nameStart
 				continue
 			}
-			name := repl[i : i+end]
-			i += end + 1 // skip name and >
+			name := repl[nameStart : nameStart+end]
+			nameEnd := nameStart + end + 1 // position after '>'
 
-			// If the pattern has no named groups, $<name> is a literal (per spec).
-			// Check whether any named group exists (re.names contains non-empty entries beyond index 0).
+			// Check whether any named group exists.
 			hasNamedGroups := false
 			for gi := 1; gi < len(re.names); gi++ {
 				if re.names[gi] != "" {
@@ -520,26 +521,27 @@ func (re *Regexp) expandRepl(repl, src string, groups []int) string {
 					break
 				}
 			}
-			if !hasNamedGroups {
-				// No named groups: emit $<name> literally
-				result.WriteString("$<")
-				result.WriteString(name)
-				result.WriteString(">")
-				continue
-			}
 
-			// Find group by name (skip group 0 which always has empty name)
-			groupIdx := -1
-			for gi := 1; gi < len(re.names); gi++ {
-				if re.names[gi] == name {
-					groupIdx = gi
-					break
+			if hasNamedGroups {
+				// Pattern has named groups: consume the whole $<name> and look up.
+				// If name doesn't match any group (or is invalid), expand to "".
+				i = nameEnd
+				groupIdx := -1
+				for gi := 1; gi < len(re.names); gi++ {
+					if re.names[gi] == name {
+						groupIdx = gi
+						break
+					}
 				}
-			}
-			// If name not found or group didn't participate in match, expand to ""
-			if groupIdx >= 0 && groupIdx*2+1 < len(groups) &&
-				groups[groupIdx*2] >= 0 && groups[groupIdx*2+1] >= 0 {
-				result.WriteString(src[groups[groupIdx*2]:groups[groupIdx*2+1]])
+				if groupIdx >= 0 && groupIdx*2+1 < len(groups) &&
+					groups[groupIdx*2] >= 0 && groups[groupIdx*2+1] >= 0 {
+					result.WriteString(src[groups[groupIdx*2]:groups[groupIdx*2+1]])
+				}
+			} else {
+				// No named groups: emit "$<" literally and re-process from nameStart.
+				// This lets any $n references inside the name still expand.
+				result.WriteString("$<")
+				i = nameStart
 			}
 		default:
 			if repl[i] >= '0' && repl[i] <= '9' {
@@ -660,6 +662,15 @@ func (re *Regexp) doMatch(s string, startPos int) []int {
 		MaxSteps:   re.maxSteps,
 	}
 
+	// Sticky flag: only attempt match at startPos (anchored)
+	if re.sticky {
+		matched, _, groups := v.Match(s, startPos)
+		if v.Err != nil || !matched {
+			return nil
+		}
+		return groups
+	}
+
 	// Try different starting positions to find a match
 	for pos := startPos; pos <= len(s); {
 		matched, _, groups := v.Match(s, pos)
@@ -692,6 +703,18 @@ func (re *Regexp) doMatchWithError(s string, startPos int) ([]int, error) {
 		DotAll:     re.dotAll,
 		Unicode:    re.unicode,
 		MaxSteps:   re.maxSteps,
+	}
+
+	// Sticky flag: only attempt match at startPos (anchored)
+	if re.sticky {
+		matched, _, groups := v.Match(s, startPos)
+		if v.Err != nil {
+			return nil, v.Err
+		}
+		if !matched {
+			return nil, nil
+		}
+		return groups, nil
 	}
 
 	for pos := startPos; pos <= len(s); {
@@ -732,6 +755,31 @@ func MatchString(pattern string, f flags.Flags, s string) (matched bool, err err
 		return false, err
 	}
 	return re.MatchString(s), nil
+}
+
+// isValidIdentifierName reports whether s is a valid ECMAScript IdentifierName.
+// An IdentifierName starts with $, _, or a Unicode letter (ID_Start),
+// followed by $, _, digits, or Unicode letters/combining marks (ID_Continue).
+func isValidIdentifierName(s string) bool {
+	if s == "" {
+		return false
+	}
+	first := true
+	for _, r := range s {
+		if first {
+			if r == '$' || r == '_' || unicode.IsLetter(r) {
+				first = false
+				continue
+			}
+			return false
+		}
+		if r == '$' || r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r) ||
+			r == 0x200C || r == 0x200D {
+			continue
+		}
+		return false
+	}
+	return !first
 }
 
 // Helper functions
