@@ -635,10 +635,15 @@ func TestTC39NamedGroups_DuplicateNamesSameAlternative_Error(t *testing.T) {
 	}
 }
 
-func TestTC39NamedGroups_UnicodeNameRequiresUnicodeFlag(t *testing.T) {
-	_, err := ecma262.Compile(`(?<π>a)`, flags.Flags(0))
-	if err == nil {
-		t.Fatal("expected error for unicode group name without unicode flag")
+func TestTC39NamedGroups_UnicodeNameAllowedWithoutUnicodeFlag(t *testing.T) {
+	// Per ECMA-262 spec, unicode identifiers in group names are valid
+	// regardless of the u flag (since ES2018, group names follow UnicodeIDStart).
+	re, err := ecma262.Compile(`(?<π>a)`, flags.Flags(0))
+	if err != nil {
+		t.Fatalf("expected no error for unicode group name without unicode flag: %v", err)
+	}
+	if !re.MatchString("a") {
+		t.Error("expected match")
 	}
 }
 

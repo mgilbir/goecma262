@@ -163,8 +163,14 @@ func (l *Lexer) makeQuantifierToken(tt TokenType, ch byte) Token {
 	return Token{Type: tt, Value: string(ch), Pos: pos}
 }
 
-// isGreedy returns whether the quantifier token is greedy
+// isGreedy returns whether the quantifier token is greedy (not lazy).
+// For *, +, and {n,m}: greedy if no trailing '?', non-greedy if trailing '?'.
+// For the ? quantifier itself: greedy if value is "?", non-greedy if value is "??".
 func (t Token) isGreedy() bool {
+	if t.Type == TokenQuestion {
+		// "?" is greedy (0-or-1), "??" is non-greedy (0-or-1 lazy)
+		return t.Value == "?"
+	}
 	return !strings.HasSuffix(t.Value, "?")
 }
 

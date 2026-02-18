@@ -124,16 +124,30 @@ func (c *Compiler) compileDisjunction(d *parser.Disjunction) error {
 		return c.compileNode(d.Alternatives[0])
 	}
 
-	// For alternation: split L1, L2; L1: alt1; jmp Lend; L2: alt2; jmp Lend; ...
-	altStarts := make([]int, len(d.Alternatives))
+	// Correct NFA structure for alternation (a|b|c|...):
+	//   split1[A=alt1_body, B=split2]
+	//   alt1_body
+	//   jmp end
+	//   split2[A=alt2_body, B=split3]
+	//   alt2_body
+	//   jmp end
+	//   ...
+	//   last_alt_body
+	//   end:
+	//
+	// Each split's B must point to the NEXT split, not the next body.
+	// This ensures the engine tries each alternative in order.
+
 	splitIdxs := make([]int, 0, len(d.Alternatives)-1)
 	jumpIdxs := make([]int, 0, len(d.Alternatives)-1)
 
-	// Emit splits for all but the last alternative
 	for i := 0; i < len(d.Alternatives)-1; i++ {
+		// Emit split: A=body (patched below), B=next split (patched below)
 		splitIdx := c.emit(vm.Instruction{Op: vm.OpSplit, A: 0, B: 0})
 		splitIdxs = append(splitIdxs, splitIdx)
-		altStarts[i] = len(c.code) // Position after the split
+
+		// Patch A to point to this alternative's body (immediately after the split)
+		c.code[splitIdx].A = len(c.code)
 
 		// Compile this alternative
 		err := c.compileNode(d.Alternatives[i])
@@ -141,13 +155,22 @@ func (c *Compiler) compileDisjunction(d *parser.Disjunction) error {
 			return err
 		}
 
-		// Jump to end after this alternative
+		// Jump to end after this alternative succeeds
 		jumpIdx := c.emit(vm.Instruction{Op: vm.OpJmp, A: 0})
 		jumpIdxs = append(jumpIdxs, jumpIdx)
+
+		// Patch previous split's B to point to this new split (or the last alt body)
+		if i > 0 {
+			c.code[splitIdxs[i-1]].B = splitIdx
+		}
 	}
 
-	// Last alternative (no split, no jump)
-	altStarts[len(d.Alternatives)-1] = len(c.code)
+	// Patch first split's B to point to second split (if >2 alternatives, already done above)
+	// For exactly 2 alternatives, patch split[0].B to the last alt body
+	// For >2, the last split's B needs to point to the last alt body
+	lastAltStart := len(c.code)
+
+	// Last alternative (no split, no jump needed)
 	err := c.compileNode(d.Alternatives[len(d.Alternatives)-1])
 	if err != nil {
 		return err
@@ -155,11 +178,8 @@ func (c *Compiler) compileDisjunction(d *parser.Disjunction) error {
 
 	endPos := len(c.code)
 
-	// Patch all splits
-	for i, splitIdx := range splitIdxs {
-		c.code[splitIdx].A = altStarts[i]   // Try this alternative
-		c.code[splitIdx].B = altStarts[i+1] // Or try next alternative
-	}
+	// Patch the last split's B to point to the last alternative body
+	c.code[splitIdxs[len(splitIdxs)-1]].B = lastAltStart
 
 	// Patch all jumps to end
 	for _, jumpIdx := range jumpIdxs {
@@ -228,38 +248,60 @@ func (c *Compiler) compileQuantifier(q *parser.Quantifier) error {
 	}
 
 	if q.Min == 0 && q.Max == -1 {
-		// * quantifier: split L1, L2; L1: body; jmp split; L2:
-		splitIdx := c.emit(vm.Instruction{Op: vm.OpSplit, A: 0, B: 0})
-		bodyStart := len(c.code)
+		if q.Greedy {
+			// Greedy *: use OpGreedyLoop for proper ECMA-262 maximum-match semantics
+			loopIdx := c.emit(vm.Instruction{Op: vm.OpGreedyLoop, A: 0, B: 0})
+			bodyStart := len(c.code)
 
-		err := c.compileNode(q.Body)
-		if err != nil {
-			return err
-		}
+			err := c.compileNode(q.Body)
+			if err != nil {
+				return err
+			}
 
-		c.emit(vm.Instruction{Op: vm.OpJmp, A: splitIdx})
+			c.code[loopIdx].A = bodyStart
+			c.code[loopIdx].B = len(c.code)
+		} else {
+			// Non-greedy *?: prefer to exit immediately, then try body
+			// Structure: loopStart: split[A=exit, B=body]; body; jmp loopStart; exit:
+			loopStart := len(c.code)
+			splitIdx := c.emit(vm.Instruction{Op: vm.OpSplit, A: 0, B: 0})
 
-		c.code[splitIdx].A = bodyStart   // Try to match body
-		c.code[splitIdx].B = len(c.code) // Or skip to after
+			bodyStart := len(c.code)
+			err := c.compileNode(q.Body)
+			if err != nil {
+				return err
+			}
+			c.emit(vm.Instruction{Op: vm.OpJmp, A: loopStart})
 
-		if !q.Greedy {
-			c.code[splitIdx].A, c.code[splitIdx].B = c.code[splitIdx].B, c.code[splitIdx].A
+			exitPos := len(c.code)
+			c.code[splitIdx].A = exitPos   // A=exit (preferred for non-greedy)
+			c.code[splitIdx].B = bodyStart // B=body
 		}
 
 	} else if q.Min == 1 && q.Max == -1 {
-		// + quantifier: L1: body; split L1, L2; L2:
-		bodyStart := len(c.code)
+		// + quantifier: body; greedyloop1[body, exit]
+		if q.Greedy {
+			loopIdx := c.emit(vm.Instruction{Op: vm.OpGreedyLoop1, A: 0, B: 0})
+			bodyStart := len(c.code)
 
-		err := c.compileNode(q.Body)
-		if err != nil {
-			return err
-		}
+			err := c.compileNode(q.Body)
+			if err != nil {
+				return err
+			}
 
-		splitIdx := c.emit(vm.Instruction{Op: vm.OpSplit, A: bodyStart, B: 0})
-		c.code[splitIdx].B = len(c.code)
+			c.code[loopIdx].A = bodyStart
+			c.code[loopIdx].B = len(c.code)
+		} else {
+			// Non-greedy +?: match body once then prefer to exit (lazy)
+			bodyStart := len(c.code)
 
-		if !q.Greedy {
-			c.code[splitIdx].A, c.code[splitIdx].B = c.code[splitIdx].B, c.code[splitIdx].A
+			err := c.compileNode(q.Body)
+			if err != nil {
+				return err
+			}
+
+			splitIdx := c.emit(vm.Instruction{Op: vm.OpSplit, A: 0, B: bodyStart})
+			c.code[splitIdx].A = len(c.code) // A=exit (preferred for non-greedy)
 		}
 
 	} else if q.Min == 0 && q.Max == 1 {
@@ -291,41 +333,62 @@ func (c *Compiler) compileQuantifier(q *parser.Quantifier) error {
 		}
 
 		if q.Max == -1 {
-			// {n,} - unlimited: add a star-like loop
-			loopStart := len(c.code)
-			splitIdx := c.emit(vm.Instruction{Op: vm.OpSplit, A: 0, B: 0})
-
-			bodyStartForLoop := len(c.code)
-			err := c.compileNode(q.Body)
-			if err != nil {
-				return err
-			}
-
-			c.emit(vm.Instruction{Op: vm.OpJmp, A: loopStart})
-
-			c.code[splitIdx].A = bodyStartForLoop
-			c.code[splitIdx].B = len(c.code)
-
-			if !q.Greedy {
-				c.code[splitIdx].A, c.code[splitIdx].B = c.code[splitIdx].B, c.code[splitIdx].A
-			}
-		} else if q.Max > q.Min {
-			// {n,m} - limited optional matches
-			optionalCount := q.Max - q.Min
-			for i := 0; i < optionalCount; i++ {
-				splitIdx := c.emit(vm.Instruction{Op: vm.OpSplit, A: 0, B: 0})
-				bodyStartOpt := len(c.code)
+			// {n,} - unlimited tail: use greedy loop for proper semantics
+			if q.Greedy {
+				loopIdx := c.emit(vm.Instruction{Op: vm.OpGreedyLoop, A: 0, B: 0})
+				bodyStartForLoop := len(c.code)
 
 				err := c.compileNode(q.Body)
 				if err != nil {
 					return err
 				}
 
-				c.code[splitIdx].A = bodyStartOpt
-				c.code[splitIdx].B = len(c.code)
+				c.code[loopIdx].A = bodyStartForLoop
+				c.code[loopIdx].B = len(c.code)
+			} else {
+				// Non-greedy {n,}: prefer to exit, then try body
+				loopStart := len(c.code)
+				splitIdx := c.emit(vm.Instruction{Op: vm.OpSplit, A: 0, B: 0})
 
-				if !q.Greedy {
-					c.code[splitIdx].A, c.code[splitIdx].B = c.code[splitIdx].B, c.code[splitIdx].A
+				bodyStartForLoop := len(c.code)
+				err := c.compileNode(q.Body)
+				if err != nil {
+					return err
+				}
+
+				c.emit(vm.Instruction{Op: vm.OpJmp, A: loopStart})
+				// Non-greedy: prefer B (exit) over A (body)
+				c.code[splitIdx].A = len(c.code)      // exit
+				c.code[splitIdx].B = bodyStartForLoop // body
+			}
+		} else if q.Max > q.Min {
+			optionalCount := q.Max - q.Min
+			if q.Greedy {
+				// Greedy {n,m}: use OpGreedyLoopN with max=optionalCount
+				loopIdx := c.emit(vm.Instruction{Op: vm.OpGreedyLoopN, A: 0, B: 0, Extra: optionalCount})
+				bodyStart := len(c.code)
+
+				err := c.compileNode(q.Body)
+				if err != nil {
+					return err
+				}
+
+				c.code[loopIdx].A = bodyStart
+				c.code[loopIdx].B = len(c.code)
+			} else {
+				// Non-greedy {n,m}: prefer exit at each step
+				for i := 0; i < optionalCount; i++ {
+					splitIdx := c.emit(vm.Instruction{Op: vm.OpSplit, A: 0, B: 0})
+					bodyStartOpt := len(c.code)
+
+					err := c.compileNode(q.Body)
+					if err != nil {
+						return err
+					}
+
+					// Non-greedy: A=exit, B=body
+					c.code[splitIdx].B = bodyStartOpt
+					c.code[splitIdx].A = len(c.code)
 				}
 			}
 		}

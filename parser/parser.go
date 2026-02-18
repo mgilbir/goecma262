@@ -586,6 +586,21 @@ func (p *Parser) parseCharacterClass() (Expression, error) {
 
 	// Use TokenRBracket (not TokenRBrace) to terminate character classes
 	for p.curToken.Type != TokenRBracket && p.curToken.Type != TokenEOF {
+		// Multi-digit tokens inside character classes must be split into
+		// individual digit literals because the lexer reads contiguous digits
+		// as a single TokenDigit (e.g. [1234567] → TokenDigit "1234567").
+		// We expand them here so each character becomes its own atom.
+		if p.curToken.Type == TokenDigit && len(p.curToken.Value) > 1 {
+			digits := []rune(p.curToken.Value)
+			// Consume the token and inject individual single-char digit tokens
+			// by re-processing each rune. We do this by temporarily replacing
+			// the token with single-char versions and advancing manually.
+			p.nextToken() // consume the multi-digit token
+			for _, d := range digits {
+				atoms = append(atoms, &ClassLiteral{Char: d})
+			}
+			continue
+		}
 		if p.curToken.Type == TokenHyphen && len(atoms) > 0 {
 			// Check if this is a range
 			prevLiteral, ok := atoms[len(atoms)-1].(*ClassLiteral)
