@@ -141,6 +141,11 @@ func (p *Parser) parseSequence() (Expression, error) {
 				return nil, err
 			}
 			atom = quant
+			// Check for non-greedy modifier after braced quantifier
+			if p.curToken.Type == TokenQuestion {
+				p.nextToken()
+				quant.Greedy = false
+			}
 		}
 
 		elements = append(elements, atom)
