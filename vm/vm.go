@@ -737,10 +737,18 @@ func (vm *VM) executeLookahead(startPC, endPC, pos int, groups []int) bool {
 		MaxSteps:   vm.MaxSteps,
 	}
 
-	matched, _, _ := subVM.Match(vm.Input, pos)
+	matched, _, subGroups := subVM.Match(vm.Input, pos)
 	if subVM.Err != nil {
 		vm.Err = subVM.Err
 		return false
+	}
+	if matched && subGroups != nil {
+		// Propagate captures from lookahead body back into outer groups
+		for i := 0; i < len(subGroups) && i < len(groups); i++ {
+			if subGroups[i] >= 0 {
+				groups[i] = subGroups[i]
+			}
+		}
 	}
 	return matched
 }
@@ -783,12 +791,20 @@ func (vm *VM) executeLookbehind(startPC, endPC, pos int, groups []int) bool {
 
 	// Try every possible start position before pos
 	for tryPos := 0; tryPos <= pos; tryPos++ {
-		matched, endPos, _ := subVM.Match(vm.Input, tryPos)
+		matched, endPos, subGroups := subVM.Match(vm.Input, tryPos)
 		if subVM.Err != nil {
 			vm.Err = subVM.Err
 			return false
 		}
 		if matched && endPos == pos {
+			// Propagate captures from lookbehind body back into outer groups
+			if subGroups != nil {
+				for i := 0; i < len(subGroups) && i < len(groups); i++ {
+					if subGroups[i] >= 0 {
+						groups[i] = subGroups[i]
+					}
+				}
+			}
 			return true
 		}
 	}
