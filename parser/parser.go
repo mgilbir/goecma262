@@ -222,6 +222,23 @@ func (p *Parser) parseAtom() (Expression, error) {
 		p.nextToken()
 		return &Literal{Char: '-'}, nil
 
+	case TokenDigit:
+		// Digits are literal characters in the pattern body.
+		// The lexer may return multiple contiguous digits as one token (e.g. "12"),
+		// so we consume only the first character and leave the rest for next call.
+		val := p.curToken.Value
+		if len(val) == 0 {
+			return nil, fmt.Errorf("empty digit token")
+		}
+		firstChar := rune(val[0])
+		if len(val) > 1 {
+			// Leave remaining digits as curToken (don't advance the lexer)
+			p.curToken = Token{Type: TokenDigit, Value: val[1:], Pos: p.curToken.Pos + 1}
+		} else {
+			p.nextToken()
+		}
+		return &Literal{Char: firstChar}, nil
+
 	default:
 		return nil, fmt.Errorf("unexpected token: %s", p.curToken.Value)
 	}

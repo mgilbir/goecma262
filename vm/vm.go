@@ -202,6 +202,13 @@ type matchResult struct {
 // Returns (matched, endPos, groups).
 // Uses recursive backtracking so each branch gets its own copy of state.
 func (vm *VM) Match(input string, pos int) (bool, int, []int) {
+	return vm.matchWithInitialGroups(input, pos, nil)
+}
+
+// matchWithInitialGroups is like Match but pre-initializes the groups slice
+// with values from outerGroups (used to pass captures from outer match into
+// lookahead/lookbehind sub-VMs for backreference resolution).
+func (vm *VM) matchWithInitialGroups(input string, pos int, outerGroups []int) (bool, int, []int) {
 	vm.Input = input
 	vm.steps = 0
 	vm.Err = nil
@@ -211,6 +218,12 @@ func (vm *VM) Match(input string, pos int) (bool, int, []int) {
 	groups := make([]int, totalGroups*2)
 	for i := range groups {
 		groups[i] = -1
+	}
+	// Pre-seed with outer groups if provided (for backreference resolution in lookarounds)
+	if outerGroups != nil {
+		for i := 0; i < len(outerGroups) && i < len(groups); i++ {
+			groups[i] = outerGroups[i]
+		}
 	}
 
 	res := vm.exec(pos, 0, groups)
@@ -737,7 +750,8 @@ func (vm *VM) executeLookahead(startPC, endPC, pos int, groups []int) bool {
 		MaxSteps:   vm.MaxSteps,
 	}
 
-	matched, _, subGroups := subVM.Match(vm.Input, pos)
+	// Pass outer groups so backreferences inside lookahead can see prior captures
+	matched, _, subGroups := subVM.matchWithInitialGroups(vm.Input, pos, groups)
 	if subVM.Err != nil {
 		vm.Err = subVM.Err
 		return false
@@ -791,7 +805,8 @@ func (vm *VM) executeLookbehind(startPC, endPC, pos int, groups []int) bool {
 
 	// Try every possible start position before pos
 	for tryPos := 0; tryPos <= pos; tryPos++ {
-		matched, endPos, subGroups := subVM.Match(vm.Input, tryPos)
+		// Pass outer groups so backreferences inside lookbehind can see prior captures
+		matched, endPos, subGroups := subVM.matchWithInitialGroups(vm.Input, tryPos, groups)
 		if subVM.Err != nil {
 			vm.Err = subVM.Err
 			return false
