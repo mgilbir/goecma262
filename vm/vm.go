@@ -932,9 +932,68 @@ func matchUnicodeProperty(r rune, prop string) bool {
 		if isGeneralCategoryName(name) {
 			return matchUnicodePropertyValue(r, value)
 		}
+		if isScriptName(name) {
+			return matchUnicodeScript(r, value)
+		}
+		if isPropertyOfStrings(name) {
+			// Property of strings (e.g. Emoji_Presentation) — treat as false for single char
+			return false
+		}
 		return false
 	}
-	return matchUnicodePropertyValue(r, prop)
+	// Binary property or general category shorthand
+	return matchUnicodeBinaryOrCategory(r, prop)
+}
+
+func matchUnicodeScript(r rune, script string) bool {
+	// Normalize script name
+	norm := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(script, "_", ""), " ", ""))
+	// Look up in Go's unicode.Scripts table
+	for name, rangeTable := range unicode.Scripts {
+		if strings.ToLower(strings.ReplaceAll(name, "_", "")) == norm {
+			return unicode.Is(rangeTable, r)
+		}
+	}
+	// Also check unicode.Categories as some scripts are there
+	return false
+}
+
+func isScriptName(name string) bool {
+	switch name {
+	case "script", "sc":
+		return true
+	}
+	return false
+}
+
+func isPropertyOfStrings(name string) bool {
+	return false // simplified
+}
+
+func matchUnicodeBinaryOrCategory(r rune, prop string) bool {
+	norm := normalizeUnicodeProperty(prop)
+	switch norm {
+	// Binary properties
+	case "ascii":
+		return r <= 0x7F
+	case "alphanumeric", "alnum":
+		return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
+	case "alpha":
+		return unicode.IsLetter(r)
+	case "any":
+		return true
+	case "assigned":
+		return r != unicode.ReplacementChar && unicode.IsGraphic(r)
+	case "id_continue", "idcontinue":
+		return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == 0x200C || r == 0x200D
+	case "id_start", "idstart":
+		return unicode.IsLetter(r) || r == '_'
+	case "emoji":
+		return unicode.Is(unicode.So, r) || r == 0x23 || r == 0x2A || (r >= 0x30 && r <= 0x39)
+	// General categories (same as matchUnicodePropertyValue)
+	default:
+		return matchUnicodePropertyValue(r, prop)
+	}
 }
 
 func matchUnicodePropertyValue(r rune, prop string) bool {
