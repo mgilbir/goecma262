@@ -472,23 +472,17 @@ func tokenRune(tok Token) (rune, bool) {
 }
 
 func isIdentifierStartRune(r rune, unicodeMode bool) bool {
-	if unicodeMode {
-		if r == '$' || r == '_' {
-			return true
-		}
-		return unicode.IsLetter(r) || unicode.In(r, unicode.Nl)
+	if r == '$' || r == '_' {
+		return true
 	}
-	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r == '$' || r == '_'
+	return unicode.IsLetter(r) || unicode.In(r, unicode.Nl)
 }
 
 func isIdentifierPartRune(r rune, unicodeMode bool) bool {
-	if unicodeMode {
-		if isIdentifierStartRune(r, true) {
-			return true
-		}
-		return unicode.IsDigit(r) || unicode.In(r, unicode.Mn, unicode.Mc, unicode.Nd, unicode.Pc)
+	if isIdentifierStartRune(r, unicodeMode) {
+		return true
 	}
-	return isIdentifierStartRune(r, false) || (r >= '0' && r <= '9')
+	return unicode.IsDigit(r) || unicode.In(r, unicode.Mn, unicode.Mc, unicode.Nd, unicode.Pc)
 }
 
 type nameSet map[string]struct{}
