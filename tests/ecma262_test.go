@@ -105,10 +105,14 @@ func TestCharacterClasses(t *testing.T) {
 	}
 }
 
-func TestLookbehindFixedLength(t *testing.T) {
-	_, err := ecma262.Compile(`(?<=a+)b`, flags.Flags(0))
-	if err == nil {
-		t.Fatal("expected error for variable-length lookbehind")
+func TestLookbehindVariableLength(t *testing.T) {
+	// Variable-length lookbehind is supported; (?<=a+)b should match "b" in "aab".
+	re, err := ecma262.Compile(`(?<=a+)b`, flags.Flags(0))
+	if err != nil {
+		t.Fatalf("Compile error: %v", err)
+	}
+	if !re.MatchString("aab") {
+		t.Fatal("expected match for variable-length lookbehind")
 	}
 }
 
@@ -350,7 +354,7 @@ func TestReplaceAll(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			re, err := ecma262.Compile(tt.pattern, flags.Flags(0))
+			re, err := ecma262.Compile(tt.pattern, flags.Global)
 			if err != nil {
 				t.Fatalf("Compile error: %v", err)
 			}

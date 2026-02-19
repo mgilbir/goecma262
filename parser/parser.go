@@ -173,7 +173,10 @@ func (p *Parser) parseAtom() (Expression, error) {
 	case TokenLiteral:
 		val := p.curToken.Value
 		p.nextToken()
-		if strings.HasPrefix(val, "\\") {
+		// If the value starts with \ and has at least 2 chars, it's an escape
+		// sequence that needs decoding (e.g. \uXXXX, \xHH, \n, etc.).
+		// A single \ means the lexer already decoded it to a literal backslash.
+		if strings.HasPrefix(val, "\\") && len(val) >= 2 {
 			return p.parseEscape(val)
 		}
 		if len(val) == 1 {
@@ -225,6 +228,26 @@ func (p *Parser) parseAtom() (Expression, error) {
 		// Hyphen is a literal outside of character classes
 		p.nextToken()
 		return &Literal{Char: '-'}, nil
+
+	case TokenColon:
+		p.nextToken()
+		return &Literal{Char: ':'}, nil
+
+	case TokenEquals:
+		p.nextToken()
+		return &Literal{Char: '='}, nil
+
+	case TokenLess:
+		p.nextToken()
+		return &Literal{Char: '<'}, nil
+
+	case TokenGreater:
+		p.nextToken()
+		return &Literal{Char: '>'}, nil
+
+	case TokenExclaim:
+		p.nextToken()
+		return &Literal{Char: '!'}, nil
 
 	case TokenDigit:
 		// Digits are literal characters in the pattern body.
@@ -283,6 +306,12 @@ func (p *Parser) parseEscape(val string) (Expression, error) {
 		if ch >= '1' && ch <= '9' {
 			// Backreference
 			return p.parseBackreference(val)
+		}
+		// \u{...} code point escape: only valid in unicode mode in pattern body.
+		if ch == 'u' && len(val) > 3 && val[2] == '{' {
+			if !(p.flags.Unicode || p.flags.UnicodeSets) {
+				return nil, fmt.Errorf("unicode code point escape requires unicode flag")
+			}
 		}
 		// Character escape
 		r, err := decodeEscape(val)
@@ -459,40 +488,115 @@ func (p *Parser) parseNamedGroup() (Expression, error) {
 	return &NamedGroup{Name: name, Body: body}, nil
 }
 
-// parseGroupName parses a group name identifier
+// parseGroupName parses a group name identifier.
+// ECMA-262 allows Unicode identifier names in group names, including:
+//   - Direct Unicode characters (including astral-plane chars as UTF-8)
+//   - \uXXXX and \u{XXXX} escape sequences
+//   - Surrogate pairs \uD800-\uDBFF followed by \uDC00-\uDFFF
+//   - $ (TokenDollar) as identifier start
+//   - Digits (TokenDigit) as identifier continuation
 func (p *Parser) parseGroupName() (string, error) {
 	var sb strings.Builder
 	unicodeMode := p.flags.Unicode || p.flags.UnicodeSets
 
-	// First character must be identifier start
-	if p.curToken.Type != TokenLiteral {
-		return "", fmt.Errorf("expected group name")
+	// readGroupNameRune tries to decode one identifier rune from the current token.
+	// Returns (rune, decoded, ok) where decoded=true means a rune was consumed.
+	readGroupNameRune := func() (rune, bool) {
+		tok := p.curToken
+		switch tok.Type {
+		case TokenDollar:
+			p.nextToken()
+			return '$', true
+		case TokenLiteral:
+			// Could be a direct char, a \uXXXX escape, or a \u{...} escape.
+			val := tok.Value
+			if strings.HasPrefix(val, "\\u") {
+				// Decode to rune
+				r, err := decodeEscape(val)
+				if err != nil {
+					return 0, false
+				}
+				p.nextToken()
+				// Handle surrogate pairs: if this is a high surrogate, look ahead
+				// for a matching low surrogate (\uDC00-\uDFFF).
+				if r >= 0xD800 && r <= 0xDBFF {
+					next := p.curToken
+					if next.Type == TokenLiteral && strings.HasPrefix(next.Value, "\\u") &&
+						!strings.HasPrefix(next.Value, "\\u{") {
+						low, err2 := decodeEscape(next.Value)
+						if err2 == nil && low >= 0xDC00 && low <= 0xDFFF {
+							combined := 0x10000 + (r-0xD800)*0x400 + (low - 0xDC00)
+							p.nextToken()
+							return combined, true
+						}
+					}
+				}
+				return r, true
+			}
+			// Direct character (possibly multi-byte astral).
+			r, size := utf8.DecodeRuneInString(val)
+			if r == utf8.RuneError && size == 1 {
+				return 0, false
+			}
+			p.nextToken()
+			return r, true
+		default:
+			return 0, false
+		}
 	}
 
-	r, ok := tokenRune(p.curToken)
+	// First character must be identifier start.
+	// Special-case: $ is a valid identifier start.
+	var firstRune rune
+	var ok bool
+	switch p.curToken.Type {
+	case TokenDollar:
+		firstRune = '$'
+		p.nextToken()
+		ok = true
+	case TokenLiteral:
+		firstRune, ok = readGroupNameRune()
+	default:
+		return "", fmt.Errorf("expected group name")
+	}
 	if !ok {
 		return "", fmt.Errorf("invalid group name start")
 	}
-	if !isIdentifierStartRune(r, unicodeMode) {
-		return "", fmt.Errorf("invalid group name start: %c", r)
+	if !isIdentifierStartRune(firstRune, unicodeMode) {
+		return "", fmt.Errorf("invalid group name start: %c", firstRune)
 	}
-	sb.WriteRune(r)
-	p.nextToken()
+	sb.WriteRune(firstRune)
 
-	// Rest must be identifier part
-	for p.curToken.Type == TokenLiteral {
-		r, ok = tokenRune(p.curToken)
-		if !ok {
-			break
+	// Rest must be identifier part characters.
+	for {
+		tok := p.curToken
+		switch tok.Type {
+		case TokenLiteral:
+			r, decoded := readGroupNameRune()
+			if !decoded {
+				return sb.String(), nil
+			}
+			if !isIdentifierPartRune(r, unicodeMode) {
+				// Not a valid continuation; can't put the token back easily,
+				// but this shouldn't happen in valid patterns.
+				return sb.String(), nil
+			}
+			sb.WriteRune(r)
+		case TokenDigit:
+			// Digits are valid identifier continuation characters.
+			val := tok.Value
+			p.nextToken()
+			for _, d := range val {
+				sb.WriteRune(d)
+			}
+		case TokenDollar:
+			// $ is also valid as a continuation.
+			sb.WriteRune('$')
+			p.nextToken()
+		default:
+			return sb.String(), nil
 		}
-		if !isIdentifierPartRune(r, unicodeMode) {
-			break
-		}
-		sb.WriteRune(r)
-		p.nextToken()
 	}
-
-	return sb.String(), nil
 }
 
 func tokenRune(tok Token) (rune, bool) {
@@ -762,11 +866,31 @@ func (p *Parser) parseClassAtom() (ClassAtom, error) {
 		r, _ := utf8.DecodeRuneInString(val)
 		return &ClassLiteral{Char: r}, nil
 
+	case TokenHyphen:
+		p.nextToken()
+		return &ClassLiteral{Char: '-'}, nil
+
+	case TokenColon:
+		p.nextToken()
+		return &ClassLiteral{Char: ':'}, nil
+
+	case TokenEquals:
+		p.nextToken()
+		return &ClassLiteral{Char: '='}, nil
+
+	case TokenLess:
+		p.nextToken()
+		return &ClassLiteral{Char: '<'}, nil
+
+	case TokenGreater:
+		p.nextToken()
+		return &ClassLiteral{Char: '>'}, nil
+
+	case TokenExclaim:
+		p.nextToken()
+		return &ClassLiteral{Char: '!'}, nil
+
 	default:
-		if p.curToken.Type == TokenHyphen {
-			p.nextToken()
-			return &ClassLiteral{Char: '-'}, nil
-		}
 		return nil, fmt.Errorf("unexpected token in character class: %s (type %d)", p.curToken.Value, p.curToken.Type)
 	}
 }

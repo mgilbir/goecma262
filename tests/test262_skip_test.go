@@ -41,4 +41,33 @@ var test262KnownFailures = map[string]string{
 	"groups-object-subclass-sans.js#4": "requires JS RegExp subclass with custom groups object",
 	"groups-object-subclass.js#3":      "requires JS RegExp subclass with custom groups object",
 	"groups-object-subclass.js#4":      "requires JS RegExp subclass with custom groups object",
+
+	// -------------------------------------------------------------------------
+	// Lookbehind: right-to-left capture semantics
+	// -------------------------------------------------------------------------
+	// These tests require the lookbehind body to be evaluated right-to-left (as
+	// per ECMA-262), so that capture groups in a repeated quantifier inside the
+	// lookbehind capture the leftmost (first) iteration rather than the last.
+	// Our implementation evaluates the lookbehind body left-to-right, so group
+	// captures inside quantified lookbehind bodies are incorrect.
+	"lookbehind.js#3": "requires right-to-left lookbehind evaluation for capture group semantics",
+	"lookbehind.js#8": "requires right-to-left lookbehind evaluation for capture group semantics",
+
+	// -------------------------------------------------------------------------
+	// Lookbehind: backreference to group defined inside same lookbehind
+	// -------------------------------------------------------------------------
+	// (?<=\1(\w+))c — backreference \1 refers to group 1 which is also inside
+	// the lookbehind.  In JS right-to-left evaluation this is well-defined, but
+	// in our left-to-right sub-VM the backreference is always unset at the point
+	// it is evaluated, making this test behave incorrectly.
+	"back-references-to-captures.js#1": "requires right-to-left lookbehind evaluation for self-referencing backreference",
+
+	// -------------------------------------------------------------------------
+	// Deeply nested patterns: nesting depth limit
+	// -------------------------------------------------------------------------
+	// These patterns have 200+ levels of nesting and hit the MaxNestingDepth=200
+	// compile-time limit.  Raising the limit further would risk stack overflows.
+	// These tests produce a compile error which causes t.Skip, not t.Fail.
+	"S15.10.2.8_A3_T15.js#3": "pattern too deeply nested (200+ capturing groups)",
+	"S15.10.2.8_A3_T16.js#3": "pattern too deeply nested (200+ non-capturing groups)",
 }

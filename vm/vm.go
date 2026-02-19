@@ -68,6 +68,9 @@ const (
 
 	// Group reset for quantifier body repeats (ES2022 group-reset semantics)
 	OpResetGroups // Reset groups[A..B] (inclusive, 1-indexed) to -1
+
+	// Position anchor used in lookbehind sub-VMs: succeeds only if current pos == A.
+	OpRequirePos
 )
 
 // Instruction represents a single VM instruction
@@ -691,6 +694,14 @@ func (vm *VM) exec(pos, pc int, groups []int) matchResult {
 			groups = newGroups
 			pc++
 
+		case OpRequirePos:
+			// Succeed only if the current position equals inst.A.
+			// Used in lookbehind sub-VMs to anchor the match end.
+			if pos != inst.A {
+				return matchResult{matched: false}
+			}
+			pc++
+
 		default:
 			return matchResult{matched: false}
 		}
@@ -801,13 +812,16 @@ func (vm *VM) executeLookahead(startPC, endPC, pos int, groups []int) bool {
 }
 
 // executeLookbehind tries matching the lookbehind body ending at the current position.
-// It tries progressively longer prefixes ending at pos.
+// It tries progressively longer prefixes ending at pos using a sub-VM anchored at pos.
 func (vm *VM) executeLookbehind(startPC, endPC, pos int, groups []int) bool {
-	// Build a sub-VM with only the lookbehind body + OpMatch
+	// Build a sub-VM with only the lookbehind body.
+	// We append OpRequirePos (checks pos==target) then OpMatch at the end.
+	// This allows the VM backtracker to naturally find a match ending at pos.
 	bodyLen := endPC - startPC
-	subCode := make([]Instruction, bodyLen+1)
+	subCode := make([]Instruction, bodyLen+2)
 	copy(subCode, vm.Code[startPC:endPC])
-	subCode[bodyLen] = Instruction{Op: OpMatch}
+	subCode[bodyLen] = Instruction{Op: OpRequirePos, A: pos}
+	subCode[bodyLen+1] = Instruction{Op: OpMatch}
 
 	for i := range subCode[:bodyLen] {
 		switch subCode[i].Op {
@@ -836,15 +850,16 @@ func (vm *VM) executeLookbehind(startPC, endPC, pos int, groups []int) bool {
 		MaxSteps:   vm.MaxSteps,
 	}
 
-	// Try every possible start position before pos
+	// Try every possible start position before pos.
+	// The sub-VM will backtrack to find an execution path that ends exactly at pos.
 	for tryPos := 0; tryPos <= pos; tryPos++ {
 		// Pass outer groups so backreferences inside lookbehind can see prior captures
-		matched, endPos, subGroups := subVM.matchWithInitialGroups(vm.Input, tryPos, groups)
+		matched, _, subGroups := subVM.matchWithInitialGroups(vm.Input, tryPos, groups)
 		if subVM.Err != nil {
 			vm.Err = subVM.Err
 			return false
 		}
-		if matched && endPos == pos {
+		if matched {
 			// Propagate captures from lookbehind body back into outer groups
 			if subGroups != nil {
 				for i := 0; i < len(subGroups) && i < len(groups); i++ {

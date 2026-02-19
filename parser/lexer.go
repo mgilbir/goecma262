@@ -324,10 +324,8 @@ func (l *Lexer) readUnicodeEscape(pos int) Token {
 	l.readChar() // consume u; now l.ch = first hex digit (or '{')
 
 	if l.ch == '{' {
-		// Unicode code point escape: \u{...} requires Unicode mode.
-		if !(l.flags.Unicode || l.flags.UnicodeSets) {
-			return Token{Type: TokenError, Value: "unicode code point escape requires unicode flag", Pos: pos}
-		}
+		// Unicode code point escape. Allowed in group names in all modes;
+		// the parser will reject it in the pattern body when not in unicode mode.
 		return l.readUnicodeCodePointEscape(pos)
 	}
 

@@ -272,30 +272,24 @@ func (c *Compiler) compileQuantifier(q *parser.Quantifier) error {
 		}
 
 	} else if q.Min == 1 && q.Max == -1 {
-		// + quantifier: body once (mandatory), then loop like *
-		// First match body once:
+		// + quantifier: body once (mandatory), then loop back to body start.
+		// Structure: bodyStart: <body>; split[A=bodyStart, B=exit] (greedy)
+		// This reuses the same group slots on each iteration (correct JS semantics).
+		bodyStart := len(c.code)
 		err := c.compileNode(q.Body)
 		if err != nil {
 			return err
 		}
-		// Then optionally repeat:
-		loopStart := len(c.code)
+
 		splitIdx := c.emit(vm.Instruction{Op: vm.OpSplit, A: 0, B: 0})
-
-		bodyStart2 := len(c.code)
-		err = c.compileNode(q.Body)
-		if err != nil {
-			return err
-		}
-		c.emit(vm.Instruction{Op: vm.OpJmp, A: loopStart})
-
 		exitPos := len(c.code)
+
 		if q.Greedy {
-			c.code[splitIdx].A = bodyStart2 // greedy: prefer more body
+			c.code[splitIdx].A = bodyStart // greedy: loop back to body
 			c.code[splitIdx].B = exitPos
 		} else {
 			c.code[splitIdx].A = exitPos // non-greedy: prefer exit
-			c.code[splitIdx].B = bodyStart2
+			c.code[splitIdx].B = bodyStart
 		}
 
 	} else if q.Min == 0 && q.Max == 1 {
@@ -497,9 +491,6 @@ func (c *Compiler) compileNegativeLookahead(l *parser.NegativeLookahead) error {
 }
 
 func (c *Compiler) compileLookbehind(l *parser.Lookbehind) error {
-	if _, ok := fixedLength(l.Body); !ok {
-		return fmt.Errorf("lookbehind must be fixed length")
-	}
 	jmpIdx := c.emit(vm.Instruction{Op: vm.OpJmp, A: 0})
 
 	bodyStart := len(c.code)
@@ -519,9 +510,6 @@ func (c *Compiler) compileLookbehind(l *parser.Lookbehind) error {
 }
 
 func (c *Compiler) compileNegativeLookbehind(l *parser.NegativeLookbehind) error {
-	if _, ok := fixedLength(l.Body); !ok {
-		return fmt.Errorf("lookbehind must be fixed length")
-	}
 	jmpIdx := c.emit(vm.Instruction{Op: vm.OpJmp, A: 0})
 
 	bodyStart := len(c.code)
