@@ -71,6 +71,19 @@ console.log(
   `captured ${captured} cases from ${assertCount} assert.sameValue calls (files scanned: ${filesScanned}, failed: ${filesFailed}) -> ${outPath}`
 );
 
+// coerceLastIndexForJSON converts a JS lastIndex value to an integer suitable
+// for JSON serialization, following ECMA-262 ToIntegerOrInfinity semantics.
+// NaN and non-numeric values become 0; negative values become 0;
+// Infinity becomes a large sentinel (2^31-1); finite values are truncated.
+function coerceLastIndexForJSON(v) {
+  if (v === undefined || v === null) return 0;
+  const n = Number(v);
+  if (Number.isNaN(n)) return 0;
+  if (n <= 0) return 0;
+  if (!Number.isFinite(n) || n > 2147483647) return 2147483647; // MaxInt32 sentinel
+  return Math.trunc(n);
+}
+
 function listJSFiles(dir) {
   const out = [];
   const entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -135,6 +148,7 @@ function runFile(relPath, content, harnessFiles) {
       input: call.input,
       expected,
       matchIndex,
+      lastIndex: coerceLastIndexForJSON(call.extra.lastIndex),
       replaceWith: call.extra.replaceWith ?? null,
       splitLimit: call.extra.splitLimit ?? null,
     });
@@ -150,34 +164,39 @@ function runFile(relPath, content, harnessFiles) {
     const origReplace = String.prototype.replace;
     const origSplit = String.prototype.split;
     RegExp.prototype.test = function(input) {
+      const lastIndex = this.lastIndex;
       const res = origTest.call(this, input);
-      globalThis.__recordCall("test", this, input, res);
+      globalThis.__recordCall("test", this, input, res, { lastIndex });
       return res;
     };
     RegExp.prototype.exec = function(input) {
+      const lastIndex = this.lastIndex;
       const res = origExec.call(this, input);
-      globalThis.__recordCall("exec", this, input, res);
+      globalThis.__recordCall("exec", this, input, res, { lastIndex });
       return res;
     };
     String.prototype.match = function(re) {
+      const lastIndex = (re instanceof RegExp) ? re.lastIndex : 0;
       const res = origMatch.call(this, re);
       if (re instanceof RegExp) {
-        globalThis.__recordCall("string_match", re, String(this), res);
+        globalThis.__recordCall("string_match", re, String(this), res, { lastIndex });
       }
       return res;
     };
     String.prototype.replace = function(re, replacement) {
+      const lastIndex = (re instanceof RegExp) ? re.lastIndex : 0;
       const res = origReplace.call(this, re, replacement);
       if (re instanceof RegExp) {
-        globalThis.__recordCall("string_replace", re, String(this), res, { replaceWith: String(replacement) });
+        globalThis.__recordCall("string_replace", re, String(this), res, { replaceWith: String(replacement), lastIndex });
       }
       return res;
     };
     String.prototype.split = function(sep, limit) {
+      const lastIndex = (sep instanceof RegExp) ? sep.lastIndex : 0;
       const res = origSplit.call(this, sep, limit);
       if (sep instanceof RegExp) {
         const lim = typeof limit === "number" ? limit : null;
-        globalThis.__recordCall("string_split", sep, String(this), res, { splitLimit: lim });
+        globalThis.__recordCall("string_split", sep, String(this), res, { splitLimit: lim, lastIndex });
       }
       return res;
     };

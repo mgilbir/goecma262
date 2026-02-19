@@ -65,6 +65,9 @@ const (
 	// Unicode properties
 	OpUnicodeProp    // Match unicode property \p{...}
 	OpNotUnicodeProp // Match not unicode property \P{...}
+
+	// Group reset for quantifier body repeats (ES2022 group-reset semantics)
+	OpResetGroups // Reset groups[A..B] (inclusive, 1-indexed) to -1
 )
 
 // Instruction represents a single VM instruction
@@ -163,6 +166,8 @@ func (i Instruction) String() string {
 		return fmt.Sprintf("unicode-prop %s", i.Prop)
 	case OpNotUnicodeProp:
 		return fmt.Sprintf("not-unicode-prop %s", i.Prop)
+	case OpResetGroups:
+		return fmt.Sprintf("reset-groups %d..%d", i.A, i.B)
 	default:
 		return fmt.Sprintf("unknown(%d)", i.Op)
 	}
@@ -671,6 +676,19 @@ func (vm *VM) exec(pos, pc int, groups []int) matchResult {
 				return matchResult{matched: false}
 			}
 			pos += size
+			pc++
+
+		case OpResetGroups:
+			// Reset groups[A..B] (inclusive, 1-indexed) to -1
+			// Used to implement ECMA-262 group-reset semantics for quantifier body repeats.
+			newGroups := copyGroups(groups)
+			for g := inst.A; g <= inst.B; g++ {
+				if g*2+1 < len(newGroups) {
+					newGroups[g*2] = -1
+					newGroups[g*2+1] = -1
+				}
+			}
+			groups = newGroups
 			pc++
 
 		default:

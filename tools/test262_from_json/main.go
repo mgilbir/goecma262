@@ -20,6 +20,7 @@ type jsonCase struct {
 	Input       string  `json:"input"`
 	Expected    any     `json:"expected"`
 	MatchIndex  *int    `json:"matchIndex"`
+	LastIndex   any     `json:"lastIndex"` // may be number, string, or object (coerced to int)
 	ReplaceWith *string `json:"replaceWith"`
 	SplitLimit  *int    `json:"splitLimit"`
 }
@@ -38,6 +39,7 @@ type goCase struct {
 	Expect      string
 	Index       int
 	Limit       int
+	LastIndex   int
 	ReplaceWith string
 }
 
@@ -81,7 +83,32 @@ func main() {
 	fmt.Printf("generated %d go cases -> %s\n", len(cases), outPath)
 }
 
+// coerceLastIndex converts a JSON lastIndex value (already pre-processed by
+// coerceLastIndexForJSON in extract.js) to an int. The JS side already applies
+// ECMA-262 ToIntegerOrInfinity semantics, so we just need to handle the
+// JSON number type.
+func coerceLastIndex(v any) int {
+	if v == nil {
+		return 0
+	}
+	switch x := v.(type) {
+	case float64:
+		if x != x { // NaN (shouldn't happen after JS processing)
+			return 0
+		}
+		if x < 0 {
+			return 0
+		}
+		if x > 2147483647 {
+			return 2147483647
+		}
+		return int(x)
+	}
+	return 0
+}
+
 func convertCase(c jsonCase) (goCase, bool) {
+	li := coerceLastIndex(c.LastIndex)
 	switch c.Method {
 	case "test":
 		b, ok := c.Expected.(bool)
@@ -89,24 +116,31 @@ func convertCase(c jsonCase) (goCase, bool) {
 			return goCase{}, false
 		}
 		return goCase{
-			Name:    c.Name,
-			File:    c.File,
-			Pattern: c.Pattern,
-			Flags:   c.Flags,
-			Input:   c.Input,
-			Kind:    "match",
-			Expect:  strconv.FormatBool(b),
+			Name:      c.Name,
+			File:      c.File,
+			Pattern:   c.Pattern,
+			Flags:     c.Flags,
+			Input:     c.Input,
+			Kind:      "match",
+			Expect:    strconv.FormatBool(b),
+			LastIndex: li,
 		}, true
 	case "exec":
 		if c.Expected == nil {
+			// If matchIndex is set, this is an undefined group element from a successful exec
+			// (extraction artifact from d-flag or unmatched-group tests) — skip it.
+			if c.MatchIndex != nil {
+				return goCase{}, false
+			}
 			return goCase{
-				Name:    c.Name,
-				File:    c.File,
-				Pattern: c.Pattern,
-				Flags:   c.Flags,
-				Input:   c.Input,
-				Kind:    "match",
-				Expect:  "false",
+				Name:      c.Name,
+				File:      c.File,
+				Pattern:   c.Pattern,
+				Flags:     c.Flags,
+				Input:     c.Input,
+				Kind:      "match",
+				Expect:    "false",
+				LastIndex: li,
 			}, true
 		}
 		s, ok := c.Expected.(string)
@@ -118,25 +152,31 @@ func convertCase(c jsonCase) (goCase, bool) {
 			index = *c.MatchIndex
 		}
 		return goCase{
-			Name:    c.Name,
-			File:    c.File,
-			Pattern: c.Pattern,
-			Flags:   c.Flags,
-			Input:   c.Input,
-			Kind:    "submatch",
-			Expect:  s,
-			Index:   index,
+			Name:      c.Name,
+			File:      c.File,
+			Pattern:   c.Pattern,
+			Flags:     c.Flags,
+			Input:     c.Input,
+			Kind:      "submatch",
+			Expect:    s,
+			Index:     index,
+			LastIndex: li,
 		}, true
 	case "string_match":
 		if c.Expected == nil {
+			// If matchIndex is set, this is an undefined group element — skip it.
+			if c.MatchIndex != nil {
+				return goCase{}, false
+			}
 			return goCase{
-				Name:    c.Name,
-				File:    c.File,
-				Pattern: c.Pattern,
-				Flags:   c.Flags,
-				Input:   c.Input,
-				Kind:    "match",
-				Expect:  "false",
+				Name:      c.Name,
+				File:      c.File,
+				Pattern:   c.Pattern,
+				Flags:     c.Flags,
+				Input:     c.Input,
+				Kind:      "match",
+				Expect:    "false",
+				LastIndex: li,
 			}, true
 		}
 		s, ok := c.Expected.(string)
@@ -146,38 +186,41 @@ func convertCase(c jsonCase) (goCase, bool) {
 		if c.MatchIndex != nil {
 			if strings.Contains(c.Flags, "g") {
 				return goCase{
-					Name:    c.Name,
-					File:    c.File,
-					Pattern: c.Pattern,
-					Flags:   c.Flags,
-					Input:   c.Input,
-					Kind:    "findall",
-					Expect:  s,
-					Index:   *c.MatchIndex,
+					Name:      c.Name,
+					File:      c.File,
+					Pattern:   c.Pattern,
+					Flags:     c.Flags,
+					Input:     c.Input,
+					Kind:      "findall",
+					Expect:    s,
+					Index:     *c.MatchIndex,
+					LastIndex: li,
 				}, true
 			}
 			return goCase{
-				Name:    c.Name,
-				File:    c.File,
-				Pattern: c.Pattern,
-				Flags:   c.Flags,
-				Input:   c.Input,
-				Kind:    "submatch",
-				Expect:  s,
-				Index:   *c.MatchIndex,
+				Name:      c.Name,
+				File:      c.File,
+				Pattern:   c.Pattern,
+				Flags:     c.Flags,
+				Input:     c.Input,
+				Kind:      "submatch",
+				Expect:    s,
+				Index:     *c.MatchIndex,
+				LastIndex: li,
 			}, true
 		}
 		if strings.Contains(c.Flags, "g") {
 			return goCase{}, false
 		}
 		return goCase{
-			Name:    c.Name,
-			File:    c.File,
-			Pattern: c.Pattern,
-			Flags:   c.Flags,
-			Input:   c.Input,
-			Kind:    "find",
-			Expect:  s,
+			Name:      c.Name,
+			File:      c.File,
+			Pattern:   c.Pattern,
+			Flags:     c.Flags,
+			Input:     c.Input,
+			Kind:      "find",
+			Expect:    s,
+			LastIndex: li,
 		}, true
 	case "string_replace":
 		s, ok := c.Expected.(string)
@@ -193,6 +236,7 @@ func convertCase(c jsonCase) (goCase, bool) {
 			Kind:        "replace",
 			Expect:      s,
 			ReplaceWith: *c.ReplaceWith,
+			LastIndex:   li,
 		}, true
 	case "string_split":
 		s, ok := c.Expected.(string)
@@ -204,15 +248,16 @@ func convertCase(c jsonCase) (goCase, bool) {
 			limit = *c.SplitLimit
 		}
 		return goCase{
-			Name:    c.Name,
-			File:    c.File,
-			Pattern: c.Pattern,
-			Flags:   c.Flags,
-			Input:   c.Input,
-			Kind:    "split",
-			Expect:  s,
-			Index:   *c.MatchIndex,
-			Limit:   limit,
+			Name:      c.Name,
+			File:      c.File,
+			Pattern:   c.Pattern,
+			Flags:     c.Flags,
+			Input:     c.Input,
+			Kind:      "split",
+			Expect:    s,
+			Index:     *c.MatchIndex,
+			Limit:     limit,
+			LastIndex: li,
 		}, true
 	default:
 		return goCase{}, false
@@ -242,12 +287,12 @@ func writeGo(outPath string, cases []goCase) error {
 	if _, err := fmt.Fprintln(f, "var test262GeneratedCases = []struct {"); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintln(f, "\tname string\n\tfile string\n\tpattern string\n\tflags string\n\tinput string\n\tkind string\n\texpect string\n\tindex int\n\tlimit int\n\treplaceWith string\n} {"); err != nil {
+	if _, err := fmt.Fprintln(f, "\tname string\n\tfile string\n\tpattern string\n\tflags string\n\tinput string\n\tkind string\n\texpect string\n\tindex int\n\tlimit int\n\tlastIndex int\n\treplaceWith string\n} {"); err != nil {
 		return err
 	}
 
 	for _, c := range cases {
-		line := fmt.Sprintf("\t{%s, %s, %s, %s, %s, %s, %s, %d, %d, %s},",
+		line := fmt.Sprintf("\t{%s, %s, %s, %s, %s, %s, %s, %d, %d, %d, %s},",
 			strconv.Quote(c.Name),
 			strconv.Quote(c.File),
 			strconv.Quote(c.Pattern),
@@ -257,6 +302,7 @@ func writeGo(outPath string, cases []goCase) error {
 			strconv.Quote(c.Expect),
 			c.Index,
 			c.Limit,
+			c.LastIndex,
 			strconv.Quote(c.ReplaceWith),
 		)
 		if _, err := fmt.Fprintln(f, line); err != nil {
@@ -292,6 +338,9 @@ func writeGo(outPath string, cases []goCase) error {
 		return err
 	}
 	if _, err := fmt.Fprintln(f, "\t\t\tif err != nil {\n\t\t\t\tif strict {\n\t\t\t\t\tt.Fatalf(\"%s: compile error for %q: %v\", tc.file, tc.pattern, err)\n\t\t\t\t}\n\t\t\t\tt.Skipf(\"%s: compile error for %q: %v\", tc.file, tc.pattern, err)\n\t\t\t\treturn\n\t\t\t}"); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintln(f, "\t\t\tre.SetLastIndex(tc.lastIndex)"); err != nil {
 		return err
 	}
 	if _, err := fmt.Fprintln(f, "\t\t\tswitch tc.kind {\n\t\t\tcase \"match\":\n\t\t\t\tgot := re.MatchString(tc.input)\n\t\t\t\twant := tc.expect == \"true\"\n\t\t\t\tif got != want {\n\t\t\t\t\tt.Fatalf(\"%s: /%s/%s.MatchString(%q) = %v, want %v\", tc.file, tc.pattern, tc.flags, tc.input, got, want)\n\t\t\t\t}\n\t\t\tcase \"find\":\n\t\t\t\tgot := re.FindString(tc.input)\n\t\t\t\tif got != tc.expect {\n\t\t\t\t\tt.Fatalf(\"%s: /%s/%s.FindString(%q) = %q, want %q\", tc.file, tc.pattern, tc.flags, tc.input, got, tc.expect)\n\t\t\t\t}\n\t\t\tcase \"submatch\":\n\t\t\t\tgot := re.FindStringSubmatch(tc.input)\n\t\t\t\tif got == nil || tc.index >= len(got) {\n\t\t\t\t\tt.Fatalf(\"%s: /%s/%s.FindStringSubmatch(%q) missing index %d\", tc.file, tc.pattern, tc.flags, tc.input, tc.index)\n\t\t\t\t}\n\t\t\t\tif got[tc.index] != tc.expect {\n\t\t\t\t\tt.Fatalf(\"%s: /%s/%s.FindStringSubmatch(%q)[%d] = %q, want %q\", tc.file, tc.pattern, tc.flags, tc.input, tc.index, got[tc.index], tc.expect)\n\t\t\t\t}\n\t\t\tcase \"findall\":\n\t\t\t\tgot := re.FindAllString(tc.input, -1)\n\t\t\t\tif tc.index >= len(got) {\n\t\t\t\t\tt.Fatalf(\"%s: /%s/%s.FindAllString(%q) missing index %d\", tc.file, tc.pattern, tc.flags, tc.input, tc.index)\n\t\t\t\t}\n\t\t\t\tif got[tc.index] != tc.expect {\n\t\t\t\t\tt.Fatalf(\"%s: /%s/%s.FindAllString(%q)[%d] = %q, want %q\", tc.file, tc.pattern, tc.flags, tc.input, tc.index, got[tc.index], tc.expect)\n\t\t\t\t}\n\t\t\tcase \"replace\":\n\t\t\t\tgot := re.ReplaceAllString(tc.input, tc.replaceWith)\n\t\t\t\tif got != tc.expect {\n\t\t\t\t\tt.Fatalf(\"%s: /%s/%s.ReplaceAllString(%q, %q) = %q, want %q\", tc.file, tc.pattern, tc.flags, tc.input, tc.replaceWith, got, tc.expect)\n\t\t\t\t}\n\t\t\tcase \"split\":\n\t\t\t\tgot := re.Split(tc.input, tc.limit)\n\t\t\t\tif tc.index >= len(got) {\n\t\t\t\t\tt.Fatalf(\"%s: /%s/%s.Split(%q, %d) missing index %d\", tc.file, tc.pattern, tc.flags, tc.input, tc.limit, tc.index)\n\t\t\t\t}\n\t\t\t\tif got[tc.index] != tc.expect {\n\t\t\t\t\tt.Fatalf(\"%s: /%s/%s.Split(%q, %d)[%d] = %q, want %q\", tc.file, tc.pattern, tc.flags, tc.input, tc.limit, tc.index, got[tc.index], tc.expect)\n\t\t\t\t}\n\t\t\tdefault:\n\t\t\t\tt.Skipf(\"%s: unsupported case kind %s\", tc.file, tc.kind)\n\t\t\t}\n\t\t})\n\t}\n}\n"); err != nil {

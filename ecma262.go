@@ -21,7 +21,8 @@ import (
 )
 
 // Regexp is the representation of a compiled ECMA-262 regular expression.
-// It is safe for concurrent use by multiple goroutines.
+// It is safe for concurrent use by multiple goroutines unless SetLastIndex
+// is used, which makes the instance stateful.
 type Regexp struct {
 	expr      string
 	flags     flags.Flags
@@ -37,6 +38,10 @@ type Regexp struct {
 	global     bool
 	sticky     bool
 	maxSteps   int
+
+	// lastIndex is the starting position for the next match when using g or y flags.
+	// It is set by SetLastIndex and used by stateful match operations.
+	lastIndex int
 }
 
 // Compile parses a regular expression and returns, if successful,
@@ -100,9 +105,14 @@ func CompileFlags(expr string, flagStr string) (*Regexp, error) {
 	return Compile(expr, f)
 }
 
-// MatchString reports whether the string s contains any match of the regular expression
+// MatchString reports whether the string s contains any match of the regular expression.
+// For patterns with the g or y flag, matching starts at re.lastIndex.
 func (re *Regexp) MatchString(s string) bool {
-	return re.doMatch(s, 0) != nil
+	startPos := 0
+	if re.global || re.sticky {
+		startPos = re.lastIndex
+	}
+	return re.doMatch(s, startPos) != nil
 }
 
 // SetMaxSteps sets the maximum VM instruction steps for each match operation.
@@ -112,6 +122,20 @@ func (re *Regexp) SetMaxSteps(max int) {
 		max = 0
 	}
 	re.maxSteps = max
+}
+
+// SetLastIndex sets the starting position for the next match operation.
+// For patterns with the g (global) or y (sticky) flag, this determines
+// where searching begins. For patterns without these flags, lastIndex is ignored.
+// This method makes the Regexp instance stateful; callers are responsible
+// for synchronization when using across goroutines.
+func (re *Regexp) SetLastIndex(n int) {
+	re.lastIndex = n
+}
+
+// LastIndex returns the current lastIndex value.
+func (re *Regexp) LastIndex() int {
+	return re.lastIndex
 }
 
 // MatchStringErr reports whether the string s contains any match of the regular expression.
@@ -208,9 +232,14 @@ func (re *Regexp) FindStringIndexErr(s string) ([]int, error) {
 
 // FindStringSubmatch returns a slice of strings holding the text of the leftmost
 // match of the regular expression in s and the matches, if any, of its subexpressions.
+// For patterns with the g or y flag, matching starts at re.lastIndex.
 // A return value of nil indicates no match.
 func (re *Regexp) FindStringSubmatch(s string) []string {
-	groups := re.doMatch(s, 0)
+	startPos := 0
+	if re.global || re.sticky {
+		startPos = re.lastIndex
+	}
+	groups := re.doMatch(s, startPos)
 	if groups == nil {
 		return nil
 	}

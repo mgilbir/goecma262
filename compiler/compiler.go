@@ -318,8 +318,22 @@ func (c *Compiler) compileQuantifier(q *parser.Quantifier) error {
 	} else {
 		// {n,m} quantifier
 
+		// Detect whether the body has duplicate named groups (ES2022).
+		// If so, apply group-reset semantics (reuse same group slots per iteration,
+		// reset them at the start of each new iteration).
+		// Otherwise, use the classic unrolling approach (separate group slots per iteration)
+		// which happens to produce the expected result for non-duplicate-name patterns.
+		dupNames := bodyHasDuplicateNamedGroups(q.Body)
+		groupCountBefore := c.groupCount
+
 		// Emit body q.Min times (required minimum)
 		for i := 0; i < q.Min; i++ {
+			if i > 0 && dupNames {
+				// Reset captured groups from the previous iteration before the next one.
+				c.emit(vm.Instruction{Op: vm.OpResetGroups, A: groupCountBefore + 1, B: c.groupCount})
+				// Reuse the same group slots for subsequent iterations.
+				c.groupCount = groupCountBefore
+			}
 			err := c.compileNode(q.Body)
 			if err != nil {
 				return err
@@ -328,9 +342,17 @@ func (c *Compiler) compileQuantifier(q *parser.Quantifier) error {
 
 		if q.Max == -1 {
 			// {n,} - unlimited tail: loop like * using OpSplit
+			groupCountAfterBody := c.groupCount
 			loopStart := len(c.code)
 			splitIdx := c.emit(vm.Instruction{Op: vm.OpSplit, A: 0, B: 0})
 
+			if dupNames {
+				// Emit reset at start of loop body (group-reset semantics)
+				if groupCountAfterBody > groupCountBefore {
+					c.emit(vm.Instruction{Op: vm.OpResetGroups, A: groupCountBefore + 1, B: groupCountAfterBody})
+				}
+				c.groupCount = groupCountBefore
+			}
 			bodyStartForLoop := len(c.code)
 			err := c.compileNode(q.Body)
 			if err != nil {
@@ -340,18 +362,26 @@ func (c *Compiler) compileQuantifier(q *parser.Quantifier) error {
 
 			exitPos := len(c.code)
 			if q.Greedy {
-				c.code[splitIdx].A = bodyStartForLoop // greedy: prefer more body
+				c.code[splitIdx].A = bodyStartForLoop // greedy: prefer body
 				c.code[splitIdx].B = exitPos
 			} else {
 				c.code[splitIdx].A = exitPos // non-greedy: prefer exit
 				c.code[splitIdx].B = bodyStartForLoop
 			}
 		} else if q.Max > q.Min {
+			groupCountAfterBody := c.groupCount
 			optionalCount := q.Max - q.Min
 			// {n,m}: emit optional part as nested ?s
 			// Greedy: split prefers body, non-greedy prefers exit
 			for i := 0; i < optionalCount; i++ {
 				splitIdx := c.emit(vm.Instruction{Op: vm.OpSplit, A: 0, B: 0})
+				if dupNames {
+					// Reset group slots before each optional body repetition
+					if groupCountAfterBody > groupCountBefore {
+						c.emit(vm.Instruction{Op: vm.OpResetGroups, A: groupCountBefore + 1, B: groupCountAfterBody})
+					}
+					c.groupCount = groupCountBefore
+				}
 				bodyStartOpt := len(c.code)
 
 				err := c.compileNode(q.Body)
@@ -517,6 +547,51 @@ func (c *Compiler) compileUnicodeProperty(u *parser.UnicodeProperty) error {
 		c.emit(vm.Instruction{Op: vm.OpUnicodeProp, Prop: u.Property})
 	}
 	return nil
+}
+
+// bodyHasDuplicateNamedGroups checks whether the body of a quantifier contains
+// named capture groups where the same name appears more than once (ES2022 duplicate
+// named groups). In that case, the group-reset semantics must be applied.
+func bodyHasDuplicateNamedGroups(node parser.Expression) bool {
+	names := make(map[string]int)
+	collectNamedGroups(node, names)
+	for _, count := range names {
+		if count > 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// collectNamedGroups accumulates named group name frequencies in the map.
+func collectNamedGroups(node parser.Expression, names map[string]int) {
+	switch n := node.(type) {
+	case *parser.NamedGroup:
+		names[n.Name]++
+		collectNamedGroups(n.Body, names)
+	case *parser.Group:
+		collectNamedGroups(n.Body, names)
+	case *parser.NonCapturingGroup:
+		collectNamedGroups(n.Body, names)
+	case *parser.Disjunction:
+		for _, alt := range n.Alternatives {
+			collectNamedGroups(alt, names)
+		}
+	case *parser.Sequence:
+		for _, elem := range n.Elements {
+			collectNamedGroups(elem, names)
+		}
+	case *parser.Quantifier:
+		collectNamedGroups(n.Body, names)
+	case *parser.Lookahead:
+		collectNamedGroups(n.Body, names)
+	case *parser.NegativeLookahead:
+		collectNamedGroups(n.Body, names)
+	case *parser.Lookbehind:
+		collectNamedGroups(n.Body, names)
+	case *parser.NegativeLookbehind:
+		collectNamedGroups(n.Body, names)
+	}
 }
 
 // fixedLength returns the fixed length of an expression if it is fixed-length.
