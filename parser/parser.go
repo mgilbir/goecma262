@@ -619,6 +619,11 @@ func isIdentifierPartRune(r rune, unicodeMode bool) bool {
 	if isIdentifierStartRune(r, unicodeMode) {
 		return true
 	}
+	// U+200C (ZWNJ) and U+200D (ZWJ) are valid identifier continuation
+	// characters per ECMA-262 §12.7.1 (Other_ID_Continue).
+	if r == 0x200C || r == 0x200D {
+		return true
+	}
 	return unicode.IsDigit(r) || unicode.In(r, unicode.Mn, unicode.Mc, unicode.Nd, unicode.Pc)
 }
 
