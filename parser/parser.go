@@ -574,12 +574,10 @@ func (p *Parser) parseGroupName() (string, error) {
 		case TokenLiteral:
 			r, decoded := readGroupNameRune()
 			if !decoded {
-				return sb.String(), nil
+				return "", fmt.Errorf("invalid group name continuation")
 			}
 			if !isIdentifierPartRune(r, unicodeMode) {
-				// Not a valid continuation; can't put the token back easily,
-				// but this shouldn't happen in valid patterns.
-				return sb.String(), nil
+				return "", fmt.Errorf("invalid group name continuation: %c", r)
 			}
 			sb.WriteRune(r)
 		case TokenDigit:

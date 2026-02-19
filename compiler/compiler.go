@@ -252,29 +252,36 @@ func (c *Compiler) compileQuantifier(q *parser.Quantifier) error {
 		// Structure: loopStart: split[A=body, B=exit]; body; jmp loopStart; exit:
 		// Greedy:     split prefers body (A=body, B=exit)
 		// Non-greedy: split prefers exit (A=exit, B=body)
+		groupCountBefore := c.groupCount
 		loopStart := len(c.code)
 		splitIdx := c.emit(vm.Instruction{Op: vm.OpSplit, A: 0, B: 0})
 
-		bodyStart := len(c.code)
+		resetIdx := c.emit(vm.Instruction{Op: vm.OpResetGroups, A: 0, B: 0})
 		err := c.compileNode(q.Body)
 		if err != nil {
 			return err
 		}
 		c.emit(vm.Instruction{Op: vm.OpJmp, A: loopStart})
 
+		// Reset group captures before each iteration (correct JS semantics).
+		groupCountAfter := c.groupCount
+		c.code[resetIdx].A = groupCountBefore + 1
+		c.code[resetIdx].B = groupCountAfter
+
 		exitPos := len(c.code)
 		if q.Greedy {
-			c.code[splitIdx].A = bodyStart // greedy: prefer body
+			c.code[splitIdx].A = resetIdx // greedy: prefer body
 			c.code[splitIdx].B = exitPos
 		} else {
 			c.code[splitIdx].A = exitPos // non-greedy: prefer exit
-			c.code[splitIdx].B = bodyStart
+			c.code[splitIdx].B = resetIdx
 		}
 
 	} else if q.Min == 1 && q.Max == -1 {
 		// + quantifier: body once (mandatory), then loop back to body start.
 		// Structure: bodyStart: <body>; split[A=bodyStart, B=exit] (greedy)
 		// This reuses the same group slots on each iteration (correct JS semantics).
+		groupCountBefore := c.groupCount
 		bodyStart := len(c.code)
 		err := c.compileNode(q.Body)
 		if err != nil {
@@ -282,14 +289,20 @@ func (c *Compiler) compileQuantifier(q *parser.Quantifier) error {
 		}
 
 		splitIdx := c.emit(vm.Instruction{Op: vm.OpSplit, A: 0, B: 0})
+		resetIdx := c.emit(vm.Instruction{Op: vm.OpResetGroups, A: 0, B: 0})
+		c.emit(vm.Instruction{Op: vm.OpJmp, A: bodyStart})
+
+		groupCountAfter := c.groupCount
+		c.code[resetIdx].A = groupCountBefore + 1
+		c.code[resetIdx].B = groupCountAfter
 		exitPos := len(c.code)
 
 		if q.Greedy {
-			c.code[splitIdx].A = bodyStart // greedy: loop back to body
+			c.code[splitIdx].A = resetIdx // greedy: loop back to body
 			c.code[splitIdx].B = exitPos
 		} else {
 			c.code[splitIdx].A = exitPos // non-greedy: prefer exit
-			c.code[splitIdx].B = bodyStart
+			c.code[splitIdx].B = resetIdx
 		}
 
 	} else if q.Min == 0 && q.Max == 1 {

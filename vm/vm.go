@@ -171,6 +171,8 @@ func (i Instruction) String() string {
 		return fmt.Sprintf("not-unicode-prop %s", i.Prop)
 	case OpResetGroups:
 		return fmt.Sprintf("reset-groups %d..%d", i.A, i.B)
+	case OpRequirePos:
+		return fmt.Sprintf("require-pos %d", i.A)
 	default:
 		return fmt.Sprintf("unknown(%d)", i.Op)
 	}

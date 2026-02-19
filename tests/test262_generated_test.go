@@ -66227,9 +66227,8 @@ func TestTest262Generated(t *testing.T) {
 					t.Fatalf("%s: /%s/%s.Split(%q, %d)[%d] = %q, want %q", tc.file, tc.pattern, tc.flags, tc.input, tc.limit, tc.index, got[tc.index], tc.expect)
 				}
 			default:
-				t.Skipf("%s: unsupported case kind %s", tc.file, tc.kind)
+				t.Fatalf("unknown kind: %s", tc.kind)
 			}
 		})
 	}
 }
-

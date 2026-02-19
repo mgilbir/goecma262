@@ -253,6 +253,18 @@ func TestGroups(t *testing.T) {
 			input:   "abab",
 			want:    []string{"abab", "ab"},
 		},
+		{
+			name:    "quantifier resets captures",
+			pattern: `(?:(a)|b)+`,
+			input:   "ab",
+			want:    []string{"ab", ""},
+		},
+		{
+			name:    "star quantifier resets captures",
+			pattern: `(?:(a)|b)*`,
+			input:   "b",
+			want:    []string{"b", ""},
+		},
 	}
 
 	for _, tt := range tests {
@@ -273,6 +285,18 @@ func TestGroups(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestInvalidGroupName(t *testing.T) {
+	_, err := ecma262.Compile(`(?<a->a)`, flags.Flags(0))
+	if err == nil {
+		t.Fatal("expected error for invalid group name with hyphen")
+	}
+
+	_, err = ecma262.Compile(`(?<\u{20}>a)`, flags.Flags(0))
+	if err == nil {
+		t.Fatal("expected error for invalid group name with space escape")
 	}
 }
 
