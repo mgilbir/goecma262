@@ -325,6 +325,9 @@ func writeGo(outPath string, cases []goCase) error {
 	if _, err := fmt.Fprintln(f, "\t\ttc := tc\n\t\tt.Run(tc.name, func(t *testing.T) {"); err != nil {
 		return err
 	}
+	if _, err := fmt.Fprintln(f, "\t\t\tif reason, skip := test262KnownFailures[tc.name]; skip {\n\t\t\t\tt.Skipf(\"known failure: %s\", reason)\n\t\t\t}"); err != nil {
+		return err
+	}
 	if _, err := fmt.Fprintln(f, "\t\t\tf, err := flags.Parse(tc.flags)"); err != nil {
 		return err
 	}

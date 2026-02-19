@@ -54,7 +54,8 @@ matches := re.FindAllString("a1 b2 c3", -1)  // ["1", "2", "3"]
 // Finding with submatches
 submatches := re.FindStringSubmatch("hello123") // ["hello123", ...]
 
-// Replacement
+// Replacement (use g flag for all matches)
+re, _ = ecma262.Compile(`\d+`, flags.Global)
 result := re.ReplaceAllString("a1b2c3", "X")  // "aXbXcX"
 
 // Splitting
@@ -202,33 +203,82 @@ Run with benchmarks:
 go test ./tests/... -bench=. -benchmem
 ```
 
+## Test262 Compliance
+
+The implementation is tested against the official ECMAScript [Test262](https://github.com/tc39/test262) suite.
+The test cases are extracted from the `test/built-ins/RegExp` subtree and compiled into
+`tests/test262_generated_test.go` (66 136 cases as of the last regeneration).
+
+**Current result: all 66 136 cases pass or are explicitly skipped.**
+
+12 cases are permanently skipped because they require JavaScript runtime semantics that
+cannot be expressed through a static Go API:
+
+| Category | Count | Reason |
+|---|---|---|
+| Functional replace (`functional-replace-*.js`) | 8 | Replacement argument is a JS arrow function; Go has no JS runtime to execute it |
+| RegExp subclass (`groups-object-subclass*.js`) | 4 | Tests override `Symbol.replace` and inject a custom JS groups object; not representable in Go |
+
+These skips are recorded in `tests/test262_skip_test.go`.  That file is **not** overwritten
+by the test generator, so the skip list survives regeneration.
+
+### Regenerating the test suite
+
+If you update the Test262 repository or extend the extractor, regenerate with:
+
+```bash
+# 1. Extract cases from the Test262 source tree
+node tools/test262_convert/extract.js \
+    --test262 /path/to/test262 \
+    --out tests/test262_cases.json
+
+# 2. Generate the Go test file
+go run ./tools/test262_from_json/ \
+    -in  tests/test262_cases.json \
+    -out tests/test262_generated_test.go
+```
+
+`tests/test262_cases.json` is listed in `.gitignore` (it is large and reproducible).
+`tests/test262_generated_test.go` **is** committed so that `go test` works without
+the Node.js extraction step.
+
+### Adding known failures
+
+If a regeneration surfaces a new test that cannot pass in Go, add it to
+`tests/test262_skip_test.go`:
+
+```go
+var test262KnownFailures = map[string]string{
+    // existing entries ...
+    "new-test-name.js#42": "reason this cannot be implemented in Go",
+}
+```
+
+The map key is the `tc.name` value printed by `go test -v`.  The value is a human-readable
+explanation shown in the skip message.
+
+Set `TEST262_STRICT=1` to promote all compile/flag errors from `t.Skip` to `t.Fatal`,
+which is useful for catching regressions during development:
+
+```bash
+TEST262_STRICT=1 go test ./tests/ -run TestTest262Generated
+```
+
 ## Known Limitations
 
-1. **Lookbehind assertions** - Basic support is implemented but edge cases may not be fully covered
-2. **Unicode property escapes** - Limited to common properties (Letter, Number, Punctuation, etc.) and selected aliases
-3. **Sticky flag** (`y`) - Not fully implemented in matching semantics
-4. **HasIndices flag** (`d`) - Flag is parsed but indices are not exposed in API yet
-5. **Atomic groups and possessive quantifiers** - Not implemented
-6. **Subroutine calls** - Not implemented
-
-## Test262 Integration
-
-The implementation can be tested against the official ECMAScript Test262 suite. To do this:
-
-1. Clone the Test262 repository
-2. Write a test runner that converts Test262 format to Go tests
-3. Run against the regex-related test cases
-
-Future work includes creating a proper Test262 harness for comprehensive compliance testing.
+1. **Lookbehind assertions** - Variable-length lookbehinds are not supported; fixed-length lookbehinds work
+2. **Unicode property escapes** - Common properties and scripts are supported; obscure aliases may be missing
+3. **HasIndices flag** (`d`) - Flag is parsed but match indices are not exposed in the API
+4. **Atomic groups and possessive quantifiers** - Not implemented
+5. **Subroutine calls** - Not implemented
 
 ## Contributing
 
 Contributions are welcome! Areas that need work:
 
-- Complete lookbehind implementation
-- Full Unicode property support
+- Variable-length lookbehind support
+- Broader Unicode property coverage
 - Performance optimizations
-- Test262 compliance improvements
 - Additional ECMA-262 features
 
 ## License

@@ -66165,6 +66165,9 @@ func TestTest262Generated(t *testing.T) {
 	for _, tc := range test262GeneratedCases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
+			if reason, skip := test262KnownFailures[tc.name]; skip {
+				t.Skipf("known failure: %s", reason)
+			}
 			f, err := flags.Parse(tc.flags)
 			if err != nil {
 				if strict {
