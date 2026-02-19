@@ -275,7 +275,11 @@ func writeGo(outPath string, cases []goCase) error {
 	}
 	defer f.Close()
 	w := bufio.NewWriter(f)
-	defer w.Flush()
+	defer func() {
+		if err == nil {
+			err = w.Flush()
+		}
+	}()
 
 	writeString := func(s string) error {
 		_, err := w.WriteString(s)

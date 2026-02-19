@@ -257,6 +257,7 @@ func (c *Compiler) compileQuantifier(q *parser.Quantifier) error {
 		splitIdx := c.emit(vm.Instruction{Op: vm.OpSplit, A: 0, B: 0})
 
 		resetIdx := c.emit(vm.Instruction{Op: vm.OpResetGroups, A: 0, B: 0})
+		bodyStart := len(c.code)
 		err := c.compileNode(q.Body)
 		if err != nil {
 			return err
@@ -265,16 +266,24 @@ func (c *Compiler) compileQuantifier(q *parser.Quantifier) error {
 
 		// Reset group captures before each iteration (correct JS semantics).
 		groupCountAfter := c.groupCount
-		c.code[resetIdx].A = groupCountBefore + 1
-		c.code[resetIdx].B = groupCountAfter
+		if groupCountAfter > groupCountBefore {
+			c.code[resetIdx].A = groupCountBefore + 1
+			c.code[resetIdx].B = groupCountAfter
+		} else {
+			resetIdx = -1
+		}
 
 		exitPos := len(c.code)
+		bodyEntry := bodyStart
+		if resetIdx != -1 {
+			bodyEntry = resetIdx
+		}
 		if q.Greedy {
-			c.code[splitIdx].A = resetIdx // greedy: prefer body
+			c.code[splitIdx].A = bodyEntry // greedy: prefer body
 			c.code[splitIdx].B = exitPos
 		} else {
 			c.code[splitIdx].A = exitPos // non-greedy: prefer exit
-			c.code[splitIdx].B = resetIdx
+			c.code[splitIdx].B = bodyEntry
 		}
 
 	} else if q.Min == 1 && q.Max == -1 {
@@ -289,20 +298,24 @@ func (c *Compiler) compileQuantifier(q *parser.Quantifier) error {
 		}
 
 		splitIdx := c.emit(vm.Instruction{Op: vm.OpSplit, A: 0, B: 0})
-		resetIdx := c.emit(vm.Instruction{Op: vm.OpResetGroups, A: 0, B: 0})
-		c.emit(vm.Instruction{Op: vm.OpJmp, A: bodyStart})
-
 		groupCountAfter := c.groupCount
-		c.code[resetIdx].A = groupCountBefore + 1
-		c.code[resetIdx].B = groupCountAfter
+		resetIdx := -1
+		if groupCountAfter > groupCountBefore {
+			resetIdx = c.emit(vm.Instruction{Op: vm.OpResetGroups, A: groupCountBefore + 1, B: groupCountAfter})
+		}
+		c.emit(vm.Instruction{Op: vm.OpJmp, A: bodyStart})
 		exitPos := len(c.code)
 
+		loopEntry := bodyStart
+		if resetIdx != -1 {
+			loopEntry = resetIdx
+		}
 		if q.Greedy {
-			c.code[splitIdx].A = resetIdx // greedy: loop back to body
+			c.code[splitIdx].A = loopEntry // greedy: loop back to body
 			c.code[splitIdx].B = exitPos
 		} else {
 			c.code[splitIdx].A = exitPos // non-greedy: prefer exit
-			c.code[splitIdx].B = resetIdx
+			c.code[splitIdx].B = loopEntry
 		}
 
 	} else if q.Min == 0 && q.Max == 1 {
