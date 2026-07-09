@@ -56,6 +56,12 @@ func Compile(expr string, f flags.Flags) (*Regexp, error) {
 		Multiline:   f.Has(flags.Multiline),
 	})
 
+	// Validate flag combinations before parsing so Compile and CompileFlags
+	// reject the same inputs (u and v are mutually exclusive per ECMA-262).
+	if f.Has(flags.Unicode) && f.Has(flags.UnicodeSets) {
+		return nil, fmt.Errorf("incompatible flags: u and v")
+	}
+
 	ast, err := p.Parse()
 	if err != nil {
 		return nil, fmt.Errorf("parse error: %w", err)
@@ -688,6 +694,16 @@ func (re *Regexp) UnmarshalText(text []byte) error {
 
 // doMatch performs the actual matching and returns the capture groups
 func (re *Regexp) doMatch(s string, startPos int) []int {
+	// Clamp the start position. A negative lastIndex is treated as 0; a
+	// start position beyond the input yields no match (ECMA-262 semantics),
+	// never a panic.
+	if startPos < 0 {
+		startPos = 0
+	}
+	if startPos > len(s) {
+		return nil
+	}
+
 	v := &vm.VM{
 		Code:       re.code,
 		NumGroups:  re.numGroups,
@@ -731,6 +747,13 @@ func (re *Regexp) doMatch(s string, startPos int) []int {
 // doMatchWithError performs the actual matching and returns the capture groups.
 // If the VM exceeds its step limit, returns vm.ErrStepLimit.
 func (re *Regexp) doMatchWithError(s string, startPos int) ([]int, error) {
+	if startPos < 0 {
+		startPos = 0
+	}
+	if startPos > len(s) {
+		return nil, nil
+	}
+
 	v := &vm.VM{
 		Code:       re.code,
 		NumGroups:  re.numGroups,
