@@ -234,6 +234,9 @@ func (c *Compiler) compileCharacterClass(cc *parser.CharacterClass) error {
 			case parser.ClassEscapeSpace:
 				classAtoms = append(classAtoms, vm.ClassAtom{Kind: vm.ClassAtomSpace, Negated: a.Negated})
 			case parser.ClassEscapeUnicodeProperty:
+				if !vm.ValidUnicodeProperty(a.Property) {
+					return fmt.Errorf("invalid unicode property escape: \\p{%s}", a.Property)
+				}
 				classAtoms = append(classAtoms, vm.ClassAtom{Kind: vm.ClassAtomUnicodeProp, Prop: a.Property, Negated: a.Negated})
 			}
 		default:
@@ -502,6 +505,9 @@ func (c *Compiler) compileNegativeLookbehind(l *parser.NegativeLookbehind) error
 }
 
 func (c *Compiler) compileUnicodeProperty(u *parser.UnicodeProperty) error {
+	if !vm.ValidUnicodeProperty(u.Property) {
+		return fmt.Errorf("invalid unicode property escape: \\p{%s}", u.Property)
+	}
 	if u.Negated {
 		c.emit(vm.Instruction{Op: vm.OpNotUnicodeProp, Prop: u.Property})
 	} else {
