@@ -291,7 +291,7 @@ TEST262_STRICT=1 go test ./tests/ -run TestTest262Generated
 2. **Unicode property escapes** - All general categories, scripts (via `Script=`/`Script_Extensions=`), and the common lone binary properties are supported; some rarer binary properties may be missing (and are reported as errors rather than silently matching nothing).
 3. **HasIndices flag** (`d`) - Parsed and accepted, but it has no effect: match indices are always available through the `*Index` methods (`FindStringSubmatchIndex`, `FindAllStringSubmatchIndex`, etc.), which return `[start, end)` byte-offset pairs per group (`-1` for a non-participating group). Named-group indices (JavaScript's `indices.groups`) are obtained by combining `SubexpIndex(name)` with those pairs.
 4. **Nesting depth / program size** - Patterns nested more than 200 levels deep, or that compile to more than 200,000 instructions, are rejected at compile time.
-5. **Case folding** - Case-insensitive matching uses Unicode simple case folding under the `u` flag and ASCII-only folding otherwise; non-ASCII case folding is not applied in non-`u` mode.
+5. **Case folding** - Case-insensitive matching uses Unicode simple case folding under the `u` flag, and the legacy `Canonicalize` (uppercase-based, with the "don't map non-ASCII to ASCII" guard) otherwise — matching JavaScript in both modes. A handful of full-mapping edge cases (e.g. `ß`↔`SS`) are not folded, as in most engines.
 
 ## Contributing
 
