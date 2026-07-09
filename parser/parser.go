@@ -80,8 +80,9 @@ func (p *Parser) Parse() (*Pattern, error) {
 	}
 
 	return &Pattern{
-		Body:  body,
-		Flags: p.flags,
+		Body:      body,
+		NumGroups: p.groupCount,
+		Flags:     p.flags,
 	}, nil
 }
 
@@ -356,8 +357,10 @@ func (p *Parser) parseGroup() (Expression, error) {
 		return p.parseSpecialGroup()
 	}
 
-	// Regular capturing group
+	// Regular capturing group. The index is fixed at the opening paren, before
+	// the body (which may contain further, higher-numbered groups) is parsed.
 	p.groupCount++
+	idx := p.groupCount
 
 	body, err := p.parseDisjunction()
 	if err != nil {
@@ -369,7 +372,7 @@ func (p *Parser) parseGroup() (Expression, error) {
 	}
 	p.nextToken()
 
-	return &Group{Body: body}, nil
+	return &Group{Index: idx, Body: body}, nil
 }
 
 // parseSpecialGroup parses special group types after (?
@@ -472,8 +475,9 @@ func (p *Parser) parseNamedGroup() (Expression, error) {
 	p.nextToken() // consume >
 
 	p.groupCount++
+	idx := p.groupCount
 	// ES2022: allow duplicate named groups across alternatives; track all indices
-	p.namedGroups[name] = append(p.namedGroups[name], p.groupCount)
+	p.namedGroups[name] = append(p.namedGroups[name], idx)
 
 	body, err := p.parseDisjunction()
 	if err != nil {
@@ -485,7 +489,7 @@ func (p *Parser) parseNamedGroup() (Expression, error) {
 	}
 	p.nextToken()
 
-	return &NamedGroup{Name: name, Body: body}, nil
+	return &NamedGroup{Index: idx, Name: name, Body: body}, nil
 }
 
 // parseGroupName parses a group name identifier.

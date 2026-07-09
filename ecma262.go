@@ -73,8 +73,9 @@ func Compile(expr string, f flags.Flags) (*Regexp, error) {
 		return nil, fmt.Errorf("compile error: %w", err)
 	}
 
-	// Extract group names from AST
-	names := extractGroupNames(ast.Body)
+	// Extract group names from AST, indexed by the parse-time group number so
+	// that len(names) == numGroups+1 always holds.
+	names := extractGroupNames(ast.Body, numGroups)
 
 	return &Regexp{
 		expr:       expr,
@@ -798,9 +799,13 @@ func quote(s string) string {
 	return "`" + s + "`"
 }
 
-func extractGroupNames(node parser.Node) []string {
-	// Extract group names from AST
-	names := []string{""} // Group 0 has no name
+// extractGroupNames returns a slice of length numGroups+1 mapping each group
+// index to its name ("" for unnamed groups and for group 0). Names are placed
+// by the parse-time group index — the same numbering the compiler uses — so the
+// result stays aligned with FindStringSubmatch/SubexpIndex, including for groups
+// inside lookarounds and counted quantifiers.
+func extractGroupNames(node parser.Node, numGroups int) []string {
+	names := make([]string, numGroups+1)
 
 	var extract func(parser.Node)
 	extract = func(n parser.Node) {
@@ -814,17 +819,24 @@ func extractGroupNames(node parser.Node) []string {
 				extract(elem)
 			}
 		case *parser.Group:
-			names = append(names, "")
 			extract(v.Body)
 		case *parser.NamedGroup:
-			names = append(names, v.Name)
+			if v.Index >= 0 && v.Index < len(names) {
+				names[v.Index] = v.Name
+			}
 			extract(v.Body)
 		case *parser.NonCapturingGroup:
 			extract(v.Body)
 		case *parser.Quantifier:
 			extract(v.Body)
-		case *parser.Lookahead, *parser.NegativeLookahead, *parser.Lookbehind, *parser.NegativeLookbehind:
-			// Lookarounds don't add capture groups
+		case *parser.Lookahead:
+			extract(v.Body)
+		case *parser.NegativeLookahead:
+			extract(v.Body)
+		case *parser.Lookbehind:
+			extract(v.Body)
+		case *parser.NegativeLookbehind:
+			extract(v.Body)
 		}
 	}
 

@@ -14,8 +14,12 @@ type Expression interface {
 
 // Pattern represents a complete regex pattern with flags
 type Pattern struct {
-	Body  Expression
-	Flags Flags
+	Body Expression
+	// NumGroups is the total number of capturing groups, assigned by source
+	// order at parse time. This is the single source of truth for group
+	// numbering; quantifiers never create additional groups.
+	NumGroups int
+	Flags     Flags
 }
 
 func (p *Pattern) node() {}
@@ -111,7 +115,10 @@ func (q *Quantifier) expr() {}
 
 // Group represents a capturing group (...)
 type Group struct {
-	Body Expression
+	// Index is the 1-based capture-group number, assigned at parse time by
+	// the source order of the opening parenthesis.
+	Index int
+	Body  Expression
 }
 
 func (g *Group) node() {}
@@ -119,8 +126,11 @@ func (g *Group) expr() {}
 
 // NamedGroup represents a named capturing group (?<name>...)
 type NamedGroup struct {
-	Name string
-	Body Expression
+	// Index is the 1-based capture-group number (named groups share the same
+	// numbering space as unnamed groups), assigned at parse time.
+	Index int
+	Name  string
+	Body  Expression
 }
 
 func (n *NamedGroup) node() {}

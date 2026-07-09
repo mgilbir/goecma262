@@ -16,17 +16,17 @@ const (
 
 // Compiler compiles regex AST to VM bytecode
 type Compiler struct {
-	code        []vm.Instruction
-	groupCount  int
-	namedGroups map[string]int
-	depth       int // current nesting depth
+	code  []vm.Instruction
+	depth int // current nesting depth
 }
 
-// Compile compiles a regex pattern AST to VM instructions
+// Compile compiles a regex pattern AST to VM instructions.
+// The returned group count is the parse-time total (pattern.NumGroups), so it
+// includes groups that a {0} quantifier compiles zero times, and never counts
+// a group more than once even inside a counted quantifier.
 func Compile(pattern *parser.Pattern) ([]vm.Instruction, int, error) {
 	c := &Compiler{
-		code:        make([]vm.Instruction, 0),
-		namedGroups: make(map[string]int),
+		code: make([]vm.Instruction, 0),
 	}
 
 	// Emit save instructions for group 0 (full match)
@@ -42,7 +42,7 @@ func Compile(pattern *parser.Pattern) ([]vm.Instruction, int, error) {
 	// Add final match instruction
 	c.emit(vm.Instruction{Op: vm.OpMatch})
 
-	return c.code, c.groupCount, nil
+	return c.code, pattern.NumGroups, nil
 }
 
 func (c *Compiler) emit(inst vm.Instruction) int {
@@ -247,74 +247,58 @@ func (c *Compiler) compileQuantifier(q *parser.Quantifier) error {
 		return fmt.Errorf("quantifier maximum %d exceeds limit %d", q.Max, MaxQuantifierRepeat)
 	}
 
+	// Capturing groups inside the body are reset to unset at the start of each
+	// new iteration, per ECMA-262 RepeatMatcher group-reset semantics. Because
+	// group indices are assigned once at parse time, every repetition of the
+	// body re-emits the same save instructions (targeting the same slots), so
+	// a group's value is that of its last participating iteration, and a
+	// non-participating alternative in a later iteration clears it.
+	loGroup, hiGroup, hasGroups := groupIndexRange(q.Body)
+	emitReset := func() int {
+		if !hasGroups {
+			return -1
+		}
+		return c.emit(vm.Instruction{Op: vm.OpResetGroups, A: loGroup, B: hiGroup})
+	}
+
 	if q.Min == 0 && q.Max == -1 {
 		// * quantifier
-		// Structure: loopStart: split[A=body, B=exit]; body; jmp loopStart; exit:
-		// Greedy:     split prefers body (A=body, B=exit)
-		// Non-greedy: split prefers exit (A=exit, B=body)
-		groupCountBefore := c.groupCount
+		// Structure: loopStart: split[A=reset?body, B=exit]; body; jmp loopStart; exit:
 		loopStart := len(c.code)
 		splitIdx := c.emit(vm.Instruction{Op: vm.OpSplit, A: 0, B: 0})
-
-		resetIdx := c.emit(vm.Instruction{Op: vm.OpResetGroups, A: 0, B: 0})
-		bodyStart := len(c.code)
+		bodyEntry := len(c.code) // points at the reset (or body if none)
+		emitReset()
 		err := c.compileNode(q.Body)
 		if err != nil {
 			return err
 		}
 		c.emit(vm.Instruction{Op: vm.OpJmp, A: loopStart})
-
-		// Reset group captures before each iteration (correct JS semantics).
-		groupCountAfter := c.groupCount
-		if groupCountAfter > groupCountBefore {
-			c.code[resetIdx].A = groupCountBefore + 1
-			c.code[resetIdx].B = groupCountAfter
-		} else {
-			resetIdx = -1
-		}
-
 		exitPos := len(c.code)
-		bodyEntry := bodyStart
-		if resetIdx != -1 {
-			bodyEntry = resetIdx
-		}
 		if q.Greedy {
-			c.code[splitIdx].A = bodyEntry // greedy: prefer body
+			c.code[splitIdx].A = bodyEntry
 			c.code[splitIdx].B = exitPos
 		} else {
-			c.code[splitIdx].A = exitPos // non-greedy: prefer exit
+			c.code[splitIdx].A = exitPos
 			c.code[splitIdx].B = bodyEntry
 		}
 
 	} else if q.Min == 1 && q.Max == -1 {
-		// + quantifier: body once (mandatory), then loop back to body start.
-		// Structure: bodyStart: <body>; split[A=bodyStart, B=exit] (greedy)
-		// This reuses the same group slots on each iteration (correct JS semantics).
-		groupCountBefore := c.groupCount
+		// + quantifier: body once (mandatory), then loop back with a reset.
 		bodyStart := len(c.code)
 		err := c.compileNode(q.Body)
 		if err != nil {
 			return err
 		}
-
 		splitIdx := c.emit(vm.Instruction{Op: vm.OpSplit, A: 0, B: 0})
-		groupCountAfter := c.groupCount
-		resetIdx := -1
-		if groupCountAfter > groupCountBefore {
-			resetIdx = c.emit(vm.Instruction{Op: vm.OpResetGroups, A: groupCountBefore + 1, B: groupCountAfter})
-		}
+		loopEntry := len(c.code)
+		emitReset()
 		c.emit(vm.Instruction{Op: vm.OpJmp, A: bodyStart})
 		exitPos := len(c.code)
-
-		loopEntry := bodyStart
-		if resetIdx != -1 {
-			loopEntry = resetIdx
-		}
 		if q.Greedy {
-			c.code[splitIdx].A = loopEntry // greedy: loop back to body
+			c.code[splitIdx].A = loopEntry
 			c.code[splitIdx].B = exitPos
 		} else {
-			c.code[splitIdx].A = exitPos // non-greedy: prefer exit
+			c.code[splitIdx].A = exitPos
 			c.code[splitIdx].B = loopEntry
 		}
 
@@ -322,99 +306,64 @@ func (c *Compiler) compileQuantifier(q *parser.Quantifier) error {
 		// ? quantifier: split L1, L2; L1: body; L2:
 		splitIdx := c.emit(vm.Instruction{Op: vm.OpSplit, A: 0, B: 0})
 		bodyStart := len(c.code)
-
 		err := c.compileNode(q.Body)
 		if err != nil {
 			return err
 		}
-
 		c.code[splitIdx].A = bodyStart   // Try body
 		c.code[splitIdx].B = len(c.code) // Or skip
-
 		if !q.Greedy {
 			c.code[splitIdx].A, c.code[splitIdx].B = c.code[splitIdx].B, c.code[splitIdx].A
 		}
 
 	} else {
-		// {n,m} quantifier
-
-		// Detect whether the body has duplicate named groups (ES2022).
-		// If so, apply group-reset semantics (reuse same group slots per iteration,
-		// reset them at the start of each new iteration).
-		// Otherwise, use the classic unrolling approach (separate group slots per iteration)
-		// which happens to produce the expected result for non-duplicate-name patterns.
-		dupNames := bodyHasDuplicateNamedGroups(q.Body)
-		groupCountBefore := c.groupCount
-
-		// Emit body q.Min times (required minimum)
+		// {n,m} quantifier.
+		// Emit the body q.Min times (the required minimum), resetting the body's
+		// groups before every repetition after the first.
 		for i := 0; i < q.Min; i++ {
-			if i > 0 && dupNames {
-				// Reset captured groups from the previous iteration before the next one.
-				c.emit(vm.Instruction{Op: vm.OpResetGroups, A: groupCountBefore + 1, B: c.groupCount})
-				// Reuse the same group slots for subsequent iterations.
-				c.groupCount = groupCountBefore
+			if i > 0 {
+				emitReset()
 			}
-			err := c.compileNode(q.Body)
-			if err != nil {
+			if err := c.compileNode(q.Body); err != nil {
 				return err
 			}
 		}
 
 		if q.Max == -1 {
-			// {n,} - unlimited tail: loop like * using OpSplit
-			groupCountAfterBody := c.groupCount
+			// {n,} - unlimited tail: loop like * using OpSplit.
 			loopStart := len(c.code)
 			splitIdx := c.emit(vm.Instruction{Op: vm.OpSplit, A: 0, B: 0})
-
-			if dupNames {
-				// Emit reset at start of loop body (group-reset semantics)
-				if groupCountAfterBody > groupCountBefore {
-					c.emit(vm.Instruction{Op: vm.OpResetGroups, A: groupCountBefore + 1, B: groupCountAfterBody})
-				}
-				c.groupCount = groupCountBefore
-			}
-			bodyStartForLoop := len(c.code)
-			err := c.compileNode(q.Body)
-			if err != nil {
+			bodyEntry := len(c.code)
+			emitReset()
+			if err := c.compileNode(q.Body); err != nil {
 				return err
 			}
 			c.emit(vm.Instruction{Op: vm.OpJmp, A: loopStart})
-
 			exitPos := len(c.code)
 			if q.Greedy {
-				c.code[splitIdx].A = bodyStartForLoop // greedy: prefer body
+				c.code[splitIdx].A = bodyEntry
 				c.code[splitIdx].B = exitPos
 			} else {
-				c.code[splitIdx].A = exitPos // non-greedy: prefer exit
-				c.code[splitIdx].B = bodyStartForLoop
+				c.code[splitIdx].A = exitPos
+				c.code[splitIdx].B = bodyEntry
 			}
 		} else if q.Max > q.Min {
-			groupCountAfterBody := c.groupCount
+			// {n,m}: emit the optional part as nested optionals, resetting the
+			// body's groups before each optional repetition.
 			optionalCount := q.Max - q.Min
-			// {n,m}: emit optional part as nested ?s
-			// Greedy: split prefers body, non-greedy prefers exit
 			for i := 0; i < optionalCount; i++ {
 				splitIdx := c.emit(vm.Instruction{Op: vm.OpSplit, A: 0, B: 0})
-				if dupNames {
-					// Reset group slots before each optional body repetition
-					if groupCountAfterBody > groupCountBefore {
-						c.emit(vm.Instruction{Op: vm.OpResetGroups, A: groupCountBefore + 1, B: groupCountAfterBody})
-					}
-					c.groupCount = groupCountBefore
-				}
-				bodyStartOpt := len(c.code)
-
-				err := c.compileNode(q.Body)
-				if err != nil {
+				bodyEntry := len(c.code)
+				emitReset()
+				if err := c.compileNode(q.Body); err != nil {
 					return err
 				}
-
 				if q.Greedy {
-					c.code[splitIdx].A = bodyStartOpt
+					c.code[splitIdx].A = bodyEntry
 					c.code[splitIdx].B = len(c.code)
 				} else {
 					c.code[splitIdx].A = len(c.code)
-					c.code[splitIdx].B = bodyStartOpt
+					c.code[splitIdx].B = bodyEntry
 				}
 			}
 		}
@@ -424,31 +373,22 @@ func (c *Compiler) compileQuantifier(q *parser.Quantifier) error {
 }
 
 func (c *Compiler) compileGroup(g *parser.Group) error {
-	c.groupCount++
-	groupNum := c.groupCount
-
-	c.emit(vm.Instruction{Op: vm.OpSaveStart, A: groupNum})
+	c.emit(vm.Instruction{Op: vm.OpSaveStart, A: g.Index})
 	err := c.compileNode(g.Body)
 	if err != nil {
 		return err
 	}
-	c.emit(vm.Instruction{Op: vm.OpSaveEnd, A: groupNum})
-
+	c.emit(vm.Instruction{Op: vm.OpSaveEnd, A: g.Index})
 	return nil
 }
 
 func (c *Compiler) compileNamedGroup(g *parser.NamedGroup) error {
-	c.groupCount++
-	groupNum := c.groupCount
-	c.namedGroups[g.Name] = groupNum
-
-	c.emit(vm.Instruction{Op: vm.OpSaveStart, A: groupNum})
+	c.emit(vm.Instruction{Op: vm.OpSaveStart, A: g.Index})
 	err := c.compileNode(g.Body)
 	if err != nil {
 		return err
 	}
-	c.emit(vm.Instruction{Op: vm.OpSaveEnd, A: groupNum})
-
+	c.emit(vm.Instruction{Op: vm.OpSaveEnd, A: g.Index})
 	return nil
 }
 
@@ -563,48 +503,57 @@ func (c *Compiler) compileUnicodeProperty(u *parser.UnicodeProperty) error {
 	return nil
 }
 
-// bodyHasDuplicateNamedGroups checks whether the body of a quantifier contains
-// named capture groups where the same name appears more than once (ES2022 duplicate
-// named groups). In that case, the group-reset semantics must be applied.
-func bodyHasDuplicateNamedGroups(node parser.Expression) bool {
-	names := make(map[string]int)
-	collectNamedGroups(node, names)
-	for _, count := range names {
-		if count > 1 {
-			return true
+// groupIndexRange returns the contiguous range [lo, hi] of capture-group indices
+// defined anywhere within node, and whether any exist. Because indices are
+// assigned in source order and a subtree spans a contiguous source range, the
+// groups it contains always form a contiguous index range — so a single
+// OpResetGroups over [lo, hi] resets exactly the body's captures.
+func groupIndexRange(node parser.Expression) (lo, hi int, has bool) {
+	var walk func(parser.Expression)
+	walk = func(n parser.Expression) {
+		switch e := n.(type) {
+		case *parser.Group:
+			consider(e.Index, &lo, &hi, &has)
+			walk(e.Body)
+		case *parser.NamedGroup:
+			consider(e.Index, &lo, &hi, &has)
+			walk(e.Body)
+		case *parser.NonCapturingGroup:
+			walk(e.Body)
+		case *parser.Disjunction:
+			for _, alt := range e.Alternatives {
+				walk(alt)
+			}
+		case *parser.Sequence:
+			for _, elem := range e.Elements {
+				walk(elem)
+			}
+		case *parser.Quantifier:
+			walk(e.Body)
+		case *parser.Lookahead:
+			walk(e.Body)
+		case *parser.NegativeLookahead:
+			walk(e.Body)
+		case *parser.Lookbehind:
+			walk(e.Body)
+		case *parser.NegativeLookbehind:
+			walk(e.Body)
 		}
 	}
-	return false
+	walk(node)
+	return lo, hi, has
 }
 
-// collectNamedGroups accumulates named group name frequencies in the map.
-func collectNamedGroups(node parser.Expression, names map[string]int) {
-	switch n := node.(type) {
-	case *parser.NamedGroup:
-		names[n.Name]++
-		collectNamedGroups(n.Body, names)
-	case *parser.Group:
-		collectNamedGroups(n.Body, names)
-	case *parser.NonCapturingGroup:
-		collectNamedGroups(n.Body, names)
-	case *parser.Disjunction:
-		for _, alt := range n.Alternatives {
-			collectNamedGroups(alt, names)
-		}
-	case *parser.Sequence:
-		for _, elem := range n.Elements {
-			collectNamedGroups(elem, names)
-		}
-	case *parser.Quantifier:
-		collectNamedGroups(n.Body, names)
-	case *parser.Lookahead:
-		collectNamedGroups(n.Body, names)
-	case *parser.NegativeLookahead:
-		collectNamedGroups(n.Body, names)
-	case *parser.Lookbehind:
-		collectNamedGroups(n.Body, names)
-	case *parser.NegativeLookbehind:
-		collectNamedGroups(n.Body, names)
+func consider(idx int, lo, hi *int, has *bool) {
+	if !*has {
+		*lo, *hi, *has = idx, idx, true
+		return
+	}
+	if idx < *lo {
+		*lo = idx
+	}
+	if idx > *hi {
+		*hi = idx
 	}
 }
 
