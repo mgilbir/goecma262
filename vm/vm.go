@@ -4,10 +4,26 @@ package vm
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
 )
+
+// splitKey encodes a full backtracking state (pos, pc, groups) into a map key
+// for the OpSplit failure memo. Groups are included so that states differing
+// only in captured groups are treated as distinct.
+func splitKey(pos, pc int, groups []int) string {
+	buf := make([]byte, 0, 8+len(groups)*3)
+	buf = strconv.AppendInt(buf, int64(pos), 36)
+	buf = append(buf, ':')
+	buf = strconv.AppendInt(buf, int64(pc), 36)
+	for _, g := range groups {
+		buf = append(buf, ':')
+		buf = strconv.AppendInt(buf, int64(g), 36)
+	}
+	return string(buf)
+}
 
 // ErrStepLimit is returned when the VM exceeds its step limit (ReDoS protection)
 var ErrStepLimit = errors.New("regexp execution step limit exceeded")
@@ -191,7 +207,7 @@ type VM struct {
 	Err        error
 
 	steps         int             // current step count
-	visitedSplits map[[2]int]bool // shared cycle detection for empty-match loops
+	visitedSplits map[string]bool // memoized failed split states (pos, pc, groups)
 }
 
 // New creates a new VM with the given code
@@ -213,6 +229,17 @@ type matchResult struct {
 // Returns (matched, endPos, groups).
 // Uses recursive backtracking so each branch gets its own copy of state.
 func (vm *VM) Match(input string, pos int) (bool, int, []int) {
+	vm.steps = 0
+	vm.Err = nil
+	return vm.matchWithInitialGroups(input, pos, nil)
+}
+
+// MatchAt is like Match but does NOT reset the step counter or Err, so a caller
+// scanning successive start positions shares a single step budget. This keeps
+// the ReDoS bound at O(MaxSteps) for a whole search instead of O(len·MaxSteps).
+// Callers must inspect Err after the scan to distinguish "no match" from
+// "step limit exceeded".
+func (vm *VM) MatchAt(input string, pos int) (bool, int, []int) {
 	return vm.matchWithInitialGroups(input, pos, nil)
 }
 
@@ -221,9 +248,10 @@ func (vm *VM) Match(input string, pos int) (bool, int, []int) {
 // lookahead/lookbehind sub-VMs for backreference resolution).
 func (vm *VM) matchWithInitialGroups(input string, pos int, outerGroups []int) (bool, int, []int) {
 	vm.Input = input
-	vm.steps = 0
-	vm.Err = nil
-	vm.visitedSplits = nil // reset per match attempt
+	// Note: steps and Err are intentionally not reset here so that a scan over
+	// successive start positions (via MatchAt) shares one step budget. Match
+	// resets them for a single standalone attempt.
+	vm.visitedSplits = nil // memo is per attempt (keys embed the absolute pos)
 
 	totalGroups := vm.NumGroups + 1
 	groups := make([]int, totalGroups*2)
@@ -497,14 +525,18 @@ func (vm *VM) exec(pos, pc int, groups []int) matchResult {
 			pc = inst.A
 
 		case OpSplit:
-			// Cycle detection: if we've visited this same (pos, pc) before,
-			// the loop body is matching empty strings — exit via branch B.
-			key := [2]int{pos, pc}
+			// The outcome of matching from a given (pos, pc, groups) is a pure
+			// function of that state, so once branch A has failed for a state we
+			// can memoize it: revisiting the same state (an empty-match cycle, or
+			// a different backtracking path that reconverges) skips A and takes
+			// the exit B. The key MUST include groups — keying on (pos, pc) alone
+			// wrongly pruned branches reachable with different captures, e.g.
+			// (?:(a)|a)(?:b|c)\1 on "ab".
+			key := splitKey(pos, pc, groups)
 			if vm.visitedSplits == nil {
-				vm.visitedSplits = make(map[[2]int]bool)
+				vm.visitedSplits = make(map[string]bool)
 			}
 			if vm.visitedSplits[key] {
-				// Empty-match cycle detected — skip A, take exit (B)
 				pc = inst.B
 				continue
 			}
@@ -901,33 +933,71 @@ func (vm *VM) matchChar(input, pattern rune) bool {
 	if input == pattern {
 		return true
 	}
-	if vm.IgnoreCase {
-		if vm.Unicode {
-			// Full Unicode case folding
-			return unicode.ToLower(input) == unicode.ToLower(pattern)
+	if !vm.IgnoreCase {
+		return false
+	}
+	if vm.Unicode {
+		// Unicode simple case folding: input matches pattern if they share a
+		// fold orbit (so ſ folds to s, Kelvin sign K to k, etc.).
+		return foldEqual(input, pattern)
+	}
+	// Non-unicode mode: ASCII-only case folding.
+	return toASCIILower(input) == toASCIILower(pattern)
+}
+
+func (vm *VM) matchInRange(ch, start, end rune) bool {
+	if ch >= start && ch <= end {
+		return true
+	}
+	if !vm.IgnoreCase {
+		return false
+	}
+	// Case-insensitive membership: a character matches the range if any of its
+	// case-fold variants falls within the raw [start, end] range. Folding the
+	// range endpoints instead (the old approach) breaks ranges that span the
+	// case boundary, e.g. /[Y-b]/i failing to match "y".
+	if vm.Unicode {
+		for f := unicode.SimpleFold(ch); f != ch; f = unicode.SimpleFold(f) {
+			if f >= start && f <= end {
+				return true
+			}
 		}
-		// Non-unicode mode: simple ASCII-ish case folding
-		return toASCIILower(input) == toASCIILower(pattern)
+		return false
+	}
+	if lo := toASCIILower(ch); lo >= start && lo <= end {
+		return true
+	}
+	if up := toASCIIUpper(ch); up >= start && up <= end {
+		return true
 	}
 	return false
 }
 
-func (vm *VM) matchInRange(ch, start, end rune) bool {
-	if vm.IgnoreCase {
-		if vm.Unicode {
-			lower := unicode.ToLower(ch)
-			return lower >= unicode.ToLower(start) && lower <= unicode.ToLower(end)
-		}
-		lower := toASCIILower(ch)
-		return lower >= toASCIILower(start) && lower <= toASCIILower(end)
+// foldEqual reports whether a and b belong to the same Unicode simple-fold orbit.
+func foldEqual(a, b rune) bool {
+	if a == b {
+		return true
 	}
-	return ch >= start && ch <= end
+	for f := unicode.SimpleFold(a); f != a; f = unicode.SimpleFold(f) {
+		if f == b {
+			return true
+		}
+	}
+	return false
 }
 
 // toASCIILower does simple ASCII-range lower-casing (ECMA-262 non-unicode mode).
 func toASCIILower(r rune) rune {
 	if r >= 'A' && r <= 'Z' {
 		return r + ('a' - 'A')
+	}
+	return r
+}
+
+// toASCIIUpper does simple ASCII-range upper-casing (ECMA-262 non-unicode mode).
+func toASCIIUpper(r rune) rune {
+	if r >= 'a' && r <= 'z' {
+		return r - ('a' - 'A')
 	}
 	return r
 }
