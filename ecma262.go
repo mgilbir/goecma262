@@ -44,8 +44,52 @@ type Regexp struct {
 }
 
 // Compile parses a regular expression and returns, if successful,
+// Syntax selects how the compiler treats the legacy web-compatibility
+// extensions (ECMA-262 Annex B).
+type Syntax int
+
+const (
+	// SyntaxAnnexB accepts the Annex B web-compatibility extensions that
+	// browsers apply to non-Unicode patterns: legacy octal escapes,
+	// out-of-range numeric backreferences (as octal/literal), an invalid \c as
+	// a literal, and a malformed {..} quantifier as literal characters. This is
+	// the default, so a pattern that works in JavaScript's RegExp works here.
+	SyntaxAnnexB Syntax = iota
+	// SyntaxStrict rejects those constructs as compile errors, matching strict
+	// ECMA-262. The u and v flags always force strict behavior regardless of
+	// this setting (Annex B does not apply in Unicode mode).
+	SyntaxStrict
+)
+
+type config struct {
+	syntax Syntax
+}
+
+// Option configures a Compile call.
+type Option func(*config)
+
+// WithSyntax selects strict ECMA-262 or the default Annex B web-compatibility
+// behavior. See Syntax.
+func WithSyntax(s Syntax) Option {
+	return func(c *config) { c.syntax = s }
+}
+
 // a Regexp object that can be used to match against text
-func Compile(expr string, f flags.Flags) (*Regexp, error) {
+func Compile(expr string, f flags.Flags, opts ...Option) (*Regexp, error) {
+	cfg := config{syntax: SyntaxAnnexB}
+	for _, o := range opts {
+		o(&cfg)
+	}
+
+	// Validate flag combinations before parsing so Compile and CompileFlags
+	// reject the same inputs (u and v are mutually exclusive per ECMA-262).
+	if f.Has(flags.Unicode) && f.Has(flags.UnicodeSets) {
+		return nil, fmt.Errorf("incompatible flags: u and v")
+	}
+
+	// Annex B leniencies apply only outside Unicode mode.
+	annexB := cfg.syntax == SyntaxAnnexB && !f.Has(flags.Unicode) && !f.Has(flags.UnicodeSets)
+
 	// Parse the regex
 	p := parser.New(expr, parser.Flags{
 		IgnoreCase:  f.Has(flags.IgnoreCase),
@@ -53,13 +97,8 @@ func Compile(expr string, f flags.Flags) (*Regexp, error) {
 		UnicodeSets: f.Has(flags.UnicodeSets),
 		DotAll:      f.Has(flags.DotAll),
 		Multiline:   f.Has(flags.Multiline),
+		AnnexB:      annexB,
 	})
-
-	// Validate flag combinations before parsing so Compile and CompileFlags
-	// reject the same inputs (u and v are mutually exclusive per ECMA-262).
-	if f.Has(flags.Unicode) && f.Has(flags.UnicodeSets) {
-		return nil, fmt.Errorf("incompatible flags: u and v")
-	}
 
 	ast, err := p.Parse()
 	if err != nil {
@@ -94,8 +133,8 @@ func Compile(expr string, f flags.Flags) (*Regexp, error) {
 
 // MustCompile is like Compile but panics if the expression cannot be parsed.
 // It simplifies safe initialization of global variables holding compiled regular expressions.
-func MustCompile(expr string, f flags.Flags) *Regexp {
-	re, err := Compile(expr, f)
+func MustCompile(expr string, f flags.Flags, opts ...Option) *Regexp {
+	re, err := Compile(expr, f, opts...)
 	if err != nil {
 		panic(`regexp: Compile(` + quote(expr) + `): ` + err.Error())
 	}
@@ -103,12 +142,12 @@ func MustCompile(expr string, f flags.Flags) *Regexp {
 }
 
 // CompileFlags is a convenience function that compiles a regex with flags from a string
-func CompileFlags(expr string, flagStr string) (*Regexp, error) {
+func CompileFlags(expr string, flagStr string, opts ...Option) (*Regexp, error) {
 	f, err := flags.Parse(flagStr)
 	if err != nil {
 		return nil, err
 	}
-	return Compile(expr, f)
+	return Compile(expr, f, opts...)
 }
 
 // MatchString reports whether the string s contains any match of the regular expression.

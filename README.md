@@ -155,6 +155,25 @@ re, _ := ecma262.Compile(`pattern`, f)
 re, _ := ecma262.Compile(`pattern`, flags.IgnoreCase|flags.Multiline|flags.DotAll)
 ```
 
+### Syntax mode (Annex B vs strict)
+
+By default the compiler accepts the web-compatibility extensions (ECMA-262
+Annex B) that browsers apply to non-Unicode patterns, so a regex that works in
+JavaScript works here:
+
+```go
+// Default: Annex B. Legacy octal escape \5 matches U+0005; \8 is a literal "8";
+// a{2 x} matches the text "a{2 x}"; \c1 matches the characters "\c1".
+re := ecma262.MustCompile(`\5`, flags.Flags(0))
+
+// Opt into strict ECMA-262, which rejects those constructs as errors:
+re, err := ecma262.Compile(`\5`, flags.Flags(0), ecma262.WithSyntax(ecma262.SyntaxStrict))
+```
+
+The `u` and `v` flags always force strict behavior regardless of this option
+(Annex B does not apply in Unicode mode). Note that an out-of-order quantifier
+such as `a{2,1}` is a syntax error in *every* mode.
+
 ## Flags
 
 | Flag | Description |
