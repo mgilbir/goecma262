@@ -880,7 +880,9 @@ func TestTC39String(t *testing.T) {
 
 // TC39 covers String.prototype.replace with function argument
 func TestTC39ReplaceAllStringFunc(t *testing.T) {
-	re := ecma262.MustCompile(`\d+`, flags.Flags(0))
+	// The g flag selects all-vs-first replacement, consistently with
+	// ReplaceAllString (see README "use g flag for all matches").
+	re := ecma262.MustCompile(`\d+`, flags.Global)
 	result := re.ReplaceAllStringFunc("a1b22c333", func(s string) string {
 		return "[" + s + "]"
 	})

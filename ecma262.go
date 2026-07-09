@@ -294,41 +294,57 @@ func (re *Regexp) FindStringSubmatchIndex(s string) []int {
 	return result
 }
 
-// FindAllString returns a slice of all successive matches of the regular expression.
-// A return value of nil indicates no match.
-func (re *Regexp) FindAllString(s string, n int) []string {
-	if n == 0 {
+// findAllMatches returns the capture-group slices of every successive match,
+// scanning left to right. It is the single source of truth for how the search
+// cursor advances, so every iterating method (FindAll*, ReplaceAll*, Split)
+// shares identical, correct behavior — in particular for zero-width matches.
+//
+// doMatch returns the leftmost match at or after the requested start, so a
+// match may begin ahead of the cursor (e.g. a lookahead assertion). After each
+// match the cursor advances to matchEnd, and for an empty match it advances one
+// further rune past matchEnd so the same zero-width position is not re-reported.
+// limit < 0 means unlimited; limit == 0 returns no matches.
+func (re *Regexp) findAllMatches(s string, limit int) [][]int {
+	if limit == 0 {
 		return nil
 	}
-
-	var result []string
-	pos := 0
-
-	for n < 0 || len(result) < n {
-		groups := re.doMatch(s, pos)
+	var matches [][]int
+	searchStart := 0
+	for limit < 0 || len(matches) < limit {
+		if searchStart > len(s) {
+			break
+		}
+		groups := re.doMatch(s, searchStart)
 		if groups == nil || len(groups) < 2 {
 			break
 		}
+		matches = append(matches, groups)
 
-		matchStart := groups[0]
-		matchEnd := groups[1]
-
-		result = append(result, s[matchStart:matchEnd])
-
-		if matchStart == matchEnd {
-			// Empty match - advance by one rune
-			if pos >= len(s) {
+		matchStart, matchEnd := groups[0], groups[1]
+		if matchEnd > matchStart {
+			searchStart = matchEnd
+		} else {
+			// Empty match: advance one rune past the match position.
+			if matchEnd >= len(s) {
 				break
 			}
-			_, size := utf8.DecodeRuneInString(s[pos:])
-			pos += size
-		} else {
-			pos = matchEnd
+			_, size := utf8.DecodeRuneInString(s[matchEnd:])
+			searchStart = matchEnd + size
 		}
 	}
+	return matches
+}
 
-	if len(result) == 0 {
+// FindAllString returns a slice of all successive matches of the regular expression.
+// A return value of nil indicates no match.
+func (re *Regexp) FindAllString(s string, n int) []string {
+	matches := re.findAllMatches(s, n)
+	if len(matches) == 0 {
 		return nil
+	}
+	result := make([]string, len(matches))
+	for i, g := range matches {
+		result[i] = s[g[0]:g[1]]
 	}
 	return result
 }
@@ -351,42 +367,20 @@ func (re *Regexp) FindAll(b []byte, n int) [][]byte {
 // It returns the matches and submatches.
 // A return value of nil indicates no match.
 func (re *Regexp) FindAllStringSubmatch(s string, n int) [][]string {
-	if n == 0 {
+	matches := re.findAllMatches(s, n)
+	if len(matches) == 0 {
 		return nil
 	}
-
-	var result [][]string
-	pos := 0
-
-	for n < 0 || len(result) < n {
-		groups := re.doMatch(s, pos)
-		if groups == nil {
-			break
-		}
-
-		matchStart := groups[0]
-		matchEnd := groups[1]
-
+	result := make([][]string, len(matches))
+	for mi, groups := range matches {
 		match := make([]string, re.numGroups+1)
 		for i := 0; i <= re.numGroups; i++ {
 			if i*2+1 < len(groups) && groups[i*2] >= 0 && groups[i*2+1] >= 0 {
 				match[i] = s[groups[i*2]:groups[i*2+1]]
 			}
 		}
-		result = append(result, match)
-
-		if matchStart == matchEnd {
-			// Empty match - advance by one rune
-			if pos >= len(s) {
-				break
-			}
-			_, size := utf8.DecodeRuneInString(s[pos:])
-			pos += size
-		} else {
-			pos = matchEnd
-		}
+		result[mi] = match
 	}
-
 	return result
 }
 
@@ -402,42 +396,20 @@ func (re *Regexp) FindAllStringSubmatch(s string, n int) [][]string {
 //	$nn → nth capture group (two digits)
 //	$<name> → named capture group
 func (re *Regexp) ReplaceAllString(src, repl string) string {
+	// Without the global flag only the first match is replaced.
+	limit := -1
+	if !re.global {
+		limit = 1
+	}
+	matches := re.findAllMatches(src, limit)
+
 	var result strings.Builder
 	lastEnd := 0
-	pos := 0
-
-	for {
-		groups := re.doMatch(src, pos)
-		if groups == nil || len(groups) < 2 {
-			break
-		}
-
-		matchStart := groups[0]
-		matchEnd := groups[1]
-
-		result.WriteString(src[lastEnd:matchStart])
+	for _, groups := range matches {
+		result.WriteString(src[lastEnd:groups[0]])
 		result.WriteString(re.expandRepl(repl, src, groups))
-
-		if matchStart == matchEnd {
-			if pos >= len(src) {
-				lastEnd = matchEnd
-				break
-			}
-			_, size := utf8.DecodeRuneInString(src[pos:])
-			result.WriteString(src[pos : pos+size])
-			pos += size
-			lastEnd = pos
-		} else {
-			lastEnd = matchEnd
-			pos = matchEnd
-		}
-
-		// Without the global flag, only replace the first match
-		if !re.global {
-			break
-		}
+		lastEnd = groups[1]
 	}
-
 	result.WriteString(src[lastEnd:])
 	return result.String()
 }
@@ -451,37 +423,21 @@ func (re *Regexp) ReplaceAll(src, repl []byte) []byte {
 // ReplaceAllStringFunc returns a copy of src in which all matches of the regexp
 // have been replaced by the return value of the function fn applied to the matched string
 func (re *Regexp) ReplaceAllStringFunc(src string, fn func(string) string) string {
+	// Match ReplaceAllString: without the global flag only the first match is
+	// replaced.
+	limit := -1
+	if !re.global {
+		limit = 1
+	}
+	matches := re.findAllMatches(src, limit)
+
 	var result strings.Builder
 	lastEnd := 0
-	pos := 0
-
-	for {
-		groups := re.doMatch(src, pos)
-		if groups == nil || len(groups) < 2 {
-			break
-		}
-
-		matchStart := groups[0]
-		matchEnd := groups[1]
-
-		result.WriteString(src[lastEnd:matchStart])
-		result.WriteString(fn(src[matchStart:matchEnd]))
-
-		if matchStart == matchEnd {
-			if pos >= len(src) {
-				lastEnd = matchEnd
-				break
-			}
-			_, size := utf8.DecodeRuneInString(src[pos:])
-			result.WriteString(src[pos : pos+size])
-			pos += size
-			lastEnd = pos
-		} else {
-			lastEnd = matchEnd
-			pos = matchEnd
-		}
+	for _, groups := range matches {
+		result.WriteString(src[lastEnd:groups[0]])
+		result.WriteString(fn(src[groups[0]:groups[1]]))
+		lastEnd = groups[1]
 	}
-
 	result.WriteString(src[lastEnd:])
 	return result.String()
 }
@@ -587,21 +543,30 @@ func (re *Regexp) expandRepl(repl, src string, groups []int) string {
 			}
 		default:
 			if repl[i] >= '0' && repl[i] <= '9' {
-				// $n or $nn → capture group
-				numStr := string(repl[i])
-				i++
-				// Try two-digit group number
-				if i < len(repl) && repl[i] >= '0' && repl[i] <= '9' {
-					twoDigit, _ := strconv.Atoi(numStr + string(repl[i]))
-					if twoDigit <= re.numGroups {
-						numStr += string(repl[i])
-						i++
+				// $n or $nn → capture group, per ECMA-262 GetSubstitution.
+				// A two-digit number is preferred when it names a valid group;
+				// otherwise a single digit is tried. Only 1..numGroups are valid
+				// references — $0, $00 and out-of-range numbers are literal.
+				chosen, consume := -1, 0
+				if i+1 < len(repl) && repl[i+1] >= '0' && repl[i+1] <= '9' {
+					if n2, err := strconv.Atoi(repl[i : i+2]); err == nil && n2 >= 1 && n2 <= re.numGroups {
+						chosen, consume = n2, 2
 					}
 				}
-				num, _ := strconv.Atoi(numStr)
-				if num >= 0 && num*2+1 < len(groups) &&
-					groups[num*2] >= 0 && groups[num*2+1] >= 0 {
-					result.WriteString(src[groups[num*2]:groups[num*2+1]])
+				if chosen < 0 {
+					if n1 := int(repl[i] - '0'); n1 >= 1 && n1 <= re.numGroups {
+						chosen, consume = n1, 1
+					}
+				}
+				if chosen >= 1 {
+					i += consume
+					if chosen*2+1 < len(groups) && groups[chosen*2] >= 0 && groups[chosen*2+1] >= 0 {
+						result.WriteString(src[groups[chosen*2]:groups[chosen*2+1]])
+					}
+				} else {
+					// Not a valid group reference (e.g. $0) — emit a literal $
+					// and let the digits be copied verbatim on the next passes.
+					result.WriteByte('$')
 				}
 			} else {
 				// Unknown $ sequence — emit literal $
@@ -623,33 +588,16 @@ func (re *Regexp) Split(s string, n int) []string {
 		n = len(s) + 1
 	}
 
-	var result []string
-	pos := 0
-	lastEnd := 0
+	matches := re.findAllMatches(s, -1)
 
-	for len(result) < n-1 {
-		groups := re.doMatch(s, pos)
-		if groups == nil || len(groups) < 2 {
+	var result []string
+	lastEnd := 0
+	for _, groups := range matches {
+		if len(result) >= n-1 {
 			break
 		}
-
-		matchStart := groups[0]
-		matchEnd := groups[1]
-
-		result = append(result, s[lastEnd:matchStart])
-
-		if matchStart == matchEnd {
-			// Empty match - advance by one rune
-			if pos >= len(s) {
-				break
-			}
-			_, size := utf8.DecodeRuneInString(s[pos:])
-			pos += size
-			lastEnd = pos
-		} else {
-			lastEnd = matchEnd
-			pos = matchEnd
-		}
+		result = append(result, s[lastEnd:groups[0]])
+		lastEnd = groups[1]
 	}
 
 	result = append(result, s[lastEnd:])
