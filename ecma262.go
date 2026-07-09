@@ -11,7 +11,6 @@ import (
 	"io"
 	"strconv"
 	"strings"
-	"unicode"
 	"unicode/utf8"
 
 	"github.com/mgilbir/goecma262/compiler"
@@ -113,13 +112,20 @@ func CompileFlags(expr string, flagStr string) (*Regexp, error) {
 }
 
 // MatchString reports whether the string s contains any match of the regular expression.
-// For patterns with the g or y flag, matching starts at re.lastIndex.
+// For patterns with the g or y flag, matching starts at re.lastIndex, and
+// lastIndex is advanced to the end of the match (or reset to 0 on no match),
+// mirroring JavaScript RegExp.prototype.test so repeated calls iterate.
 func (re *Regexp) MatchString(s string) bool {
-	startPos := 0
-	if re.global || re.sticky {
-		startPos = re.lastIndex
+	if !re.global && !re.sticky {
+		return re.doMatch(s, 0) != nil
 	}
-	return re.doMatch(s, startPos) != nil
+	groups := re.doMatch(s, re.lastIndex)
+	if groups == nil || len(groups) < 2 {
+		re.lastIndex = 0
+		return false
+	}
+	re.lastIndex = groups[1]
+	return true
 }
 
 // SetMaxSteps sets the maximum VM instruction steps for each match operation.
@@ -248,7 +254,13 @@ func (re *Regexp) FindStringSubmatch(s string) []string {
 	}
 	groups := re.doMatch(s, startPos)
 	if groups == nil {
+		if re.global || re.sticky {
+			re.lastIndex = 0
+		}
 		return nil
+	}
+	if (re.global || re.sticky) && len(groups) >= 2 {
+		re.lastIndex = groups[1]
 	}
 
 	totalGroups := re.numGroups + 1
@@ -631,16 +643,6 @@ func (re *Regexp) String() string {
 	return re.expr
 }
 
-// UnmarshalText implements encoding.TextUnmarshaler
-func (re *Regexp) UnmarshalText(text []byte) error {
-	newRE, err := Compile(string(text), flags.Flags(0))
-	if err != nil {
-		return err
-	}
-	*re = *newRE
-	return nil
-}
-
 // doMatch performs the actual matching and returns the capture groups
 func (re *Regexp) doMatch(s string, startPos int) []int {
 	// Clamp the start position. A negative lastIndex is treated as 0; a
@@ -763,31 +765,6 @@ func MatchString(pattern string, f flags.Flags, s string) (matched bool, err err
 		return false, err
 	}
 	return re.MatchString(s), nil
-}
-
-// isValidIdentifierName reports whether s is a valid ECMAScript IdentifierName.
-// An IdentifierName starts with $, _, or a Unicode letter (ID_Start),
-// followed by $, _, digits, or Unicode letters/combining marks (ID_Continue).
-func isValidIdentifierName(s string) bool {
-	if s == "" {
-		return false
-	}
-	first := true
-	for _, r := range s {
-		if first {
-			if r == '$' || r == '_' || unicode.IsLetter(r) {
-				first = false
-				continue
-			}
-			return false
-		}
-		if r == '$' || r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r) ||
-			r == 0x200C || r == 0x200D {
-			continue
-		}
-		return false
-	}
-	return !first
 }
 
 // Helper functions

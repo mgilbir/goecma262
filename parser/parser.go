@@ -604,17 +604,6 @@ func (p *Parser) parseGroupName() (string, error) {
 	}
 }
 
-func tokenRune(tok Token) (rune, bool) {
-	r, size := utf8.DecodeRuneInString(tok.Value)
-	if r == utf8.RuneError && size == 1 {
-		return 0, false
-	}
-	if size != len(tok.Value) {
-		return 0, false
-	}
-	return r, true
-}
-
 func isIdentifierStartRune(r rune, unicodeMode bool) bool {
 	if r == '$' || r == '_' {
 		return true

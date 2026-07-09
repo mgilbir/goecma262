@@ -22,8 +22,8 @@ This library implements ECMA-262 regular expressions with support for:
 - ✅ Flags: `i` (ignore case), `g` (global), `m` (multiline), `s` (dotAll), `u` (unicode), `v` (unicodeSets), `y` (sticky), `d` (hasIndices)
 - ✅ Named capture groups: `(?<name>abc)` and backreferences `\k<name>`
 - ✅ Lookahead: `(?=...)` and `(?!...)`
-- ⚠️ Lookbehind: `(?<=...)` and `(?<!...)` (basic support)
-- ⚠️ Unicode property escapes: `\p{...}` and `\P{...}` (partial; requires `u`/`v`)
+- ✅ Lookbehind: `(?<=...)` and `(?<!...)` (including variable-length; see limitation on right-to-left capture semantics below)
+- ✅ Unicode property escapes: `\p{...}` and `\P{...}` (all general categories, scripts via `Script=`, and common binary properties; requires `u`/`v`; unknown names are rejected)
 - ✅ Hex escapes: `\xFF`
 - ✅ Unicode escapes: `\uFFFF` and `\u{...}` (requires `u`/`v` for code point escapes)
 - ✅ Control characters: `\cA`
@@ -166,7 +166,7 @@ re, _ := ecma262.Compile(`pattern`, flags.IgnoreCase|flags.Multiline|flags.DotAl
 | `u` | Unicode - enable Unicode features (required for `\p{...}` and `\u{...}`) |
 | `v` | UnicodeSets - extended Unicode features (cannot use with `u`) |
 | `y` | Sticky - match only from lastIndex position |
-| `d` | HasIndices - include match indices in results |
+| `d` | HasIndices - parsed and accepted, but match indices are **not** exposed in the API (see Known Limitations) |
 
 ## Architecture
 
@@ -182,11 +182,11 @@ The VM uses a thread-based backtracking approach similar to the one described in
 
 ## Performance
 
-Basic performance on an AMD Ryzen 9 6900HX:
+Basic performance on an AMD Ryzen 9 6900HX (`go test ./tests/ -bench . -benchmem`):
 
 ```
-BenchmarkMatch-16            583240    1973 ns/op    1848 B/op    30 allocs/op
-BenchmarkCompileAndMatch-16  364164    3034 ns/op    3552 B/op    49 allocs/op
+BenchmarkMatch-16            782073    1536 ns/op    1000 B/op    28 allocs/op
+BenchmarkCompileAndMatch-16  399681    2691 ns/op    3256 B/op    50 allocs/op
 ```
 
 ## Testing
@@ -268,19 +268,20 @@ TEST262_STRICT=1 go test ./tests/ -run TestTest262Generated
 
 ## Known Limitations
 
-1. **Lookbehind assertions** - Variable-length lookbehinds are not supported; fixed-length lookbehinds work. Lookbehind bodies are evaluated left-to-right (ECMA-262 specifies right-to-left), so capture groups inside quantified lookbehinds may return incorrect values in edge cases
-2. **Unicode property escapes** - Common properties and scripts are supported; obscure aliases may be missing
-3. **HasIndices flag** (`d`) - Flag is parsed but match indices are not exposed in the API
-4. **Nesting depth** - Patterns with more than 200 levels of nesting will fail to compile
+1. **Lookbehind capture semantics** - Both fixed- and variable-length lookbehinds match, but the body is evaluated left-to-right while ECMA-262 specifies right-to-left. Capture groups inside a quantified lookbehind therefore return the last (rightmost) iteration's value instead of the first (leftmost); e.g. `(?<=(?<a>\w){3})f` on `"abcdef"` captures `"e"` where ECMA-262 requires `"c"`.
+2. **Unicode property escapes** - All general categories, scripts (via `Script=`/`Script_Extensions=`), and the common lone binary properties are supported; some rarer binary properties may be missing (and are reported as errors rather than silently matching nothing).
+3. **HasIndices flag** (`d`) - Parsed and accepted, but match indices are not exposed in the API.
+4. **Nesting depth / program size** - Patterns nested more than 200 levels deep, or that compile to more than 200,000 instructions, are rejected at compile time.
+5. **Case folding** - Case-insensitive matching uses Unicode simple case folding under the `u` flag and ASCII-only folding otherwise; non-ASCII case folding is not applied in non-`u` mode.
 
 ## Contributing
 
 Contributions are welcome! Areas that need work:
 
 - Right-to-left lookbehind evaluation (ECMA-262 compliant capture semantics)
-- Variable-length lookbehind support
-- Broader Unicode property coverage
+- Broader Unicode binary-property coverage
 - HasIndices (`d` flag) match index exposure in the API
+- Non-`u`-mode non-ASCII case folding
 - Performance optimizations
 
 ## License
