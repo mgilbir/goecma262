@@ -10,8 +10,9 @@ import (
 
 // Compilation limits to prevent pathological patterns
 const (
-	MaxQuantifierRepeat = 10_000 // Max value of {n} / {n,m}
-	MaxNestingDepth     = 200    // Max AST nesting depth during compilation
+	MaxQuantifierRepeat = 10_000  // Max value of {n} / {n,m}
+	MaxNestingDepth     = 200     // Max AST nesting depth during compilation
+	MaxProgramSize      = 200_000 // Max total emitted instructions
 )
 
 // Compiler compiles regex AST to VM bytecode
@@ -56,6 +57,12 @@ func (c *Compiler) patchJump(idx, target int) {
 }
 
 func (c *Compiler) compileNode(node parser.Node) error {
+	// Bound total code size. MaxQuantifierRepeat caps a single quantifier, but
+	// nested quantifiers multiply (e.g. ((a{100}){100}){100} ~ 10^6 instrs), so
+	// the product must be bounded independently to prevent memory blowup.
+	if len(c.code) > MaxProgramSize {
+		return fmt.Errorf("compiled program too large (limit: %d instructions)", MaxProgramSize)
+	}
 	c.depth++
 	if c.depth > MaxNestingDepth {
 		return fmt.Errorf("pattern too deeply nested (limit: %d)", MaxNestingDepth)

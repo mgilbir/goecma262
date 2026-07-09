@@ -243,9 +243,12 @@ func (l *Lexer) readEscape() Token {
 		// Escaped special characters
 		return Token{Type: TokenLiteral, Value: string(ch), Pos: pos}
 	default:
-		// Identity escape (in unicode mode, only certain chars can be escaped)
+		// Identity escape. In Unicode mode only SyntaxCharacter and '/' are
+		// valid as an AtomEscape, plus '-', which is a valid ClassEscape inside
+		// a character class (e.g. [a\-z]). The lexer is context-free, so '-' is
+		// permitted here and treated as the literal '-'.
 		if l.flags.Unicode || l.flags.UnicodeSets {
-			if !isSyntaxCharacter(ch) && ch != '/' {
+			if !isSyntaxCharacter(ch) && ch != '/' && ch != '-' {
 				return Token{Type: TokenError, Value: fmt.Sprintf("invalid escape sequence: \\%c", ch), Pos: pos}
 			}
 		}
