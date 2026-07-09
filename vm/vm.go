@@ -80,9 +80,6 @@ const (
 
 	// Group reset for quantifier body repeats (ES2022 group-reset semantics)
 	OpResetGroups // Reset groups[A..B] (inclusive, 1-indexed) to -1
-
-	// Position anchor used in lookbehind sub-VMs: succeeds only if current pos == A.
-	OpRequirePos
 )
 
 // Instruction represents a single VM instruction
@@ -177,8 +174,6 @@ func (i Instruction) String() string {
 		return fmt.Sprintf("not-unicode-prop %s", i.Prop)
 	case OpResetGroups:
 		return fmt.Sprintf("reset-groups %d..%d", i.A, i.B)
-	case OpRequirePos:
-		return fmt.Sprintf("require-pos %d", i.A)
 	default:
 		return fmt.Sprintf("unknown(%d)", i.Op)
 	}
@@ -196,8 +191,33 @@ type VM struct {
 	MaxSteps   int // 0 means use DefaultMaxSteps
 	Err        error
 
+	// Backward runs the engine right-to-left: character instructions consume the
+	// rune ending at pos (pos decreases), and group save ops record the group's
+	// far/near edge accordingly. Used for lookbehind, whose body is compiled in
+	// reversed order so that RTL evaluation yields ECMA-262 capture semantics.
+	Backward bool
+
 	steps         int             // current step count
 	visitedSplits map[string]bool // memoized failed split states (pos, pc, groups)
+}
+
+// readRune returns the rune to consume at pos and the position after consuming
+// it, honoring the match direction: forward reads the rune at pos and advances,
+// backward reads the rune ending at pos and retreats. ok is false at the
+// boundary (end of input forward, start of input backward).
+func (vm *VM) readRune(pos int) (r rune, next int, ok bool) {
+	if vm.Backward {
+		if pos <= 0 {
+			return 0, pos, false
+		}
+		r, size := utf8.DecodeLastRuneInString(vm.Input[:pos])
+		return r, pos - size, true
+	}
+	if pos >= len(vm.Input) {
+		return 0, pos, false
+	}
+	r, size := utf8.DecodeRuneInString(vm.Input[pos:])
+	return r, pos + size, true
 }
 
 // matchResult holds the result of a recursive match attempt
@@ -285,99 +305,75 @@ func (vm *VM) exec(pos, pc int, groups []int) matchResult {
 			return matchResult{matched: true, pos: pos, groups: copyGroups(groups)}
 
 		case OpChar:
-			if pos >= len(vm.Input) {
+			r, next, ok := vm.readRune(pos)
+			if !ok || !vm.matchChar(r, inst.Char) {
 				return matchResult{matched: false}
 			}
-			r, size := utf8.DecodeRuneInString(vm.Input[pos:])
-			if !vm.matchChar(r, inst.Char) {
-				return matchResult{matched: false}
-			}
-			pos += size
+			pos = next
 			pc++
 
 		case OpAny:
-			if pos >= len(vm.Input) {
+			r, next, ok := vm.readRune(pos)
+			if !ok || (!vm.DotAll && isLineTerminator(r)) {
 				return matchResult{matched: false}
 			}
-			r, size := utf8.DecodeRuneInString(vm.Input[pos:])
-			if !vm.DotAll && isLineTerminator(r) {
-				return matchResult{matched: false}
-			}
-			pos += size
+			pos = next
 			pc++
 
 		case OpDigit:
-			if pos >= len(vm.Input) {
-				return matchResult{matched: false}
-			}
-			r, size := utf8.DecodeRuneInString(vm.Input[pos:])
+			r, next, ok := vm.readRune(pos)
 			// ECMA-262: \d matches only [0-9], not full Unicode digits
-			if !isECMADigit(r) {
+			if !ok || !isECMADigit(r) {
 				return matchResult{matched: false}
 			}
-			pos += size
+			pos = next
 			pc++
 
 		case OpNonDigit:
-			if pos >= len(vm.Input) {
+			r, next, ok := vm.readRune(pos)
+			if !ok || isECMADigit(r) {
 				return matchResult{matched: false}
 			}
-			r, size := utf8.DecodeRuneInString(vm.Input[pos:])
-			if isECMADigit(r) {
-				return matchResult{matched: false}
-			}
-			pos += size
+			pos = next
 			pc++
 
 		case OpWord:
-			if pos >= len(vm.Input) {
+			r, next, ok := vm.readRune(pos)
+			if !ok || !isWordChar(r) {
 				return matchResult{matched: false}
 			}
-			r, size := utf8.DecodeRuneInString(vm.Input[pos:])
-			if !isWordChar(r) {
-				return matchResult{matched: false}
-			}
-			pos += size
+			pos = next
 			pc++
 
 		case OpNonWord:
-			if pos >= len(vm.Input) {
+			r, next, ok := vm.readRune(pos)
+			if !ok || isWordChar(r) {
 				return matchResult{matched: false}
 			}
-			r, size := utf8.DecodeRuneInString(vm.Input[pos:])
-			if isWordChar(r) {
-				return matchResult{matched: false}
-			}
-			pos += size
+			pos = next
 			pc++
 
 		case OpSpace:
-			if pos >= len(vm.Input) {
+			r, next, ok := vm.readRune(pos)
+			if !ok || !isSpace(r) {
 				return matchResult{matched: false}
 			}
-			r, size := utf8.DecodeRuneInString(vm.Input[pos:])
-			if !isSpace(r) {
-				return matchResult{matched: false}
-			}
-			pos += size
+			pos = next
 			pc++
 
 		case OpNonSpace:
-			if pos >= len(vm.Input) {
+			r, next, ok := vm.readRune(pos)
+			if !ok || isSpace(r) {
 				return matchResult{matched: false}
 			}
-			r, size := utf8.DecodeRuneInString(vm.Input[pos:])
-			if isSpace(r) {
-				return matchResult{matched: false}
-			}
-			pos += size
+			pos = next
 			pc++
 
 		case OpClass:
-			if pos >= len(vm.Input) {
+			r, next, ok := vm.readRune(pos)
+			if !ok {
 				return matchResult{matched: false}
 			}
-			r, size := utf8.DecodeRuneInString(vm.Input[pos:])
 			matched := false
 			for _, atom := range inst.Class {
 				atomMatch := false
@@ -407,7 +403,7 @@ func (vm *VM) exec(pos, pc int, groups []int) matchResult {
 			if !matched {
 				return matchResult{matched: false}
 			}
-			pos += size
+			pos = next
 			pc++
 
 		case OpStartLine:
@@ -455,15 +451,26 @@ func (vm *VM) exec(pos, pc int, groups []int) matchResult {
 			pc++
 
 		case OpSaveStart:
-			// Copy groups, update, then continue
+			// Copy groups, update, then continue. When matching backward, this
+			// instruction is reached at the group's far (right) edge, so it
+			// records the end; OpSaveEnd, reached at the near (left) edge, records
+			// the start. A group's stored range is always [start, end].
 			newGroups := copyGroups(groups)
-			newGroups[inst.A*2] = pos
+			if vm.Backward {
+				newGroups[inst.A*2+1] = pos
+			} else {
+				newGroups[inst.A*2] = pos
+			}
 			groups = newGroups
 			pc++
 
 		case OpSaveEnd:
 			newGroups := copyGroups(groups)
-			newGroups[inst.A*2+1] = pos
+			if vm.Backward {
+				newGroups[inst.A*2] = pos
+			} else {
+				newGroups[inst.A*2+1] = pos
+			}
 			groups = newGroups
 			pc++
 
@@ -525,7 +532,21 @@ func (vm *VM) exec(pos, pc int, groups []int) matchResult {
 			}
 
 			refText := vm.Input[start:end]
-			if vm.IgnoreCase {
+			if vm.Backward {
+				// Match the referenced text ending at pos, consuming backward.
+				if vm.IgnoreCase {
+					ok, consumed := vm.matchStringIgnoreCaseBackward(vm.Input[:pos], refText)
+					if !ok {
+						return matchResult{matched: false}
+					}
+					pos -= consumed
+				} else {
+					if pos < len(refText) || vm.Input[pos-len(refText):pos] != refText {
+						return matchResult{matched: false}
+					}
+					pos -= len(refText)
+				}
+			} else if vm.IgnoreCase {
 				// Case-insensitive backreference matching
 				ok, consumed := vm.matchStringIgnoreCaseAt(vm.Input[pos:], refText)
 				if !ok {
@@ -574,25 +595,19 @@ func (vm *VM) exec(pos, pc int, groups []int) matchResult {
 			}
 
 		case OpUnicodeProp:
-			if pos >= len(vm.Input) {
+			r, next, ok := vm.readRune(pos)
+			if !ok || !matchUnicodeProperty(r, inst.Prop) {
 				return matchResult{matched: false}
 			}
-			r, size := utf8.DecodeRuneInString(vm.Input[pos:])
-			if !matchUnicodeProperty(r, inst.Prop) {
-				return matchResult{matched: false}
-			}
-			pos += size
+			pos = next
 			pc++
 
 		case OpNotUnicodeProp:
-			if pos >= len(vm.Input) {
+			r, next, ok := vm.readRune(pos)
+			if !ok || matchUnicodeProperty(r, inst.Prop) {
 				return matchResult{matched: false}
 			}
-			r, size := utf8.DecodeRuneInString(vm.Input[pos:])
-			if matchUnicodeProperty(r, inst.Prop) {
-				return matchResult{matched: false}
-			}
-			pos += size
+			pos = next
 			pc++
 
 		case OpResetGroups:
@@ -606,14 +621,6 @@ func (vm *VM) exec(pos, pc int, groups []int) matchResult {
 				}
 			}
 			groups = newGroups
-			pc++
-
-		case OpRequirePos:
-			// Succeed only if the current position equals inst.A.
-			// Used in lookbehind sub-VMs to anchor the match end.
-			if pos != inst.A {
-				return matchResult{matched: false}
-			}
 			pc++
 
 		default:
@@ -673,17 +680,17 @@ func (vm *VM) executeLookahead(startPC, endPC, pos int, groups []int) bool {
 	return matched
 }
 
-// executeLookbehind tries matching the lookbehind body ending at the current position.
-// It tries progressively longer prefixes ending at pos using a sub-VM anchored at pos.
+// executeLookbehind matches the lookbehind body ending at the current position.
+// The body was compiled in reversed order, so running it backward from pos (the
+// body's right edge) evaluates it right-to-left per ECMA-262, which gives the
+// correct capture-group values inside quantified/backreferencing lookbehinds.
+// The match starts at pos and consumes toward the start of input; wherever the
+// body's left edge lands is the (zero-width) lookbehind's start.
 func (vm *VM) executeLookbehind(startPC, endPC, pos int, groups []int) bool {
-	// Build a sub-VM with only the lookbehind body.
-	// We append OpRequirePos (checks pos==target) then OpMatch at the end.
-	// This allows the VM backtracker to naturally find a match ending at pos.
 	bodyLen := endPC - startPC
-	subCode := make([]Instruction, bodyLen+2)
+	subCode := make([]Instruction, bodyLen+1)
 	copy(subCode, vm.Code[startPC:endPC])
-	subCode[bodyLen] = Instruction{Op: OpRequirePos, A: pos}
-	subCode[bodyLen+1] = Instruction{Op: OpMatch}
+	subCode[bodyLen] = Instruction{Op: OpMatch}
 
 	for i := range subCode[:bodyLen] {
 		switch subCode[i].Op {
@@ -707,30 +714,45 @@ func (vm *VM) executeLookbehind(startPC, endPC, pos int, groups []int) bool {
 		DotAll:     vm.DotAll,
 		Unicode:    vm.Unicode,
 		MaxSteps:   vm.MaxSteps,
+		Backward:   true,
 	}
 
-	// Try every possible start position before pos.
-	// The sub-VM will backtrack to find an execution path that ends exactly at pos.
-	for tryPos := 0; tryPos <= pos; tryPos++ {
-		// Pass outer groups so backreferences inside lookbehind can see prior captures
-		matched, _, subGroups := subVM.matchWithInitialGroups(vm.Input, tryPos, groups)
-		if subVM.Err != nil {
-			vm.Err = subVM.Err
-			return false
-		}
-		if matched {
-			// Propagate captures from lookbehind body back into outer groups
-			if subGroups != nil {
-				for i := 0; i < len(subGroups) && i < len(groups); i++ {
-					if subGroups[i] >= 0 {
-						groups[i] = subGroups[i]
-					}
-				}
+	// Pass outer groups so backreferences inside the lookbehind can see prior captures.
+	matched, _, subGroups := subVM.matchWithInitialGroups(vm.Input, pos, groups)
+	if subVM.Err != nil {
+		vm.Err = subVM.Err
+		return false
+	}
+	if matched && subGroups != nil {
+		for i := 0; i < len(subGroups) && i < len(groups); i++ {
+			if subGroups[i] >= 0 {
+				groups[i] = subGroups[i]
 			}
-			return true
 		}
 	}
-	return false
+	return matched
+}
+
+// matchStringIgnoreCaseBackward matches ref against the end of sBefore
+// (= vm.Input[:pos]) case-insensitively, consuming from the end, and returns
+// how many bytes of sBefore were consumed.
+func (vm *VM) matchStringIgnoreCaseBackward(sBefore, ref string) (bool, int) {
+	si, ri := len(sBefore), len(ref)
+	consumed := 0
+	for ri > 0 {
+		if si <= 0 {
+			return false, 0
+		}
+		sr, sSize := utf8.DecodeLastRuneInString(sBefore[:si])
+		rr, rSize := utf8.DecodeLastRuneInString(ref[:ri])
+		if !vm.matchChar(sr, rr) {
+			return false, 0
+		}
+		si -= sSize
+		consumed += sSize
+		ri -= rSize
+	}
+	return true, consumed
 }
 
 // matchStringIgnoreCaseAt compares a prefix of s against ref and returns

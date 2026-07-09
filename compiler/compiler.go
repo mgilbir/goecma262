@@ -479,7 +479,10 @@ func (c *Compiler) compileLookbehind(l *parser.Lookbehind) error {
 
 	bodyStart := len(c.code)
 
-	err := c.compileNode(l.Body)
+	// Compile the body in reversed order; the VM runs the lookbehind sub-VM
+	// backward, so a reversed program matched right-to-left reproduces ECMA-262
+	// lookbehind evaluation (including capture-group and backreference order).
+	err := c.compileNode(reverseExpr(l.Body))
 	if err != nil {
 		return err
 	}
@@ -498,7 +501,7 @@ func (c *Compiler) compileNegativeLookbehind(l *parser.NegativeLookbehind) error
 
 	bodyStart := len(c.code)
 
-	err := c.compileNode(l.Body)
+	err := c.compileNode(reverseExpr(l.Body))
 	if err != nil {
 		return err
 	}
@@ -510,6 +513,39 @@ func (c *Compiler) compileNegativeLookbehind(l *parser.NegativeLookbehind) error
 	c.code[jmpIdx].A = bodyEnd
 
 	return nil
+}
+
+// reverseExpr returns a structurally reversed copy of e for right-to-left
+// lookbehind compilation: sequences are emitted last-element-first and group
+// bodies are reversed, while capture indices are preserved. Single-width atoms
+// (literals, classes, escapes, anchors, backreferences) are unchanged, and
+// nested lookarounds are treated as atomic — they carry their own direction and
+// reverse (or not) their own bodies when compiled.
+func reverseExpr(e parser.Expression) parser.Expression {
+	switch n := e.(type) {
+	case *parser.Sequence:
+		rev := make([]parser.Expression, len(n.Elements))
+		for i, el := range n.Elements {
+			rev[len(n.Elements)-1-i] = reverseExpr(el)
+		}
+		return &parser.Sequence{Elements: rev}
+	case *parser.Disjunction:
+		alts := make([]parser.Expression, len(n.Alternatives))
+		for i, a := range n.Alternatives {
+			alts[i] = reverseExpr(a)
+		}
+		return &parser.Disjunction{Alternatives: alts}
+	case *parser.Quantifier:
+		return &parser.Quantifier{Min: n.Min, Max: n.Max, Greedy: n.Greedy, Body: reverseExpr(n.Body)}
+	case *parser.Group:
+		return &parser.Group{Index: n.Index, Body: reverseExpr(n.Body)}
+	case *parser.NamedGroup:
+		return &parser.NamedGroup{Index: n.Index, Name: n.Name, Body: reverseExpr(n.Body)}
+	case *parser.NonCapturingGroup:
+		return &parser.NonCapturingGroup{Body: reverseExpr(n.Body)}
+	default:
+		return e
+	}
 }
 
 func (c *Compiler) compileUnicodeProperty(u *parser.UnicodeProperty) error {

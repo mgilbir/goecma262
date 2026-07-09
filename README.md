@@ -22,7 +22,7 @@ This library implements ECMA-262 regular expressions with support for:
 - ✅ Flags: `i` (ignore case), `g` (global), `m` (multiline), `s` (dotAll), `u` (unicode), `v` (unicodeSets), `y` (sticky), `d` (hasIndices)
 - ✅ Named capture groups: `(?<name>abc)` and backreferences `\k<name>`
 - ✅ Lookahead: `(?=...)` and `(?!...)`
-- ✅ Lookbehind: `(?<=...)` and `(?<!...)` (including variable-length; see limitation on right-to-left capture semantics below)
+- ✅ Lookbehind: `(?<=...)` and `(?<!...)` (including variable-length, with ECMA-262 right-to-left capture semantics)
 - ✅ Unicode property escapes: `\p{...}` and `\P{...}` (all general categories, scripts via `Script=`, and common binary properties; requires `u`/`v`; unknown names are rejected)
 - ✅ Hex escapes: `\xFF`
 - ✅ Unicode escapes: `\uFFFF` and `\u{...}` (requires `u`/`v` for code point escapes)
@@ -230,14 +230,13 @@ The test cases are extracted from the `test/built-ins/RegExp` subtree and compil
 
 **Current result: all 66 136 cases pass or are explicitly skipped.**
 
-21 cases are permanently skipped because they require JavaScript runtime semantics or
+14 cases are permanently skipped because they require JavaScript runtime semantics or
 hit implementation limits that cannot be resolved in a static Go API:
 
 | Category | Count | Reason |
 |---|---|---|
 | Functional replace (`functional-replace-*.js`) | 8 | Replacement argument is a JS arrow function; Go has no JS runtime to execute it |
 | RegExp subclass (`groups-object-subclass*.js`) | 4 | Tests override `Symbol.replace` and inject a custom JS groups object; not representable in Go |
-| Lookbehind right-to-left captures (`lookbehind.js`, `back-references-to-captures.js`) | 7 | ECMA-262 evaluates lookbehind bodies right-to-left; our left-to-right implementation produces incorrect capture groups when a quantified capture sits inside the lookbehind |
 | Deeply nested patterns (`S15.10.2.8_A3_T15.js`, `S15.10.2.8_A3_T16.js`) | 2 | Patterns with 200+ nesting levels hit the compile-time `MaxNestingDepth` limit |
 
 These skips are recorded in `tests/test262_skip_test.go`.  That file is **not** overwritten
@@ -287,7 +286,7 @@ TEST262_STRICT=1 go test ./tests/ -run TestTest262Generated
 
 ## Known Limitations
 
-1. **Lookbehind capture semantics** - Both fixed- and variable-length lookbehinds match, but the body is evaluated left-to-right while ECMA-262 specifies right-to-left. Capture groups inside a quantified lookbehind therefore return the last (rightmost) iteration's value instead of the first (leftmost); e.g. `(?<=(?<a>\w){3})f` on `"abcdef"` captures `"e"` where ECMA-262 requires `"c"`.
+1. **Lookbehind** - Fully supported, including variable-length bodies and ECMA-262 right-to-left capture semantics (a quantified capture inside a lookbehind takes the leftmost iteration's value, and a backreference to a group defined inside the same lookbehind is well-defined).
 2. **Unicode property escapes** - All general categories, scripts (via `Script=`/`Script_Extensions=`), and most binary properties are supported, including aliases (`\p{AHex}`, `\p{WSpace}`) and computed properties (`\p{Cased}`, `\p{Math}`, `\p{ID_Start}`, …). The Emoji-family properties (`\p{Emoji}`, `\p{Emoji_Presentation}`, `\p{Extended_Pictographic}`, …) have no Go table and are reported as errors rather than silently matching nothing; a few computed properties (`Case_Ignorable`, `Default_Ignorable_Code_Point`, `XID_*`) are close approximations.
 3. **HasIndices flag** (`d`) - Parsed and accepted, but it has no effect: match indices are always available through the `*Index` methods (`FindStringSubmatchIndex`, `FindAllStringSubmatchIndex`, etc.), which return `[start, end)` byte-offset pairs per group (`-1` for a non-participating group). Named-group indices (JavaScript's `indices.groups`) are obtained by combining `SubexpIndex(name)` with those pairs.
 4. **Nesting depth / program size** - Patterns nested more than 200 levels deep, or that compile to more than 200,000 instructions, are rejected at compile time.
@@ -297,7 +296,6 @@ TEST262_STRICT=1 go test ./tests/ -run TestTest262Generated
 
 Contributions are welcome! Areas that need work:
 
-- Right-to-left lookbehind evaluation (ECMA-262 compliant capture semantics)
 - Emoji-family Unicode properties (need embedded Unicode data)
 - Performance optimizations
 
