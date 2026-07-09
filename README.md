@@ -288,7 +288,7 @@ TEST262_STRICT=1 go test ./tests/ -run TestTest262Generated
 ## Known Limitations
 
 1. **Lookbehind capture semantics** - Both fixed- and variable-length lookbehinds match, but the body is evaluated left-to-right while ECMA-262 specifies right-to-left. Capture groups inside a quantified lookbehind therefore return the last (rightmost) iteration's value instead of the first (leftmost); e.g. `(?<=(?<a>\w){3})f` on `"abcdef"` captures `"e"` where ECMA-262 requires `"c"`.
-2. **Unicode property escapes** - All general categories, scripts (via `Script=`/`Script_Extensions=`), and the common lone binary properties are supported; some rarer binary properties may be missing (and are reported as errors rather than silently matching nothing).
+2. **Unicode property escapes** - All general categories, scripts (via `Script=`/`Script_Extensions=`), and most binary properties are supported, including aliases (`\p{AHex}`, `\p{WSpace}`) and computed properties (`\p{Cased}`, `\p{Math}`, `\p{ID_Start}`, …). The Emoji-family properties (`\p{Emoji}`, `\p{Emoji_Presentation}`, `\p{Extended_Pictographic}`, …) have no Go table and are reported as errors rather than silently matching nothing; a few computed properties (`Case_Ignorable`, `Default_Ignorable_Code_Point`, `XID_*`) are close approximations.
 3. **HasIndices flag** (`d`) - Parsed and accepted, but it has no effect: match indices are always available through the `*Index` methods (`FindStringSubmatchIndex`, `FindAllStringSubmatchIndex`, etc.), which return `[start, end)` byte-offset pairs per group (`-1` for a non-participating group). Named-group indices (JavaScript's `indices.groups`) are obtained by combining `SubexpIndex(name)` with those pairs.
 4. **Nesting depth / program size** - Patterns nested more than 200 levels deep, or that compile to more than 200,000 instructions, are rejected at compile time.
 5. **Case folding** - Case-insensitive matching uses Unicode simple case folding under the `u` flag, and the legacy `Canonicalize` (uppercase-based, with the "don't map non-ASCII to ASCII" guard) otherwise — matching JavaScript in both modes. A handful of full-mapping edge cases (e.g. `ß`↔`SS`) are not folded, as in most engines.
@@ -298,9 +298,7 @@ TEST262_STRICT=1 go test ./tests/ -run TestTest262Generated
 Contributions are welcome! Areas that need work:
 
 - Right-to-left lookbehind evaluation (ECMA-262 compliant capture semantics)
-- Broader Unicode binary-property coverage
-- HasIndices (`d` flag) match index exposure in the API
-- Non-`u`-mode non-ASCII case folding
+- Emoji-family Unicode properties (need embedded Unicode data)
 - Performance optimizations
 
 ## License

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode"
 	"unicode/utf8"
 )
@@ -888,7 +889,7 @@ func isLineTerminator(r rune) bool {
 // unrecognized property matches nothing, but callers should reject unknown
 // property names at compile time via ValidUnicodeProperty.
 func matchUnicodeProperty(r rune, prop string) bool {
-	m, ok := resolveUnicodeProperty(prop)
+	m, ok := resolveUnicodePropertyCached(prop)
 	if !ok {
 		return false
 	}
@@ -899,8 +900,28 @@ func matchUnicodeProperty(r rune, prop string) bool {
 // expression this engine understands. The compiler uses it to make \p{Unknown}
 // (and \p{}) a SyntaxError instead of a construct that silently matches nothing.
 func ValidUnicodeProperty(prop string) bool {
-	_, ok := resolveUnicodeProperty(prop)
+	_, ok := resolveUnicodePropertyCached(prop)
 	return ok
+}
+
+// propCache memoizes property resolution so a \p{...} instruction resolves its
+// predicate once (not per matched character). A nil entry records an unknown
+// property. It is safe for concurrent use.
+var propCache sync.Map // string -> propEntry
+
+type propEntry struct {
+	fn func(rune) bool
+	ok bool
+}
+
+func resolveUnicodePropertyCached(prop string) (func(rune) bool, bool) {
+	if v, ok := propCache.Load(prop); ok {
+		e := v.(propEntry)
+		return e.fn, e.ok
+	}
+	fn, ok := resolveUnicodeProperty(prop)
+	propCache.Store(prop, propEntry{fn: fn, ok: ok})
+	return fn, ok
 }
 
 // resolveUnicodeProperty maps a property expression to a rune predicate. It
@@ -950,35 +971,20 @@ func scriptTable(name string) *unicode.RangeTable {
 	return nil
 }
 
-// binaryProperty resolves the Unicode binary properties ECMA-262 permits as a
-// lone \p{Name}, falling back to Go's unicode.Properties table.
+// binaryProperty resolves a lone \p{Name} to a predicate, covering the ECMA-262
+// binary properties: computed derivations, aliases onto Go's unicode.Properties
+// tables, and the general/canonical names directly.
 func binaryProperty(prop string) (func(rune) bool, bool) {
-	switch normalizeUnicodeProperty(prop) {
-	case "ascii":
-		return func(r rune) bool { return r <= 0x7F }, true
-	case "any":
-		return func(r rune) bool { return true }, true
-	case "assigned":
-		return func(r rune) bool {
-			return r != unicode.ReplacementChar && (unicode.IsGraphic(r) || unicode.IsControl(r) || unicode.Is(unicode.Cf, r))
-		}, true
-	case "alphabetic", "alpha":
-		return func(r rune) bool {
-			return unicode.IsLetter(r) || unicode.Is(unicode.Nl, r) || unicode.Is(unicode.Other_Alphabetic, r)
-		}, true
-	case "lowercase", "lower":
-		return func(r rune) bool { return unicode.IsLower(r) || unicode.Is(unicode.Other_Lowercase, r) }, true
-	case "uppercase", "upper":
-		return func(r rune) bool { return unicode.IsUpper(r) || unicode.Is(unicode.Other_Uppercase, r) }, true
-	case "whitespace", "spaceseparator":
-		return func(r rune) bool { return unicode.IsSpace(r) }, true
-	case "digit":
-		// Non-standard alias for Nd, kept for compatibility with existing usage.
-		return func(r rune) bool { return unicode.Is(unicode.Nd, r) }, true
-	}
-	// Fall back to Go's binary property tables (Hex_Digit, ASCII_Hex_Digit,
-	// White_Space, Dash, Ideographic, ...).
 	norm := normalizeUnicodeProperty(prop)
+	if fn, ok := binaryPropertyPredicates[norm]; ok {
+		return fn, true
+	}
+	if canonical, ok := binaryPropertyAliases[norm]; ok {
+		if t := unicode.Properties[canonical]; t != nil {
+			return func(r rune) bool { return unicode.Is(t, r) }, true
+		}
+	}
+	// Canonical long names directly (e.g. \p{White_Space}, \p{Dash}).
 	for name, table := range unicode.Properties {
 		if normalizeUnicodeProperty(name) == norm {
 			t := table
@@ -986,6 +992,135 @@ func binaryProperty(prop string) (func(rune) bool, bool) {
 		}
 	}
 	return nil, false
+}
+
+// binaryPropertyPredicates holds the ECMA-262 binary properties that are
+// computed from Go's categories/case mappings rather than a single table.
+// Some (Case_Ignorable, Default_Ignorable_Code_Point, XID_*) are close
+// approximations of the full Unicode definitions.
+var binaryPropertyPredicates = map[string]func(rune) bool{
+	"ascii": func(r rune) bool { return r <= 0x7F },
+	"any":   func(r rune) bool { return true },
+	"assigned": func(r rune) bool {
+		return r != unicode.ReplacementChar && (unicode.IsGraphic(r) || unicode.IsControl(r) || unicode.Is(unicode.Cf, r))
+	},
+	"alphabetic":                isAlphabetic,
+	"alpha":                     isAlphabetic,
+	"lowercase":                 func(r rune) bool { return unicode.IsLower(r) || unicode.Is(unicode.Other_Lowercase, r) },
+	"lower":                     func(r rune) bool { return unicode.IsLower(r) || unicode.Is(unicode.Other_Lowercase, r) },
+	"uppercase":                 func(r rune) bool { return unicode.IsUpper(r) || unicode.Is(unicode.Other_Uppercase, r) },
+	"upper":                     func(r rune) bool { return unicode.IsUpper(r) || unicode.Is(unicode.Other_Uppercase, r) },
+	"cased":                     isCased,
+	"caseignorable":             isCaseIgnorable,
+	"ci":                        isCaseIgnorable,
+	"whitespace":                unicode.IsSpace,
+	"space":                     unicode.IsSpace,
+	"wspace":                    unicode.IsSpace,
+	"math":                      func(r rune) bool { return unicode.Is(unicode.Sm, r) || unicode.Is(unicode.Other_Math, r) },
+	"idstart":                   isIDStart,
+	"ids":                       isIDStart,
+	"idcontinue":                isIDContinue,
+	"idc":                       isIDContinue,
+	"xidstart":                  isIDStart,    // NFKC-closure approximation
+	"xids":                      isIDStart,    // NFKC-closure approximation
+	"xidcontinue":               isIDContinue, // NFKC-closure approximation
+	"xidc":                      isIDContinue, // NFKC-closure approximation
+	"graphemeextend":            isGraphemeExtend,
+	"grext":                     isGraphemeExtend,
+	"changeswhenuppercased":     func(r rune) bool { return unicode.ToUpper(r) != r },
+	"cwu":                       func(r rune) bool { return unicode.ToUpper(r) != r },
+	"changeswhenlowercased":     func(r rune) bool { return unicode.ToLower(r) != r },
+	"cwl":                       func(r rune) bool { return unicode.ToLower(r) != r },
+	"changeswhentitlecased":     func(r rune) bool { return unicode.ToTitle(r) != r },
+	"cwt":                       func(r rune) bool { return unicode.ToTitle(r) != r },
+	"defaultignorablecodepoint": isDefaultIgnorable,
+	"di":                        isDefaultIgnorable,
+	"digit":                     func(r rune) bool { return unicode.Is(unicode.Nd, r) }, // non-standard alias for Nd
+}
+
+// binaryPropertyAliases maps ECMA-262 binary-property aliases to the canonical
+// names keying Go's unicode.Properties table.
+var binaryPropertyAliases = map[string]string{
+	"asciihexdigit":         "ASCII_Hex_Digit",
+	"ahex":                  "ASCII_Hex_Digit",
+	"bidicontrol":           "Bidi_Control",
+	"bidic":                 "Bidi_Control",
+	"dash":                  "Dash",
+	"deprecated":            "Deprecated",
+	"dep":                   "Deprecated",
+	"diacritic":             "Diacritic",
+	"dia":                   "Diacritic",
+	"extender":              "Extender",
+	"ext":                   "Extender",
+	"hexdigit":              "Hex_Digit",
+	"hex":                   "Hex_Digit",
+	"hyphen":                "Hyphen",
+	"idsbinaryoperator":     "IDS_Binary_Operator",
+	"idsb":                  "IDS_Binary_Operator",
+	"idstrinaryoperator":    "IDS_Trinary_Operator",
+	"idst":                  "IDS_Trinary_Operator",
+	"ideographic":           "Ideographic",
+	"ideo":                  "Ideographic",
+	"joincontrol":           "Join_Control",
+	"joinc":                 "Join_Control",
+	"logicalorderexception": "Logical_Order_Exception",
+	"loe":                   "Logical_Order_Exception",
+	"noncharactercodepoint": "Noncharacter_Code_Point",
+	"nchar":                 "Noncharacter_Code_Point",
+	"patternsyntax":         "Pattern_Syntax",
+	"patsyn":                "Pattern_Syntax",
+	"patternwhitespace":     "Pattern_White_Space",
+	"patws":                 "Pattern_White_Space",
+	"quotationmark":         "Quotation_Mark",
+	"qmark":                 "Quotation_Mark",
+	"radical":               "Radical",
+	"regionalindicator":     "Regional_Indicator",
+	"ri":                    "Regional_Indicator",
+	"sentenceterminal":      "Sentence_Terminal",
+	"sterm":                 "Sentence_Terminal",
+	"softdotted":            "Soft_Dotted",
+	"sd":                    "Soft_Dotted",
+	"terminalpunctuation":   "Terminal_Punctuation",
+	"term":                  "Terminal_Punctuation",
+	"unifiedideograph":      "Unified_Ideograph",
+	"uideo":                 "Unified_Ideograph",
+	"variationselector":     "Variation_Selector",
+	"vs":                    "Variation_Selector",
+}
+
+func isAlphabetic(r rune) bool {
+	return unicode.IsLetter(r) || unicode.Is(unicode.Nl, r) || unicode.Is(unicode.Other_Alphabetic, r)
+}
+
+func isCased(r rune) bool {
+	return unicode.IsLower(r) || unicode.IsUpper(r) || unicode.Is(unicode.Lt, r) ||
+		unicode.Is(unicode.Other_Lowercase, r) || unicode.Is(unicode.Other_Uppercase, r)
+}
+
+func isCaseIgnorable(r rune) bool {
+	// Approximation of Case_Ignorable: the combining/format/modifier categories
+	// (the Word_Break refinements are omitted).
+	return unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Me, r) || unicode.Is(unicode.Cf, r) ||
+		unicode.Is(unicode.Lm, r) || unicode.Is(unicode.Sk, r)
+}
+
+func isIDStart(r rune) bool {
+	return unicode.IsLetter(r) || unicode.Is(unicode.Nl, r) || unicode.Is(unicode.Other_ID_Start, r)
+}
+
+func isIDContinue(r rune) bool {
+	return isIDStart(r) || unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Mc, r) ||
+		unicode.Is(unicode.Nd, r) || unicode.Is(unicode.Pc, r) || unicode.Is(unicode.Other_ID_Continue, r)
+}
+
+func isGraphemeExtend(r rune) bool {
+	return unicode.Is(unicode.Me, r) || unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Other_Grapheme_Extend, r)
+}
+
+func isDefaultIgnorable(r rune) bool {
+	// Approximation of Default_Ignorable_Code_Point.
+	return unicode.Is(unicode.Other_Default_Ignorable_Code_Point, r) ||
+		unicode.Is(unicode.Cf, r) || unicode.Is(unicode.Variation_Selector, r)
 }
 
 func normalizeUnicodeProperty(prop string) string {
