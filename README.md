@@ -289,7 +289,7 @@ TEST262_STRICT=1 go test ./tests/ -run TestTest262Generated
 
 1. **Lookbehind capture semantics** - Both fixed- and variable-length lookbehinds match, but the body is evaluated left-to-right while ECMA-262 specifies right-to-left. Capture groups inside a quantified lookbehind therefore return the last (rightmost) iteration's value instead of the first (leftmost); e.g. `(?<=(?<a>\w){3})f` on `"abcdef"` captures `"e"` where ECMA-262 requires `"c"`.
 2. **Unicode property escapes** - All general categories, scripts (via `Script=`/`Script_Extensions=`), and the common lone binary properties are supported; some rarer binary properties may be missing (and are reported as errors rather than silently matching nothing).
-3. **HasIndices flag** (`d`) - Parsed and accepted, but match indices are not exposed in the API.
+3. **HasIndices flag** (`d`) - Parsed and accepted, but it has no effect: match indices are always available through the `*Index` methods (`FindStringSubmatchIndex`, `FindAllStringSubmatchIndex`, etc.), which return `[start, end)` byte-offset pairs per group (`-1` for a non-participating group). Named-group indices (JavaScript's `indices.groups`) are obtained by combining `SubexpIndex(name)` with those pairs.
 4. **Nesting depth / program size** - Patterns nested more than 200 levels deep, or that compile to more than 200,000 instructions, are rejected at compile time.
 5. **Case folding** - Case-insensitive matching uses Unicode simple case folding under the `u` flag and ASCII-only folding otherwise; non-ASCII case folding is not applied in non-`u` mode.
 
