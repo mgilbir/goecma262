@@ -48,9 +48,7 @@ const (
 	OpNonSpace // Match \S
 
 	// Character classes
-	OpInRange    // Match character in range [a-z]
-	OpNotInRange // Match character not in range [^a-z]
-	OpClass      // Match character class with escapes
+	OpClass // Match character class with escapes
 
 	// Anchors
 	OpStartLine    // Match ^
@@ -63,11 +61,8 @@ const (
 	OpSaveEnd   // End of capture group
 
 	// Control flow
-	OpJmp         // Unconditional jump
-	OpSplit       // Split execution (for alternation)
-	OpGreedyLoop  // Greedy loop, 0+ iterations (matches maximum first)
-	OpGreedyLoop1 // Greedy loop, 1+ iterations (matches maximum first)
-	OpGreedyLoopN // Greedy loop, 0..N iterations (inst.A=body, inst.B=exit, inst.Extra=max)
+	OpJmp   // Unconditional jump
+	OpSplit // Split execution (for alternation and quantifiers)
 
 	// Backreferences
 	OpBackref // Match previously captured group
@@ -94,9 +89,7 @@ type Instruction struct {
 	Op     Opcode
 	A      int         // First operand
 	B      int         // Second operand
-	Extra  int         // Extra operand (e.g., max count for OpGreedyLoopN)
 	Char   rune        // For character matching
-	Ranges []RuneRange // For character classes
 	Prop   string      // For unicode properties
 	Class  []ClassAtom // For OpClass
 	Negate bool        // For OpClass
@@ -149,10 +142,6 @@ func (i Instruction) String() string {
 		return "space"
 	case OpNonSpace:
 		return "non-space"
-	case OpInRange:
-		return fmt.Sprintf("in-range %v", i.Ranges)
-	case OpNotInRange:
-		return fmt.Sprintf("not-in-range %v", i.Ranges)
 	case OpClass:
 		return "class"
 	case OpStartLine:
@@ -208,14 +197,6 @@ type VM struct {
 
 	steps         int             // current step count
 	visitedSplits map[string]bool // memoized failed split states (pos, pc, groups)
-}
-
-// New creates a new VM with the given code
-func New(code []Instruction, numGroups int) *VM {
-	return &VM{
-		Code:      code,
-		NumGroups: numGroups,
-	}
 }
 
 // matchResult holds the result of a recursive match attempt
@@ -391,42 +372,6 @@ func (vm *VM) exec(pos, pc int, groups []int) matchResult {
 			pos += size
 			pc++
 
-		case OpInRange:
-			if pos >= len(vm.Input) {
-				return matchResult{matched: false}
-			}
-			r, size := utf8.DecodeRuneInString(vm.Input[pos:])
-			found := false
-			for _, rng := range inst.Ranges {
-				if vm.matchInRange(r, rng.Start, rng.End) {
-					found = true
-					break
-				}
-			}
-			if !found {
-				return matchResult{matched: false}
-			}
-			pos += size
-			pc++
-
-		case OpNotInRange:
-			if pos >= len(vm.Input) {
-				return matchResult{matched: false}
-			}
-			r, size := utf8.DecodeRuneInString(vm.Input[pos:])
-			found := false
-			for _, rng := range inst.Ranges {
-				if vm.matchInRange(r, rng.Start, rng.End) {
-					found = true
-					break
-				}
-			}
-			if found {
-				return matchResult{matched: false}
-			}
-			pos += size
-			pc++
-
 		case OpClass:
 			if pos >= len(vm.Input) {
 				return matchResult{matched: false}
@@ -550,72 +495,6 @@ func (vm *VM) exec(pos, pc int, groups []int) matchResult {
 			}
 			// Fall through to branch B
 			pc = inst.B
-
-		case OpGreedyLoop, OpGreedyLoop1, OpGreedyLoopN:
-			// ECMA-262 greedy quantifier semantics: match maximum iterations
-			// inst.A = body start PC
-			// inst.B = body end PC (one past last body instruction) = exit point
-			// inst.Extra = max iterations (OpGreedyLoopN only; 0 = unlimited)
-			//
-			// OpGreedyLoop  = 0+ iterations (try exit first at current pos)
-			// OpGreedyLoop1 = 1+ iterations (must match body at least once first)
-			// OpGreedyLoopN = 0..N iterations (bounded, try exit first)
-			//
-			// The body is a CLOSED sub-range [A, B). We run the body via execBody
-			// which treats pc=B as OpMatch (stop and report success/pos).
-			// This prevents the body from falling through into the rest of the pattern.
-
-			var bestResult matchResult
-			visited := make(map[string]bool)
-			maxIter := inst.Extra // 0 means unlimited for OpGreedyLoop/Loop1
-
-			if inst.Op == OpGreedyLoop || inst.Op == OpGreedyLoopN {
-				// 0+ iterations: try exiting immediately (zero body matches)
-				resExit := vm.exec(pos, inst.B, copyGroups(groups))
-				if resExit.matched {
-					bestResult = resExit
-				}
-			}
-
-			// Match iterations one by one, greedily
-			currentPos := pos
-			currentGroups := copyGroups(groups)
-			iter := 0
-			for {
-				if maxIter > 0 && iter >= maxIter {
-					break
-				}
-
-				stateKey := fmt.Sprintf("%d:%v", currentPos, currentGroups)
-				if visited[stateKey] {
-					break
-				}
-				visited[stateKey] = true
-
-				// Run the body as a sub-expression bounded by [A, B)
-				resBody := vm.execBody(currentPos, inst.A, inst.B, copyGroups(currentGroups))
-				if !resBody.matched {
-					break
-				}
-
-				// Body matched — try exiting and running the rest of the pattern from B
-				resExit := vm.exec(resBody.pos, inst.B, copyGroups(resBody.groups))
-				if resExit.matched {
-					if !bestResult.matched || resExit.pos > bestResult.pos {
-						bestResult = resExit
-					}
-				}
-
-				// Continue to try another iteration
-				currentPos = resBody.pos
-				currentGroups = copyGroups(resBody.groups)
-				iter++
-			}
-
-			if bestResult.matched {
-				return bestResult
-			}
-			return matchResult{matched: false}
 
 		case OpBackref:
 			// For duplicate named groups (ES2022), try all alternative group indices
@@ -742,55 +621,6 @@ func (vm *VM) exec(pos, pc int, groups []int) matchResult {
 	}
 }
 
-// execBody runs the body code in [startPC, endPC) as a bounded sub-VM.
-// Unlike exec, it treats reaching endPC as a successful match (OpMatch sentinel).
-// This isolates the body from the rest of the pattern so the body cannot
-// fall through into later instructions.
-func (vm *VM) execBody(pos, startPC, endPC int, groups []int) matchResult {
-	bodyLen := endPC - startPC
-	subCode := make([]Instruction, bodyLen+1)
-	copy(subCode, vm.Code[startPC:endPC])
-	subCode[bodyLen] = Instruction{Op: OpMatch}
-
-	// Adjust internal jump targets relative to startPC
-	for i := range subCode[:bodyLen] {
-		switch subCode[i].Op {
-		case OpJmp:
-			subCode[i].A -= startPC
-		case OpSplit:
-			subCode[i].A -= startPC
-			subCode[i].B -= startPC
-		case OpGreedyLoop, OpGreedyLoop1, OpGreedyLoopN:
-			subCode[i].A -= startPC
-			subCode[i].B -= startPC
-		case OpLookahead, OpNegLookahead, OpLookbehind, OpNegLookbehind:
-			subCode[i].A -= startPC
-			subCode[i].B -= startPC
-		}
-	}
-
-	subVM := &VM{
-		Code:       subCode,
-		Input:      vm.Input,
-		NumGroups:  vm.NumGroups,
-		IgnoreCase: vm.IgnoreCase,
-		Multiline:  vm.Multiline,
-		DotAll:     vm.DotAll,
-		Unicode:    vm.Unicode,
-		MaxSteps:   vm.MaxSteps,
-	}
-
-	totalGroups := vm.NumGroups + 1
-	subGroups := make([]int, totalGroups*2)
-	copy(subGroups, groups)
-
-	res := subVM.exec(pos, 0, subGroups)
-	if subVM.Err != nil {
-		vm.Err = subVM.Err
-	}
-	return res
-}
-
 // executeLookahead executes a lookahead sub-pattern using only the body code [startPC, endPC).
 // The lookahead does not consume input.
 func (vm *VM) executeLookahead(startPC, endPC, pos int, groups []int) bool {
@@ -806,9 +636,6 @@ func (vm *VM) executeLookahead(startPC, endPC, pos int, groups []int) bool {
 		case OpJmp:
 			subCode[i].A -= startPC
 		case OpSplit:
-			subCode[i].A -= startPC
-			subCode[i].B -= startPC
-		case OpGreedyLoop, OpGreedyLoop1, OpGreedyLoopN:
 			subCode[i].A -= startPC
 			subCode[i].B -= startPC
 		case OpLookahead, OpNegLookahead, OpLookbehind, OpNegLookbehind:
@@ -862,9 +689,6 @@ func (vm *VM) executeLookbehind(startPC, endPC, pos int, groups []int) bool {
 		case OpJmp:
 			subCode[i].A -= startPC
 		case OpSplit:
-			subCode[i].A -= startPC
-			subCode[i].B -= startPC
-		case OpGreedyLoop, OpGreedyLoop1, OpGreedyLoopN:
 			subCode[i].A -= startPC
 			subCode[i].B -= startPC
 		case OpLookahead, OpNegLookahead, OpLookbehind, OpNegLookbehind:
@@ -1136,7 +960,9 @@ func binaryProperty(prop string) (func(rune) bool, bool) {
 	case "any":
 		return func(r rune) bool { return true }, true
 	case "assigned":
-		return func(r rune) bool { return r != unicode.ReplacementChar && (unicode.IsGraphic(r) || unicode.IsControl(r) || unicode.Is(unicode.Cf, r)) }, true
+		return func(r rune) bool {
+			return r != unicode.ReplacementChar && (unicode.IsGraphic(r) || unicode.IsControl(r) || unicode.Is(unicode.Cf, r))
+		}, true
 	case "alphabetic", "alpha":
 		return func(r rune) bool {
 			return unicode.IsLetter(r) || unicode.Is(unicode.Nl, r) || unicode.Is(unicode.Other_Alphabetic, r)
