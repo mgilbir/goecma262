@@ -2,9 +2,5 @@
   "name": "test262-convert",
   "private": true,
   "type": "module",
-  "version": "0.0.0",
-  "dependencies": {
-    "acorn": "^8.11.3",
-    "acorn-walk": "^8.3.2"
-  }
+  "version": "0.0.0"
 }

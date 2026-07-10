@@ -32,8 +32,5 @@ go.work.sum
 # .idea/
 # .vscode/
 
-# Node dependencies (test262 converter)
-tools/test262_convert/node_modules/
-
 # Test262 extraction artifacts (can be regenerated)
 tests/test262_cases.json
