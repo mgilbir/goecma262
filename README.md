@@ -1,66 +1,17 @@
 # goecma262
 
-A Go implementation of ECMA-262 (JavaScript) regular expressions with an API compatible with Go's standard `regexp` package.
+A Go implementation of ECMA-262 (JavaScript) regular expressions with an API
+shaped like Go's standard `regexp` package.
 
-## Features
-
-This library implements ECMA-262 regular expressions with support for:
-
-### Core Features
-- ✅ Literal character matching
-- ✅ `.` (dot) - any character (with `s` flag support for matching newlines)
-- ✅ Character classes `[abc]`, `[^abc]`, `[a-z]`, `[0-9]`
-- ✅ Shorthand character classes: `\d`, `\D`, `\w`, `\W`, `\s`, `\S`
-- ✅ Anchors: `^`, `$`, `\b`, `\B`
-- ✅ Quantifiers: `*`, `+`, `?`, `{n}`, `{n,}`, `{n,m}` (greedy and non-greedy)
-- ✅ Alternation: `a|b|c`
-- ✅ Capturing groups: `(abc)`
-- ✅ Non-capturing groups: `(?:abc)`
-- ✅ Backreferences: `\1`, `\2`, etc.
-
-### ECMA-262 Specific Features
-- ✅ Flags: `i` (ignore case), `g` (global), `m` (multiline), `s` (dotAll), `u` (unicode), `v` (unicodeSets), `y` (sticky), `d` (hasIndices)
-- ✅ Named capture groups: `(?<name>abc)` and backreferences `\k<name>`
-- ✅ Lookahead: `(?=...)` and `(?!...)`
-- ✅ Lookbehind: `(?<=...)` and `(?<!...)` (including variable-length, with ECMA-262 right-to-left capture semantics)
-- ✅ Unicode property escapes: `\p{...}` and `\P{...}` (all general categories, scripts via `Script=`, and common binary properties; requires `u`/`v`; unknown names are rejected)
-- ✅ Hex escapes: `\xFF`
-- ✅ Unicode escapes: `\uFFFF` and `\u{...}` (requires `u`/`v` for code point escapes)
-- ✅ Control characters: `\cA`
-- ✅ Special escapes: `\n`, `\r`, `\t`, `\f`, `\v`
-
-### API Compatibility
-
-The API is designed to match Go's `regexp` package:
-
-```go
-// Compile a regex
-re, err := ecma262.Compile(`\d+`, flags.Flags(0))
-if err != nil {
-    log.Fatal(err)
-}
-
-// Or use MustCompile for compile-time constants
-re := ecma262.MustCompile(`\w+`, flags.Flags(0))
-
-// Matching
-matched := re.MatchString("hello123")  // true
-matched = re.Match([]byte("hello123")) // true
-
-// Finding
-match := re.FindString("hello123 world")     // "hello123"
-matches := re.FindAllString("a1 b2 c3", -1)  // ["1", "2", "3"]
-
-// Finding with submatches
-submatches := re.FindStringSubmatch("hello123") // ["hello123", ...]
-
-// Replacement (use g flag for all matches)
-re, _ = ecma262.Compile(`\d+`, flags.Global)
-result := re.ReplaceAllString("a1b2c3", "X")  // "aXbXcX"
-
-// Splitting
-parts := re.Split("a1b2c3", -1)  // ["a", "b", "c", ""]
-```
+Reach for this library when you need regex features Go's RE2-based `regexp`
+cannot express — backreferences, lookahead/lookbehind — or when patterns and
+match results must behave exactly as they do in JavaScript (same flags, same
+Annex B web-compatibility syntax, same capture and replacement semantics,
+validated against the official [Test262](https://github.com/tc39/test262)
+suite). If you need neither, prefer the standard library: RE2 guarantees
+linear-time matching, while this engine is a backtracker whose worst case is
+bounded by a configurable step limit
+(see [Match semantics and safety](#match-semantics-and-safety)).
 
 ## Installation
 
@@ -68,91 +19,110 @@ parts := re.Split("a1b2c3", -1)  // ["a", "b", "c", ""]
 go get github.com/mgilbir/goecma262
 ```
 
-## Usage Examples
-
-### Basic Matching
+## Quick start
 
 ```go
 package main
 
 import (
     "fmt"
+
     "github.com/mgilbir/goecma262"
     "github.com/mgilbir/goecma262/flags"
 )
 
 func main() {
-    // Simple pattern
-    re := ecma262.MustCompile(`hello`, flags.Flags(0))
-    fmt.Println(re.MatchString("hello world")) // true
-    
-    // With case-insensitive flag
-    re = ecma262.MustCompile(`hello`, flags.IgnoreCase)
-    fmt.Println(re.MatchString("HELLO")) // true
-    
-    // Using multiple flags
-    re = ecma262.MustCompile(`^line`, flags.Multiline|flags.IgnoreCase)
-    fmt.Println(re.MatchString("First line\nSecond Line")) // true
+    re := ecma262.MustCompile(`\d+`, flags.Flags(0))
+    fmt.Println(re.MatchString("hello123"))           // true
+    fmt.Println(re.FindString("hello123 world"))      // "123"
+    fmt.Println(re.FindAllString("a1 b2 c3", -1))     // [1 2 3]
+
+    // Without the g flag only the first match is replaced, as in JavaScript.
+    re = ecma262.MustCompile(`\d+`, flags.Global)
+    fmt.Println(re.ReplaceAllString("a1b2c3", "X"))   // "aXbXcX"
+    fmt.Println(re.Split("a1b2c3", -1))               // [a b c ]
 }
 ```
 
-### Capturing Groups
+Runnable, test-asserted examples for every feature below live in
+[`example_test.go`](example_test.go) and render on
+[pkg.go.dev](https://pkg.go.dev/github.com/mgilbir/goecma262).
+
+## Features
+
+### Core
+- ✅ Literals, `.` (with `s` flag for newlines), character classes `[abc]`, `[^abc]`, `[a-z]`
+- ✅ Shorthand classes `\d`, `\D`, `\w`, `\W`, `\s`, `\S`; anchors `^`, `$`, `\b`, `\B`
+- ✅ Quantifiers `*`, `+`, `?`, `{n}`, `{n,}`, `{n,m}` (greedy and non-greedy)
+- ✅ Alternation, capturing and non-capturing groups, backreferences `\1`, `\2`, …
+
+### ECMA-262 specific
+- ✅ Flags: `i`, `g`, `m`, `s`, `u`, `v`, `y`, `d` (see [Flags](#flags))
+- ✅ Named capture groups `(?<name>abc)` and backreferences `\k<name>`
+- ✅ Lookahead `(?=...)`, `(?!...)`
+- ✅ Lookbehind `(?<=...)`, `(?<!...)` — including variable-length, with ECMA-262 right-to-left capture semantics
+- ✅ Unicode property escapes `\p{...}`, `\P{...}` (requires `u`/`v`; all general categories, scripts via `Script=`, common binary properties; unknown names are rejected)
+- ✅ Escapes: `\xFF`, `\uFFFF`, `\u{...}` (code points require `u`/`v`), `\cA`, `\n`, `\r`, `\t`, `\f`, `\v`
+- ✅ Annex B web-compatibility syntax by default, strict mode opt-in (see [Syntax mode](#syntax-mode-annex-b-vs-strict))
+
+## Usage examples
+
+### Capturing groups — plain and named
 
 ```go
 re := ecma262.MustCompile(`(\d{4})-(\d{2})-(\d{2})`, flags.Flags(0))
-matches := re.FindStringSubmatch("Date: 2024-03-15")
-// matches = ["2024-03-15", "2024", "03", "15"]
+re.FindStringSubmatch("Date: 2024-03-15")
+// ["2024-03-15", "2024", "03", "15"]
+
+re = ecma262.MustCompile(`(?<year>\d{4})-(?<month>\d{2})-(?<day>\d{2})`, flags.Flags(0))
+m := re.FindStringSubmatch("Date: 2024-03-15")
+m[re.SubexpIndex("month")] // "03"
+re.SubexpNames()           // ["", "year", "month", "day"]
 ```
 
-### Named Capture Groups (ECMA-262 Feature)
+### Lookaround
 
 ```go
-re := ecma262.MustCompile(`(?<year>\d{4})-(?<month>\d{2})-(?<day>\d{2})`, flags.Flags(0))
-matches := re.FindStringSubmatch("Date: 2024-03-15")
-// Group names: re.SubexpNames() = ["", "year", "month", "day"]
-```
-
-### Lookahead
-
-```go
-// Positive lookahead - match digits followed by dollars
+// Positive lookahead - digits only when followed by " dollars"
 re := ecma262.MustCompile(`\d+(?= dollars)`, flags.Flags(0))
-match := re.FindString("Price: 42 dollars") // "42"
+re.FindString("Price: 42 dollars") // "42"
 
-// Negative lookahead - match digits NOT followed by dollars
-re = ecma262.MustCompile(`\d+(?! dollars)`, flags.Flags(0))
-match = re.FindString("Price: 42 euros") // "42"
+// Variable-length lookbehind
+re = ecma262.MustCompile(`(?<=\$\s*)\d+`, flags.Flags(0))
+re.FindString("total: $ 99") // "99"
 ```
 
-### Unicode Property Escapes (ECMA-262 Feature)
+### Replacement syntax
 
-Unicode property escapes require the `u` (Unicode) or `v` (UnicodeSets) flag.
+`ReplaceAllString` interprets `$` in the replacement per ECMA-262:
+`$&` (whole match), `$1`…`$99` (group), `$<name>` (named group),
+`` $` `` and `$'` (text before/after the match), `$$` (literal `$`).
+Invalid references such as `$0` are emitted literally.
 
 ```go
-re := ecma262.MustCompile(`\p{digit}+`, flags.Unicode)
-fmt.Println(re.MatchString("42"))           // true
-fmt.Println(re.MatchString("\u09EA"))       // true (Bengali digit ৪)
-
-re = ecma262.MustCompile(`\p{Nd}+`, flags.Unicode)
-fmt.Println(re.MatchString("\u09EA"))       // true
-
-re = ecma262.MustCompile(`\p{General_Category=Decimal_Number}+`, flags.Unicode)
-fmt.Println(re.MatchString("\u09EA"))       // true
+re := ecma262.MustCompile(`(?<first>\w+) (?<last>\w+)`, flags.Flags(0))
+re.ReplaceAllString("Ada Lovelace", "$<last>, $<first>") // "Lovelace, Ada"
 ```
 
-Without `u`/`v`, `\p`/`\P` are treated as identity escapes (literal `p`/`P`).
+### Unicode property escapes
 
-### Using All ECMA-262 Flags
+Require the `u` (Unicode) or `v` (UnicodeSets) flag; without them, `\p`/`\P`
+are identity escapes (literal `p`/`P`).
 
 ```go
-import "github.com/mgilbir/goecma262/flags"
+re := ecma262.MustCompile(`\p{Nd}+`, flags.Unicode)
+re.MatchString("৪") // true (Bengali digit ৪)
 
-// Parse flags from string
-f, _ := flags.Parse("gimsuy")
-re, _ := ecma262.Compile(`pattern`, f)
+re = ecma262.MustCompile(`^\p{Script=Greek}+$`, flags.Unicode)
+re.MatchString("αβγ") // true
+```
 
-// Or use individual flags
-re, _ := ecma262.Compile(`pattern`, flags.IgnoreCase|flags.Multiline|flags.DotAll)
+### Flags from a string
+
+```go
+re, err := ecma262.CompileFlags(`pattern`, "gims")
+// equivalent to: f, _ := flags.Parse("gims"); ecma262.Compile(`pattern`, f)
+// or combine constants: flags.IgnoreCase | flags.Multiline | flags.DotAll
 ```
 
 ### Syntax mode (Annex B vs strict)
@@ -179,25 +149,56 @@ such as `a{2,1}` is a syntax error in *every* mode.
 | Flag | Description |
 |------|-------------|
 | `i` | Ignore case - case-insensitive matching |
-| `g` | Global - find all matches (used by FindAll functions) |
+| `g` | Global - `ReplaceAllString` replaces every match instead of the first; match operations become stateful via `lastIndex` (see below). `FindAll*` methods always return all matches regardless of this flag |
 | `m` | Multiline - `^` and `$` match start/end of lines |
 | `s` | DotAll - `.` matches newline characters |
 | `u` | Unicode - enable Unicode features (required for `\p{...}` and `\u{...}`) |
 | `v` | UnicodeSets - extended Unicode features (cannot use with `u`) |
-| `y` | Sticky - match only from lastIndex position |
-| `d` | HasIndices - parsed and accepted, but match indices are **not** exposed in the API (see Known Limitations) |
+| `y` | Sticky - match only at exactly the `lastIndex` position |
+| `d` | HasIndices - parsed and accepted, but a no-op: match indices are always available via the `*Index` methods (see Known Limitations) |
+
+## Match semantics and safety
+
+**Statefulness.** A `Regexp` compiled without `g` or `y` is immutable and safe
+for concurrent use. With `g` or `y`, `MatchString`, `Match`, and
+`FindStringSubmatch` mirror JavaScript's `test`/`exec`: they start at the
+instance's `lastIndex`, advance it past each match, and reset it to 0 on no
+match — so repeated calls iterate, and such instances must not be shared
+between goroutines without synchronization. `SetLastIndex`/`LastIndex` expose
+the cursor directly.
+
+**Offsets are bytes.** All positions (`lastIndex`, `*Index` results) are byte
+offsets into the Go string, not UTF-16 code-unit indices as in JavaScript.
+
+**ReDoS protection.** The backtracking VM enforces a step limit (default
+1,000,000; tune per instance with `SetMaxSteps`). When a match operation
+exceeds it, the boolean/string methods report **no match** — they cannot
+distinguish a limit hit from a genuine non-match. If you match untrusted
+patterns or inputs, use the error-returning variants:
+
+```go
+ok, err := re.MatchStringErr(input)
+if errors.Is(err, vm.ErrStepLimit) {
+    // pattern/input too expensive, not a non-match
+}
+```
+
+**Errors.** `Compile` wraps failures as `parse error: …` or
+`compile error: …` and rejects `u`+`v` as `incompatible flags`. `flags.Parse`
+returns typed errors (`InvalidFlagError`, `DuplicateFlagError`,
+`IncompatibleFlagsError`). Match-time step-limit errors are
+`vm.ErrStepLimit`, comparable with `errors.Is`.
 
 ## Architecture
 
-The implementation consists of several components:
-
-1. **Parser** (`parser/`): Recursive descent parser that converts regex patterns into an AST
-2. **Compiler** (`compiler/`): Transforms AST into VM bytecode instructions
-3. **VM** (`vm/`): Virtual machine that executes bytecode using a backtracking algorithm
-4. **Flags** (`flags/`): ECMA-262 flag handling
-5. **Main API** (`ecma262.go`): User-facing API compatible with Go's regexp package
-
-The VM uses a thread-based backtracking approach similar to the one described in Russ Cox's articles on regular expressions.
+Pattern strings are parsed to an AST (`parser/`), compiled to bytecode
+(`compiler/`), and executed by a recursive backtracking VM (`vm/`) — the
+backtracking design from Russ Cox's regular-expression articles, with
+memoization of failed states and a step budget bounding worst-case cost.
+Backtracking is what makes backreferences and lookarounds possible (RE2-based
+engines structurally cannot support them). Diagrams and internals — including
+how right-to-left lookbehind and the ReDoS bounds work — are in
+[docs/architecture.md](docs/architecture.md).
 
 ## Performance
 
@@ -208,96 +209,32 @@ BenchmarkMatch-16            782073    1536 ns/op    1000 B/op    28 allocs/op
 BenchmarkCompileAndMatch-16  399681    2691 ns/op    3256 B/op    50 allocs/op
 ```
 
-## Testing
-
-Run the test suite:
+## Testing and Test262 compliance
 
 ```bash
-go test ./tests/...
+go test ./...
 ```
 
-Run with benchmarks:
+The implementation is tested against the official ECMAScript
+[Test262](https://github.com/tc39/test262) suite: **all 66,136 extracted
+cases pass or are explicitly skipped**. The 14 permanent skips need a real
+JavaScript runtime (e.g. a JS function as replacement argument) or exceed
+compile-time limits; [`tests/test262_skip_test.go`](tests/test262_skip_test.go)
+is the canonical list, with the reason for every entry. How to regenerate the
+suite and maintain the skip list is covered in
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
-```bash
-go test ./tests/... -bench=. -benchmem
-```
+## Known limitations
 
-## Test262 Compliance
-
-The implementation is tested against the official ECMAScript [Test262](https://github.com/tc39/test262) suite.
-The test cases are extracted from the `test/built-ins/RegExp` subtree and compiled into
-`tests/test262_generated_test.go` (66 136 cases as of the last regeneration).
-
-**Current result: all 66 136 cases pass or are explicitly skipped.**
-
-14 cases are permanently skipped because they require JavaScript runtime semantics or
-hit implementation limits that cannot be resolved in a static Go API:
-
-| Category | Count | Reason |
-|---|---|---|
-| Functional replace (`functional-replace-*.js`) | 8 | Replacement argument is a JS arrow function; Go has no JS runtime to execute it |
-| RegExp subclass (`groups-object-subclass*.js`) | 4 | Tests override `Symbol.replace` and inject a custom JS groups object; not representable in Go |
-| Deeply nested patterns (`S15.10.2.8_A3_T15.js`, `S15.10.2.8_A3_T16.js`) | 2 | Patterns with 200+ nesting levels hit the compile-time `MaxNestingDepth` limit |
-
-These skips are recorded in `tests/test262_skip_test.go`.  That file is **not** overwritten
-by the test generator, so the skip list survives regeneration.
-
-### Regenerating the test suite
-
-If you update the Test262 repository or extend the extractor, regenerate with:
-
-```bash
-# 1. Extract cases from the Test262 source tree
-node tools/test262_convert/extract.js \
-    --test262 /path/to/test262 \
-    --out tests/test262_cases.json
-
-# 2. Generate the Go test file
-go run ./tools/test262_from_json/ \
-    -in  tests/test262_cases.json \
-    -out tests/test262_generated_test.go
-```
-
-`tests/test262_cases.json` is listed in `.gitignore` (it is large and reproducible).
-`tests/test262_generated_test.go` **is** committed so that `go test` works without
-the Node.js extraction step.
-
-### Adding known failures
-
-If a regeneration surfaces a new test that cannot pass in Go, add it to
-`tests/test262_skip_test.go`:
-
-```go
-var test262KnownFailures = map[string]string{
-    // existing entries ...
-    "new-test-name.js#42": "reason this cannot be implemented in Go",
-}
-```
-
-The map key is the `tc.name` value printed by `go test -v`.  The value is a human-readable
-explanation shown in the skip message.
-
-Set `TEST262_STRICT=1` to promote all compile/flag errors from `t.Skip` to `t.Fatal`,
-which is useful for catching regressions during development:
-
-```bash
-TEST262_STRICT=1 go test ./tests/ -run TestTest262Generated
-```
-
-## Known Limitations
-
-1. **Lookbehind** - Fully supported, including variable-length bodies and ECMA-262 right-to-left capture semantics (a quantified capture inside a lookbehind takes the leftmost iteration's value, and a backreference to a group defined inside the same lookbehind is well-defined).
-2. **Unicode property escapes** - All general categories, scripts (via `Script=`/`Script_Extensions=`), and most binary properties are supported, including aliases (`\p{AHex}`, `\p{WSpace}`) and computed properties (`\p{Cased}`, `\p{Math}`, `\p{ID_Start}`, …). The Emoji-family properties (`\p{Emoji}`, `\p{Emoji_Presentation}`, `\p{Extended_Pictographic}`, …) have no Go table and are reported as errors rather than silently matching nothing; a few computed properties (`Case_Ignorable`, `Default_Ignorable_Code_Point`, `XID_*`) are close approximations.
-3. **HasIndices flag** (`d`) - Parsed and accepted, but it has no effect: match indices are always available through the `*Index` methods (`FindStringSubmatchIndex`, `FindAllStringSubmatchIndex`, etc.), which return `[start, end)` byte-offset pairs per group (`-1` for a non-participating group). Named-group indices (JavaScript's `indices.groups`) are obtained by combining `SubexpIndex(name)` with those pairs.
-4. **Nesting depth / program size** - Patterns nested more than 200 levels deep, or that compile to more than 200,000 instructions, are rejected at compile time.
-5. **Case folding** - Case-insensitive matching uses Unicode simple case folding under the `u` flag, and the legacy `Canonicalize` (uppercase-based, with the "don't map non-ASCII to ASCII" guard) otherwise — matching JavaScript in both modes. A handful of full-mapping edge cases (e.g. `ß`↔`SS`) are not folded, as in most engines.
+1. **Unicode property escapes** - All general categories, scripts (via `Script=`/`Script_Extensions=`), and most binary properties are supported, including aliases (`\p{AHex}`, `\p{WSpace}`) and computed properties (`\p{Cased}`, `\p{Math}`, `\p{ID_Start}`, …). The Emoji-family properties (`\p{Emoji}`, `\p{Emoji_Presentation}`, `\p{Extended_Pictographic}`, …) have no Go table and are reported as errors rather than silently matching nothing; a few computed properties (`Case_Ignorable`, `Default_Ignorable_Code_Point`, `XID_*`) are close approximations.
+2. **HasIndices flag** (`d`) - Parsed and accepted, but it has no effect: match indices are always available through the `*Index` methods (`FindStringSubmatchIndex`, `FindAllStringSubmatchIndex`, etc.), which return `[start, end)` byte-offset pairs per group (`-1` for a non-participating group). Named-group indices (JavaScript's `indices.groups`) are obtained by combining `SubexpIndex(name)` with those pairs.
+3. **Compile-time limits** - Patterns nested more than 200 levels deep, with a single quantifier bound above 10,000 (`a{10001}`), or compiling to more than 200,000 instructions are rejected at compile time.
+4. **Case folding** - Case-insensitive matching uses Unicode simple case folding under the `u` flag, and the legacy `Canonicalize` (uppercase-based, with the "don't map non-ASCII to ASCII" guard) otherwise — matching JavaScript in both modes. A handful of full-mapping edge cases (e.g. `ß`↔`SS`) are not folded, as in most engines.
 
 ## Contributing
 
-Contributions are welcome! Areas that need work:
-
-- Emoji-family Unicode properties (need embedded Unicode data)
-- Performance optimizations
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the
+development workflow, the Test262 pipeline, and areas that need work.
 
 ## License
 
