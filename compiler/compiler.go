@@ -403,6 +403,14 @@ func (c *Compiler) compileNamedGroup(g *parser.NamedGroup) error {
 }
 
 func (c *Compiler) compileBackreference(b *parser.Backreference) error {
+	// An Annex B numeric escape that did not resolve to a real group compiles to
+	// literal characters (a legacy octal escape and/or literal digits).
+	if b.Fallback != nil {
+		for _, r := range b.Fallback {
+			c.emit(vm.Instruction{Op: vm.OpChar, Char: r})
+		}
+		return nil
+	}
 	c.emit(vm.Instruction{Op: vm.OpBackref, A: b.Index, AltA: b.AltIndices})
 	return nil
 }

@@ -77,6 +77,18 @@ func (l *Lexer) peekChar() byte {
 	return l.input[l.readPos]
 }
 
+// lexerState is a snapshot of the lexer's scanning position, used to backtrack
+// when an Annex B construct turns out not to parse (e.g. a malformed quantifier
+// whose '{' must be re-read as a literal).
+type lexerState struct {
+	pos     int
+	readPos int
+	ch      byte
+}
+
+func (l *Lexer) save() lexerState     { return lexerState{l.pos, l.readPos, l.ch} }
+func (l *Lexer) restore(s lexerState) { l.pos, l.readPos, l.ch = s.pos, s.readPos, s.ch }
+
 // NextToken returns the next token from the input
 func (l *Lexer) NextToken() Token {
 	var tok Token

@@ -24,9 +24,10 @@ type Parser struct {
 }
 
 type backrefInfo struct {
-	index int
-	name  string
-	node  *Backreference
+	index  int
+	name   string
+	digits string // raw decimal digits for a numeric \n, for Annex B fallback
+	node   *Backreference
 }
 
 // New creates a new parser for the given pattern and flags
@@ -46,6 +47,24 @@ func New(pattern string, flags Flags) *Parser {
 func (p *Parser) nextToken() {
 	p.curToken = p.peekToken
 	p.peekToken = p.lexer.NextToken()
+}
+
+// parserState snapshots enough to rewind the parser (both lookahead tokens and
+// the lexer position) so an Annex B construct can be retried as a literal.
+type parserState struct {
+	cur  Token
+	peek Token
+	lex  lexerState
+}
+
+func (p *Parser) save() parserState {
+	return parserState{cur: p.curToken, peek: p.peekToken, lex: p.lexer.save()}
+}
+
+func (p *Parser) restore(s parserState) {
+	p.curToken = s.cur
+	p.peekToken = s.peek
+	p.lexer.restore(s.lex)
 }
 
 // Parse parses the pattern and returns the AST
@@ -75,6 +94,17 @@ func (p *Parser) Parse() (*Pattern, error) {
 				}
 			} else {
 				return nil, fmt.Errorf("unknown named group: %s", br.name)
+			}
+			continue
+		}
+		// Numeric backreference to a group that does not exist.
+		if br.index > p.groupCount {
+			if p.flags.AnnexB {
+				// Web-compat: re-interpret as a legacy octal escape and/or
+				// literal digits (e.g. \5 -> U+0005, \8 -> "8", \58 -> U+0005,"8").
+				br.node.Fallback = legacyOctalRunes(br.digits)
+			} else {
+				return nil, fmt.Errorf("backreference to non-existent group: \\%d", br.index)
 			}
 		}
 	}
@@ -141,15 +171,28 @@ func (p *Parser) parseSequence() (Expression, error) {
 			p.curToken.Type == TokenQuestion {
 			atom = p.parseQuantifier(atom)
 		} else if p.curToken.Type == TokenLBrace && p.peekToken.Type == TokenDigit {
+			// Snapshot so a malformed quantifier can be rewound in Annex B mode,
+			// where "{" is then a literal (e.g. a{2 x} matches the text "a{2 x}").
+			st := p.save()
 			quant, err := p.parseBracedQuantifier(atom)
 			if err != nil {
-				return nil, err
-			}
-			atom = quant
-			// Check for non-greedy modifier after braced quantifier
-			if p.curToken.Type == TokenQuestion {
-				p.nextToken()
-				quant.Greedy = false
+				if !p.flags.AnnexB {
+					return nil, err
+				}
+				// Rewind: leave the base atom in place and re-read "{" as a literal
+				// on the next loop iteration.
+				p.restore(st)
+			} else {
+				// Out-of-order {n,m} (m < n) is an early error in every mode.
+				if quant.Max != -1 && quant.Max < quant.Min {
+					return nil, fmt.Errorf("quantifier range out of order: {%d,%d}", quant.Min, quant.Max)
+				}
+				atom = quant
+				// Check for non-greedy modifier after braced quantifier
+				if p.curToken.Type == TokenQuestion {
+					p.nextToken()
+					quant.Greedy = false
+				}
 			}
 		}
 
@@ -317,6 +360,20 @@ func (p *Parser) parseEscape(val string) (Expression, error) {
 				return nil, err
 			}
 		}
+		// \c not followed by a control letter (A-Za-z). In Annex B this is not a
+		// control escape at all: the backslash and following characters are all
+		// literal (e.g. \c1 matches the three characters "\", "c", "1"). In strict
+		// mode it is a SyntaxError.
+		if ch == 'c' && !(len(val) == 3 && isASCIILetter(val[2])) {
+			if !p.flags.AnnexB {
+				return nil, fmt.Errorf("invalid control escape: %s", val)
+			}
+			seq := make([]Expression, 0, len(val))
+			for _, r := range val {
+				seq = append(seq, &Literal{Char: r})
+			}
+			return &Sequence{Elements: seq}, nil
+		}
 		// Character escape
 		r, err := decodeEscape(val)
 		if err != nil {
@@ -339,6 +396,10 @@ func (p *Parser) parseEscape(val string) (Expression, error) {
 		}
 		return &Literal{Char: r}, nil
 	}
+}
+
+func isASCIILetter(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
 }
 
 // parseGroup parses a group: (...), (?:...), (?=...), (?!...), (?<=...), (?<!...), (?<name>...)
@@ -990,11 +1051,40 @@ func (p *Parser) parseBackreference(val string) (Expression, error) {
 
 	br := &Backreference{Index: num}
 	p.backreferences = append(p.backreferences, backrefInfo{
-		index: num,
-		node:  br,
+		index:  num,
+		digits: numStr,
+		node:   br,
 	})
 
 	return br, nil
+}
+
+// legacyOctalRunes decodes a run of decimal digits from a numeric escape that is
+// not a valid backreference, per ECMA-262 Annex B. A leading run of octal digits
+// (at most 3 when the first is 0-3, otherwise at most 2, so the value stays
+// <= 0o377) becomes one character; every remaining digit is a literal.
+func legacyOctalRunes(digits string) []rune {
+	if digits == "" {
+		return nil
+	}
+	var out []rune
+	i := 0
+	if digits[0] >= '0' && digits[0] <= '7' {
+		maxOctal := 2
+		if digits[0] <= '3' {
+			maxOctal = 3
+		}
+		val := 0
+		for i < len(digits) && i < maxOctal && digits[i] >= '0' && digits[i] <= '7' {
+			val = val*8 + int(digits[i]-'0')
+			i++
+		}
+		out = append(out, rune(val))
+	}
+	for ; i < len(digits); i++ {
+		out = append(out, rune(digits[i]))
+	}
+	return out
 }
 
 // parseNamedBackreference parses \k<name>
@@ -1071,10 +1161,9 @@ func (p *Parser) parseBracedQuantifier(body Expression) (*Quantifier, error) {
 		return nil, fmt.Errorf("expected } in quantifier")
 	}
 
-	// {n,m} with m < n is a SyntaxError (ECMA-262), e.g. a{2,1}.
-	if max != -1 && max < min {
-		return nil, fmt.Errorf("quantifier range out of order: {%d,%d}", min, max)
-	}
+	// Note: the {n,m} out-of-order (m < n) check is an early error applied by the
+	// caller after a grammatically-successful parse, because it must fire in all
+	// modes — unlike a *malformed* {..}, which Annex B re-reads as a literal.
 
 	greedy := p.curToken.isGreedy()
 	p.nextToken()

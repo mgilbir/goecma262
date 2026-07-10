@@ -181,6 +181,12 @@ type Backreference struct {
 	Index      int    // primary group index (1-indexed)
 	Name       string // empty if using numeric index
 	AltIndices []int  // additional group indices for ES2022 duplicate named groups
+
+	// Fallback, when non-nil, means this \n did not resolve to a real group and
+	// (in Annex B mode) is instead a sequence of literal characters — a legacy
+	// octal escape and/or literal digits. The compiler emits these literally
+	// instead of a backreference.
+	Fallback []rune
 }
 
 func (b *Backreference) node() {}
@@ -256,4 +262,9 @@ type Flags struct {
 	UnicodeSets bool
 	DotAll      bool
 	Multiline   bool
+	// AnnexB enables the web-compatibility (Annex B) leniencies: legacy octal
+	// escapes, out-of-range numeric backreferences, invalid \c, and malformed
+	// {..} quantifiers are accepted as literals rather than being SyntaxErrors.
+	// It is always false in Unicode mode.
+	AnnexB bool
 }
