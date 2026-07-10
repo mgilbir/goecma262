@@ -327,6 +327,27 @@ func (re *Regexp) FindSubmatch(b []byte) [][]byte {
 	return result
 }
 
+// submatchIndex converts a raw capture-group slice into the standard
+// index-pair form: a slice of length (numGroups+1)*2 where entry 2i/2i+1 is the
+// [start, end) byte range of group i, or -1/-1 if the group did not participate.
+//
+// These index pairs are what JavaScript's `d` (hasIndices) flag exposes. In this
+// API the index-returning methods are always available, so the `d` flag is not
+// required to obtain them (it is accepted for compatibility but has no effect).
+func (re *Regexp) submatchIndex(groups []int) []int {
+	result := make([]int, (re.numGroups+1)*2)
+	for i := range result {
+		result[i] = -1
+	}
+	for i := 0; i <= re.numGroups; i++ {
+		if i*2+1 < len(groups) {
+			result[i*2] = groups[i*2]
+			result[i*2+1] = groups[i*2+1]
+		}
+	}
+	return result
+}
+
 // FindStringSubmatchIndex returns a slice holding the index pairs identifying the
 // leftmost match of the regular expression in s and the matches, if any, of its subexpressions.
 // A return value of nil indicates no match.
@@ -335,15 +356,56 @@ func (re *Regexp) FindStringSubmatchIndex(s string) []int {
 	if groups == nil {
 		return nil
 	}
+	return re.submatchIndex(groups)
+}
 
-	result := make([]int, (re.numGroups+1)*2)
-	for i := 0; i <= re.numGroups; i++ {
-		if i*2+1 < len(groups) {
-			result[i*2] = groups[i*2]
-			result[i*2+1] = groups[i*2+1]
-		}
+// FindSubmatchIndex returns a slice holding the index pairs identifying the
+// leftmost match of the regular expression in b and the matches, if any, of its
+// subexpressions. A return value of nil indicates no match.
+func (re *Regexp) FindSubmatchIndex(b []byte) []int {
+	return re.FindStringSubmatchIndex(string(b))
+}
+
+// FindAllStringIndex returns a slice of all successive match locations of the
+// regular expression, each as a two-element {start, end} slice of byte offsets.
+// A return value of nil indicates no match.
+func (re *Regexp) FindAllStringIndex(s string, n int) [][]int {
+	matches := re.findAllMatches(s, n)
+	if len(matches) == 0 {
+		return nil
+	}
+	result := make([][]int, len(matches))
+	for i, g := range matches {
+		result[i] = []int{g[0], g[1]}
 	}
 	return result
+}
+
+// FindAllIndex is the []byte version of FindAllStringIndex.
+// A return value of nil indicates no match.
+func (re *Regexp) FindAllIndex(b []byte, n int) [][]int {
+	return re.FindAllStringIndex(string(b), n)
+}
+
+// FindAllStringSubmatchIndex returns a slice of all successive matches, each as
+// a slice of index pairs for the match and its subexpressions (the same form as
+// FindStringSubmatchIndex). A return value of nil indicates no match.
+func (re *Regexp) FindAllStringSubmatchIndex(s string, n int) [][]int {
+	matches := re.findAllMatches(s, n)
+	if len(matches) == 0 {
+		return nil
+	}
+	result := make([][]int, len(matches))
+	for i, g := range matches {
+		result[i] = re.submatchIndex(g)
+	}
+	return result
+}
+
+// FindAllSubmatchIndex is the []byte version of FindAllStringSubmatchIndex.
+// A return value of nil indicates no match.
+func (re *Regexp) FindAllSubmatchIndex(b []byte, n int) [][]int {
+	return re.FindAllStringSubmatchIndex(string(b), n)
 }
 
 // findAllMatches returns the capture-group slices of every successive match,
