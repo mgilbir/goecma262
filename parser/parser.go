@@ -309,9 +309,12 @@ func (p *Parser) parseEscape(val string) (Expression, error) {
 			return p.parseBackreference(val)
 		}
 		// \u{...} code point escape: only valid in unicode mode in pattern body.
-		if ch == 'u' && len(val) > 3 && val[2] == '{' {
+		if ch == 'u' && len(val) >= 3 && val[2] == '{' {
 			if !(p.flags.Unicode || p.flags.UnicodeSets) {
 				return nil, fmt.Errorf("unicode code point escape requires unicode flag")
+			}
+			if _, err := validateCodePointEscape(val); err != nil {
+				return nil, err
 			}
 		}
 		// Character escape
@@ -634,85 +637,78 @@ func isIdentifierPartRune(r rune, unicodeMode bool) bool {
 type nameSet map[string]struct{}
 
 func (p *Parser) validateNamedGroupAlternatives(node Expression) error {
-	_, err := p.namedGroupSets(node)
+	_, err := p.pathNames(node)
 	return err
 }
 
-func (p *Parser) namedGroupSets(node Expression) ([]nameSet, error) {
+// pathNames returns the set of capture-group names reachable along a single
+// match path through node, rejecting any name that can appear twice on the same
+// path (ES2022 permits duplicate names only across different alternatives of a
+// disjunction). It runs in linear time: a Disjunction unions its alternatives'
+// name sets without conflict, while a Sequence errors if two elements share a
+// name. (The previous implementation materialized the cartesian product of all
+// alternatives, which was exponential — e.g. 30 nested (a|b) groups hung the
+// compiler even with no named groups at all.)
+func (p *Parser) pathNames(node Expression) (nameSet, error) {
 	switch n := node.(type) {
 	case *Disjunction:
-		var all []nameSet
+		result := nameSet{}
 		for _, alt := range n.Alternatives {
-			sets, err := p.namedGroupSets(alt)
+			s, err := p.pathNames(alt)
 			if err != nil {
 				return nil, err
 			}
-			all = append(all, sets...)
+			// Names in different alternatives may coincide; just union them.
+			for k := range s {
+				result[k] = struct{}{}
+			}
 		}
-		return all, nil
+		return result, nil
 	case *Sequence:
-		sets := []nameSet{{}}
+		result := nameSet{}
 		for _, elem := range n.Elements {
-			nextSets, err := p.namedGroupSets(elem)
+			s, err := p.pathNames(elem)
 			if err != nil {
 				return nil, err
 			}
-			combined := make([]nameSet, 0, len(sets)*len(nextSets))
-			for _, left := range sets {
-				for _, right := range nextSets {
-					merged, err := mergeNameSets(left, right)
-					if err != nil {
-						return nil, err
-					}
-					combined = append(combined, merged)
+			for k := range s {
+				if _, dup := result[k]; dup {
+					return nil, fmt.Errorf("duplicate group name: %s", k)
 				}
+				result[k] = struct{}{}
 			}
-			sets = combined
 		}
-		return sets, nil
+		return result, nil
 	case *Group:
-		return p.namedGroupSets(n.Body)
+		return p.pathNames(n.Body)
 	case *NamedGroup:
-		sets, err := p.namedGroupSets(n.Body)
+		bodyNames, err := p.pathNames(n.Body)
 		if err != nil {
 			return nil, err
 		}
-		for _, set := range sets {
-			if _, exists := set[n.Name]; exists {
-				return nil, fmt.Errorf("duplicate group name: %s", n.Name)
-			}
-			set[n.Name] = struct{}{}
+		if _, dup := bodyNames[n.Name]; dup {
+			return nil, fmt.Errorf("duplicate group name: %s", n.Name)
 		}
-		return sets, nil
+		result := nameSet{n.Name: struct{}{}}
+		for k := range bodyNames {
+			result[k] = struct{}{}
+		}
+		return result, nil
 	case *NonCapturingGroup:
-		return p.namedGroupSets(n.Body)
+		return p.pathNames(n.Body)
 	case *Lookahead:
-		return p.namedGroupSets(n.Body)
+		return p.pathNames(n.Body)
 	case *NegativeLookahead:
-		return p.namedGroupSets(n.Body)
+		return p.pathNames(n.Body)
 	case *Lookbehind:
-		return p.namedGroupSets(n.Body)
+		return p.pathNames(n.Body)
 	case *NegativeLookbehind:
-		return p.namedGroupSets(n.Body)
+		return p.pathNames(n.Body)
 	case *Quantifier:
-		return p.namedGroupSets(n.Body)
+		return p.pathNames(n.Body)
 	default:
-		return []nameSet{{}}, nil
+		return nameSet{}, nil
 	}
-}
-
-func mergeNameSets(left, right nameSet) (nameSet, error) {
-	merged := make(nameSet, len(left)+len(right))
-	for k := range left {
-		merged[k] = struct{}{}
-	}
-	for k := range right {
-		if _, exists := merged[k]; exists {
-			return nil, fmt.Errorf("duplicate group name: %s", k)
-		}
-		merged[k] = struct{}{}
-	}
-	return merged, nil
 }
 
 // parseCharacterClass parses [...] or [^...]
@@ -764,6 +760,11 @@ func (p *Parser) parseCharacterClass() (Expression, error) {
 
 			endLiteral, okEnd := endAtom.(*ClassLiteral)
 			if ok && okEnd {
+				// A range whose start code point exceeds its end is a
+				// SyntaxError (ECMA-262 CharacterRange), e.g. [z-a].
+				if prevLiteral.Char > endLiteral.Char {
+					return nil, fmt.Errorf("range out of order in character class: %c-%c", prevLiteral.Char, endLiteral.Char)
+				}
 				// Replace previous literal with range
 				atoms[len(atoms)-1] = &ClassRange{Start: prevLiteral.Char, End: endLiteral.Char}
 			} else {
@@ -795,6 +796,11 @@ func (p *Parser) parseClassAtom() (ClassAtom, error) {
 		val := p.curToken.Value
 		p.nextToken()
 		if strings.HasPrefix(val, "\\") {
+			if len(val) >= 3 && val[1] == 'u' && val[2] == '{' {
+				if _, err := validateCodePointEscape(val); err != nil {
+					return nil, err
+				}
+			}
 			r, err := decodeEscape(val)
 			if err != nil {
 				return nil, err
@@ -937,12 +943,37 @@ func (p *Parser) parseClassEscape(val string) (ClassAtom, error) {
 		neg := ch == 'P'
 		return &ClassEscape{Kind: ClassEscapeUnicodeProperty, Property: prop, Negated: neg}, nil
 	default:
+		if ch == 'u' && len(val) >= 3 && val[2] == '{' {
+			if _, err := validateCodePointEscape(val); err != nil {
+				return nil, err
+			}
+		}
 		r, err := decodeEscape(val)
 		if err != nil {
 			return nil, err
 		}
 		return &ClassLiteral{Char: r}, nil
 	}
+}
+
+// validateCodePointEscape checks that a \u{...} escape is non-empty and denotes
+// a code point in [0, 0x10FFFF]; ECMA-262 makes an empty or out-of-range escape
+// a SyntaxError. It returns the decoded rune on success.
+func validateCodePointEscape(val string) (rune, error) {
+	open := strings.IndexByte(val, '{')
+	end := strings.IndexByte(val, '}')
+	if open == -1 || end == -1 || end < open {
+		return 0, fmt.Errorf("invalid unicode code point escape: %s", val)
+	}
+	hex := val[open+1 : end]
+	if len(hex) == 0 {
+		return 0, fmt.Errorf("empty unicode code point escape")
+	}
+	cp, err := strconv.ParseInt(hex, 16, 64)
+	if err != nil || cp > 0x10FFFF {
+		return 0, fmt.Errorf("unicode code point escape out of range: %s", val)
+	}
+	return rune(cp), nil
 }
 
 // parseUnicodeProperty parses \p{...} or \P{...}
@@ -1049,6 +1080,11 @@ func (p *Parser) parseBracedQuantifier(body Expression) (*Quantifier, error) {
 
 	if p.curToken.Type != TokenRBrace {
 		return nil, fmt.Errorf("expected } in quantifier")
+	}
+
+	// {n,m} with m < n is a SyntaxError (ECMA-262), e.g. a{2,1}.
+	if max != -1 && max < min {
+		return nil, fmt.Errorf("quantifier range out of order: {%d,%d}", min, max)
 	}
 
 	greedy := p.curToken.isGreedy()
