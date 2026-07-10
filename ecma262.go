@@ -1,9 +1,12 @@
 // Package ecma262 implements ECMA-262 regular expressions for Go
 // with an API compatible with the standard regexp package.
 //
-// The Regexp type is safe for concurrent use by multiple goroutines,
-// as it holds only the compiled pattern (immutable after construction).
-// Each match operation creates its own VM instance with independent state.
+// A Regexp compiled without the g (global) or y (sticky) flag is immutable
+// after construction and safe for concurrent use by multiple goroutines;
+// each match operation creates its own VM instance with independent state.
+// With g or y, the instance carries a lastIndex cursor that match operations
+// read and advance (mirroring JavaScript semantics), so such instances must
+// not be shared between goroutines without synchronization. See SetLastIndex.
 package ecma262
 
 import (
@@ -20,8 +23,10 @@ import (
 )
 
 // Regexp is the representation of a compiled ECMA-262 regular expression.
-// It is safe for concurrent use by multiple goroutines unless SetLastIndex
-// is used, which makes the instance stateful.
+// Without the g or y flag it is safe for concurrent use by multiple
+// goroutines. With g or y, MatchString, Match and FindStringSubmatch read
+// and update the instance's lastIndex cursor (as SetLastIndex does), making
+// the instance stateful; callers are responsible for synchronization.
 type Regexp struct {
 	expr      string
 	flags     flags.Flags
@@ -43,7 +48,6 @@ type Regexp struct {
 	lastIndex int
 }
 
-// Compile parses a regular expression and returns, if successful,
 // Syntax selects how the compiler treats the legacy web-compatibility
 // extensions (ECMA-262 Annex B).
 type Syntax int
@@ -74,7 +78,8 @@ func WithSyntax(s Syntax) Option {
 	return func(c *config) { c.syntax = s }
 }
 
-// a Regexp object that can be used to match against text
+// Compile parses a regular expression and returns, if successful, a Regexp
+// object that can be used to match against text.
 func Compile(expr string, f flags.Flags, opts ...Option) (*Regexp, error) {
 	cfg := config{syntax: SyntaxAnnexB}
 	for _, o := range opts {
@@ -168,7 +173,13 @@ func (re *Regexp) MatchString(s string) bool {
 }
 
 // SetMaxSteps sets the maximum VM instruction steps for each match operation.
-// A value of 0 uses the VM default limit.
+// A value of 0 uses the VM default limit (vm.DefaultMaxSteps).
+//
+// The step limit bounds backtracking as a ReDoS protection. When a match
+// operation exceeds it, the boolean/string methods (MatchString, FindString,
+// FindAllString, ReplaceAllString, ...) report it as "no match" — they cannot
+// distinguish a limit hit from a genuine non-match. Use MatchStringErr,
+// MatchErr or FindStringIndexErr to observe vm.ErrStepLimit instead.
 func (re *Regexp) SetMaxSteps(max int) {
 	if max < 0 {
 		max = 0
@@ -177,21 +188,26 @@ func (re *Regexp) SetMaxSteps(max int) {
 }
 
 // SetLastIndex sets the starting position for the next match operation.
-// For patterns with the g (global) or y (sticky) flag, this determines
-// where searching begins. For patterns without these flags, lastIndex is ignored.
+// n is a byte offset into the input string, not a UTF-16 code-unit index
+// as in JavaScript. For patterns with the g (global) or y (sticky) flag,
+// this determines where searching begins; MatchString and FindStringSubmatch
+// then advance it past each match (or reset it to 0 on no match). For
+// patterns without these flags, lastIndex is ignored.
 // This method makes the Regexp instance stateful; callers are responsible
 // for synchronization when using across goroutines.
 func (re *Regexp) SetLastIndex(n int) {
 	re.lastIndex = n
 }
 
-// LastIndex returns the current lastIndex value.
+// LastIndex returns the current lastIndex value, a byte offset into the input.
 func (re *Regexp) LastIndex() int {
 	return re.lastIndex
 }
 
 // MatchStringErr reports whether the string s contains any match of the regular expression.
 // If matching exceeds the VM step limit, it returns vm.ErrStepLimit.
+// Unlike MatchString, it always searches from the start of s: lastIndex is
+// neither consulted nor updated, even with the g or y flag.
 func (re *Regexp) MatchStringErr(s string) (bool, error) {
 	groups, err := re.doMatchWithError(s, 0)
 	if err != nil {
@@ -211,7 +227,9 @@ func (re *Regexp) MatchErr(b []byte) (bool, error) {
 	return re.MatchStringErr(string(b))
 }
 
-// MatchReader reports whether the text returned by the RuneReader contains any match
+// MatchReader reports whether the text returned by the RuneReader contains any match.
+// It reads the entire input into memory before matching, so it does not
+// provide streaming behavior for large inputs.
 func (re *Regexp) MatchReader(r io.RuneReader) bool {
 	var sb strings.Builder
 	for {
@@ -284,7 +302,9 @@ func (re *Regexp) FindStringIndexErr(s string) ([]int, error) {
 
 // FindStringSubmatch returns a slice of strings holding the text of the leftmost
 // match of the regular expression in s and the matches, if any, of its subexpressions.
-// For patterns with the g or y flag, matching starts at re.lastIndex.
+// For patterns with the g or y flag, matching starts at re.lastIndex, and
+// lastIndex is advanced to the end of the match (or reset to 0 on no match),
+// mirroring JavaScript RegExp.prototype.exec so repeated calls iterate.
 // A return value of nil indicates no match.
 func (re *Regexp) FindStringSubmatch(s string) []string {
 	startPos := 0
