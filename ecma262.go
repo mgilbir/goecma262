@@ -665,7 +665,7 @@ func (re *Regexp) doMatch(s string, startPos int) []int {
 
 	// Sticky flag: only attempt match at startPos (anchored)
 	if re.sticky {
-		matched, _, groups := v.Match(s, startPos)
+		matched, _, groups := v.MatchAt(s, startPos)
 		if v.Err != nil || !matched {
 			return nil
 		}
@@ -674,7 +674,7 @@ func (re *Regexp) doMatch(s string, startPos int) []int {
 
 	// Try different starting positions to find a match
 	for pos := startPos; pos <= len(s); {
-		matched, _, groups := v.Match(s, pos)
+		matched, _, groups := v.MatchAt(s, pos)
 		if v.Err != nil {
 			return nil
 		}
@@ -715,7 +715,7 @@ func (re *Regexp) doMatchWithError(s string, startPos int) ([]int, error) {
 
 	// Sticky flag: only attempt match at startPos (anchored)
 	if re.sticky {
-		matched, _, groups := v.Match(s, startPos)
+		matched, _, groups := v.MatchAt(s, startPos)
 		if v.Err != nil {
 			return nil, v.Err
 		}
@@ -726,7 +726,7 @@ func (re *Regexp) doMatchWithError(s string, startPos int) ([]int, error) {
 	}
 
 	for pos := startPos; pos <= len(s); {
-		matched, _, groups := v.Match(s, pos)
+		matched, _, groups := v.MatchAt(s, pos)
 		if v.Err != nil {
 			return nil, v.Err
 		}
