@@ -211,14 +211,14 @@ The test cases are extracted from the `test/built-ins/RegExp` subtree and compil
 
 **Current result: all 66 136 cases pass or are explicitly skipped.**
 
-17 cases are permanently skipped because they require JavaScript runtime semantics or
+21 cases are permanently skipped because they require JavaScript runtime semantics or
 hit implementation limits that cannot be resolved in a static Go API:
 
 | Category | Count | Reason |
 |---|---|---|
 | Functional replace (`functional-replace-*.js`) | 8 | Replacement argument is a JS arrow function; Go has no JS runtime to execute it |
 | RegExp subclass (`groups-object-subclass*.js`) | 4 | Tests override `Symbol.replace` and inject a custom JS groups object; not representable in Go |
-| Lookbehind right-to-left captures (`lookbehind.js`, `back-references-to-captures.js`) | 3 | ECMA-262 evaluates lookbehind bodies right-to-left; our left-to-right implementation produces incorrect capture groups in these edge cases |
+| Lookbehind right-to-left captures (`lookbehind.js`, `back-references-to-captures.js`) | 7 | ECMA-262 evaluates lookbehind bodies right-to-left; our left-to-right implementation produces incorrect capture groups when a quantified capture sits inside the lookbehind |
 | Deeply nested patterns (`S15.10.2.8_A3_T15.js`, `S15.10.2.8_A3_T16.js`) | 2 | Patterns with 200+ nesting levels hit the compile-time `MaxNestingDepth` limit |
 
 These skips are recorded in `tests/test262_skip_test.go`.  That file is **not** overwritten

@@ -52,6 +52,16 @@ var test262KnownFailures = map[string]string{
 	// captures inside quantified lookbehind bodies are incorrect.
 	"lookbehind.js#3": "requires right-to-left lookbehind evaluation for capture group semantics",
 	"lookbehind.js#8": "requires right-to-left lookbehind evaluation for capture group semantics",
+	// #1/#2/#6/#7 use a counted quantifier (?<a>\w){3,4} inside a lookbehind and
+	// expect the LEFTMOST iteration's capture (right-to-left evaluation): "c"/"b".
+	// Our left-to-right sub-VM with correct group-reset semantics captures the
+	// rightmost iteration ("e"). These previously passed only by accident of a
+	// group-renumbering bug in counted quantifiers (audit C3); fixing that bug
+	// reveals they share the same right-to-left lookbehind limitation as #3/#8.
+	"lookbehind.js#1": "requires right-to-left lookbehind evaluation for counted-quantifier capture semantics",
+	"lookbehind.js#2": "requires right-to-left lookbehind evaluation for counted-quantifier capture semantics",
+	"lookbehind.js#6": "requires right-to-left lookbehind evaluation for counted-quantifier capture semantics",
+	"lookbehind.js#7": "requires right-to-left lookbehind evaluation for counted-quantifier capture semantics",
 
 	// -------------------------------------------------------------------------
 	// Lookbehind: backreference to group defined inside same lookbehind
