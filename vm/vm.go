@@ -765,8 +765,8 @@ func (vm *VM) matchChar(input, pattern rune) bool {
 		// fold orbit (so ſ folds to s, Kelvin sign K to k, etc.).
 		return foldEqual(input, pattern)
 	}
-	// Non-unicode mode: ASCII-only case folding.
-	return toASCIILower(input) == toASCIILower(pattern)
+	// Non-unicode mode: legacy Canonicalize (uppercase, with the ASCII guard).
+	return canonicalizeLegacy(input) == canonicalizeLegacy(pattern)
 }
 
 func (vm *VM) matchInRange(ch, start, end rune) bool {
@@ -788,11 +788,14 @@ func (vm *VM) matchInRange(ch, start, end rune) bool {
 		}
 		return false
 	}
-	if lo := toASCIILower(ch); lo >= start && lo <= end {
-		return true
-	}
-	if up := toASCIIUpper(ch); up >= start && up <= end {
-		return true
+	// Non-unicode: a character matches the range if one of its case variants
+	// falls within the raw range AND canonicalizes to the same character (the
+	// canonicalization guard keeps e.g. ſ from matching an [R-T] range).
+	ci := canonicalizeLegacy(ch)
+	for _, v := range [2]rune{unicode.ToLower(ch), unicode.ToUpper(ch)} {
+		if v >= start && v <= end && canonicalizeLegacy(v) == ci {
+			return true
+		}
 	}
 	return false
 }
@@ -810,20 +813,16 @@ func foldEqual(a, b rune) bool {
 	return false
 }
 
-// toASCIILower does simple ASCII-range lower-casing (ECMA-262 non-unicode mode).
-func toASCIILower(r rune) rune {
-	if r >= 'A' && r <= 'Z' {
-		return r + ('a' - 'A')
+// canonicalizeLegacy implements the ECMA-262 non-Unicode Canonicalize used for
+// case-insensitive matching: map ch to its simple uppercase, except keep the
+// original when uppercasing a non-ASCII character would produce an ASCII one
+// (so ſ (U+017F) does not fold to "s", matching JavaScript's legacy behavior).
+func canonicalizeLegacy(ch rune) rune {
+	up := unicode.ToUpper(ch)
+	if ch >= 128 && up < 128 {
+		return ch
 	}
-	return r
-}
-
-// toASCIIUpper does simple ASCII-range upper-casing (ECMA-262 non-unicode mode).
-func toASCIIUpper(r rune) rune {
-	if r >= 'a' && r <= 'z' {
-		return r - ('a' - 'A')
-	}
-	return r
+	return up
 }
 
 // copyGroups returns a copy of the groups slice
