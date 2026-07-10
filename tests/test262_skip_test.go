@@ -43,36 +43,6 @@ var test262KnownFailures = map[string]string{
 	"groups-object-subclass.js#4":      "requires JS RegExp subclass with custom groups object",
 
 	// -------------------------------------------------------------------------
-	// Lookbehind: right-to-left capture semantics
-	// -------------------------------------------------------------------------
-	// These tests require the lookbehind body to be evaluated right-to-left (as
-	// per ECMA-262), so that capture groups in a repeated quantifier inside the
-	// lookbehind capture the leftmost (first) iteration rather than the last.
-	// Our implementation evaluates the lookbehind body left-to-right, so group
-	// captures inside quantified lookbehind bodies are incorrect.
-	"lookbehind.js#3": "requires right-to-left lookbehind evaluation for capture group semantics",
-	"lookbehind.js#8": "requires right-to-left lookbehind evaluation for capture group semantics",
-	// #1/#2/#6/#7 use a counted quantifier (?<a>\w){3,4} inside a lookbehind and
-	// expect the LEFTMOST iteration's capture (right-to-left evaluation): "c"/"b".
-	// Our left-to-right sub-VM with correct group-reset semantics captures the
-	// rightmost iteration ("e"). These previously passed only by accident of a
-	// group-renumbering bug in counted quantifiers (audit C3); fixing that bug
-	// reveals they share the same right-to-left lookbehind limitation as #3/#8.
-	"lookbehind.js#1": "requires right-to-left lookbehind evaluation for counted-quantifier capture semantics",
-	"lookbehind.js#2": "requires right-to-left lookbehind evaluation for counted-quantifier capture semantics",
-	"lookbehind.js#6": "requires right-to-left lookbehind evaluation for counted-quantifier capture semantics",
-	"lookbehind.js#7": "requires right-to-left lookbehind evaluation for counted-quantifier capture semantics",
-
-	// -------------------------------------------------------------------------
-	// Lookbehind: backreference to group defined inside same lookbehind
-	// -------------------------------------------------------------------------
-	// (?<=\1(\w+))c — backreference \1 refers to group 1 which is also inside
-	// the lookbehind.  In JS right-to-left evaluation this is well-defined, but
-	// in our left-to-right sub-VM the backreference is always unset at the point
-	// it is evaluated, making this test behave incorrectly.
-	"back-references-to-captures.js#1": "requires right-to-left lookbehind evaluation for self-referencing backreference",
-
-	// -------------------------------------------------------------------------
 	// Deeply nested patterns: nesting depth limit
 	// -------------------------------------------------------------------------
 	// These patterns have 200+ levels of nesting and hit the MaxNestingDepth=200
