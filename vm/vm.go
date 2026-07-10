@@ -991,122 +991,106 @@ func isLineTerminator(r rune) bool {
 	return r == '\n' || r == '\r' || r == '\u2028' || r == '\u2029'
 }
 
+// matchUnicodeProperty reports whether r has the given Unicode property. An
+// unrecognized property matches nothing, but callers should reject unknown
+// property names at compile time via ValidUnicodeProperty.
 func matchUnicodeProperty(r rune, prop string) bool {
-	name, value := splitUnicodeProperty(prop)
-	if name != "" {
-		if isGeneralCategoryName(name) {
-			return matchUnicodePropertyValue(r, value)
-		}
-		if isScriptName(name) {
-			return matchUnicodeScript(r, value)
-		}
-		if isPropertyOfStrings(name) {
-			// Property of strings (e.g. Emoji_Presentation) — treat as false for single char
-			return false
-		}
+	m, ok := resolveUnicodeProperty(prop)
+	if !ok {
 		return false
 	}
-	// Binary property or general category shorthand
-	return matchUnicodeBinaryOrCategory(r, prop)
+	return m(r)
 }
 
-func matchUnicodeScript(r rune, script string) bool {
-	// Normalize script name
-	norm := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(script, "_", ""), " ", ""))
-	// Look up in Go's unicode.Scripts table
-	for name, rangeTable := range unicode.Scripts {
-		if strings.ToLower(strings.ReplaceAll(name, "_", "")) == norm {
-			return unicode.Is(rangeTable, r)
+// ValidUnicodeProperty reports whether prop names a Unicode property/value
+// expression this engine understands. The compiler uses it to make \p{Unknown}
+// (and \p{}) a SyntaxError instead of a construct that silently matches nothing.
+func ValidUnicodeProperty(prop string) bool {
+	_, ok := resolveUnicodeProperty(prop)
+	return ok
+}
+
+// resolveUnicodeProperty maps a property expression to a rune predicate. It
+// accepts "Name=Value" (general category or script) and lone names (a general
+// category value or a binary property). It returns ok=false for anything it
+// does not recognize.
+func resolveUnicodeProperty(prop string) (func(rune) bool, bool) {
+	if eq := strings.IndexByte(prop, '='); eq >= 0 {
+		name := normalizeUnicodeProperty(prop[:eq])
+		value := prop[eq+1:]
+		switch name {
+		case "gc", "generalcategory":
+			if t := categoryTable(value); t != nil {
+				return func(r rune) bool { return unicode.Is(t, r) }, true
+			}
+		case "sc", "script", "scx", "scriptextensions":
+			if t := scriptTable(value); t != nil {
+				return func(r rune) bool { return unicode.Is(t, r) }, true
+			}
+		}
+		return nil, false
+	}
+	if t := categoryTable(prop); t != nil {
+		return func(r rune) bool { return unicode.Is(t, r) }, true
+	}
+	return binaryProperty(prop)
+}
+
+// categoryTable resolves a general-category name or alias (short or long, in any
+// case, with underscores/hyphens/spaces ignored) to its unicode.RangeTable.
+func categoryTable(name string) *unicode.RangeTable {
+	short, ok := categoryAliases[normalizeUnicodeProperty(name)]
+	if !ok {
+		return nil
+	}
+	return unicode.Categories[short]
+}
+
+// scriptTable resolves a script name (ignoring case and separators) to its table.
+func scriptTable(name string) *unicode.RangeTable {
+	norm := normalizeUnicodeProperty(name)
+	for scriptName, table := range unicode.Scripts {
+		if normalizeUnicodeProperty(scriptName) == norm {
+			return table
 		}
 	}
-	// Also check unicode.Categories as some scripts are there
-	return false
+	return nil
 }
 
-func isScriptName(name string) bool {
-	switch name {
-	case "script", "sc":
-		return true
-	}
-	return false
-}
-
-func isPropertyOfStrings(name string) bool {
-	return false // simplified
-}
-
-func matchUnicodeBinaryOrCategory(r rune, prop string) bool {
-	norm := normalizeUnicodeProperty(prop)
-	switch norm {
-	// Binary properties
+// binaryProperty resolves the Unicode binary properties ECMA-262 permits as a
+// lone \p{Name}, falling back to Go's unicode.Properties table.
+func binaryProperty(prop string) (func(rune) bool, bool) {
+	switch normalizeUnicodeProperty(prop) {
 	case "ascii":
-		return r <= 0x7F
-	case "alphanumeric", "alnum":
-		return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
-	case "alpha":
-		return unicode.IsLetter(r)
+		return func(r rune) bool { return r <= 0x7F }, true
 	case "any":
-		return true
+		return func(r rune) bool { return true }, true
 	case "assigned":
-		return r != unicode.ReplacementChar && unicode.IsGraphic(r)
-	case "id_continue", "idcontinue":
-		return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == 0x200C || r == 0x200D
-	case "id_start", "idstart":
-		return unicode.IsLetter(r) || r == '_'
-	case "emoji":
-		return unicode.Is(unicode.So, r) || r == 0x23 || r == 0x2A || (r >= 0x30 && r <= 0x39)
-	// General categories (same as matchUnicodePropertyValue)
-	default:
-		return matchUnicodePropertyValue(r, prop)
+		return func(r rune) bool { return r != unicode.ReplacementChar && (unicode.IsGraphic(r) || unicode.IsControl(r) || unicode.Is(unicode.Cf, r)) }, true
+	case "alphabetic", "alpha":
+		return func(r rune) bool {
+			return unicode.IsLetter(r) || unicode.Is(unicode.Nl, r) || unicode.Is(unicode.Other_Alphabetic, r)
+		}, true
+	case "lowercase", "lower":
+		return func(r rune) bool { return unicode.IsLower(r) || unicode.Is(unicode.Other_Lowercase, r) }, true
+	case "uppercase", "upper":
+		return func(r rune) bool { return unicode.IsUpper(r) || unicode.Is(unicode.Other_Uppercase, r) }, true
+	case "whitespace", "spaceseparator":
+		return func(r rune) bool { return unicode.IsSpace(r) }, true
+	case "digit":
+		// Non-standard alias for Nd, kept for compatibility with existing usage.
+		return func(r rune) bool { return unicode.Is(unicode.Nd, r) }, true
 	}
-}
-
-func matchUnicodePropertyValue(r rune, prop string) bool {
+	// Fall back to Go's binary property tables (Hex_Digit, ASCII_Hex_Digit,
+	// White_Space, Dash, Ideographic, ...).
 	norm := normalizeUnicodeProperty(prop)
-	switch norm {
-	case "l", "letter":
-		return unicode.IsLetter(r)
-	case "n", "number":
-		return unicode.IsNumber(r)
-	case "p", "punctuation":
-		return unicode.IsPunct(r)
-	case "s", "symbol":
-		return unicode.IsSymbol(r)
-	case "z", "separator":
-		return unicode.IsSpace(r)
-	case "c", "other":
-		return unicode.IsControl(r)
-	case "ll", "lowercaseletter":
-		return unicode.IsLower(r)
-	case "lu", "uppercaseletter":
-		return unicode.IsUpper(r)
-	case "lt", "titlecaseletter":
-		return unicode.IsTitle(r)
-	case "nd", "decimalnumber", "digit":
-		// Decimal_Number (Nd) includes all Unicode decimal digits
-		return unicode.IsDigit(r)
-	case "whitespace":
-		return unicode.IsSpace(r)
-	default:
-		return false
+	for name, table := range unicode.Properties {
+		if normalizeUnicodeProperty(name) == norm {
+			t := table
+			return func(r rune) bool { return unicode.Is(t, r) }, true
+		}
 	}
-}
-
-func splitUnicodeProperty(prop string) (string, string) {
-	parts := strings.SplitN(prop, "=", 2)
-	if len(parts) != 2 {
-		return "", ""
-	}
-	return normalizeUnicodeProperty(parts[0]), parts[1]
-}
-
-func isGeneralCategoryName(name string) bool {
-	switch normalizeUnicodeProperty(name) {
-	case "gc", "generalcategory":
-		return true
-	default:
-		return false
-	}
+	return nil, false
 }
 
 func normalizeUnicodeProperty(prop string) string {
@@ -1115,4 +1099,46 @@ func normalizeUnicodeProperty(prop string) string {
 	prop = strings.ReplaceAll(prop, "-", "")
 	prop = strings.ReplaceAll(prop, " ", "")
 	return strings.ToLower(prop)
+}
+
+// categoryAliases maps normalized general-category names (short codes and long
+// names/aliases) to the short code keying unicode.Categories.
+var categoryAliases = map[string]string{
+	"l": "L", "letter": "L",
+	"lu": "Lu", "uppercaseletter": "Lu",
+	"ll": "Ll", "lowercaseletter": "Ll",
+	"lt": "Lt", "titlecaseletter": "Lt",
+	"lm": "Lm", "modifierletter": "Lm",
+	"lo": "Lo", "otherletter": "Lo",
+	"lc": "L", "casedletter": "L",
+	"m": "M", "mark": "M", "combiningmark": "M",
+	"mn": "Mn", "nonspacingmark": "Mn",
+	"mc": "Mc", "spacingcombiningmark": "Mc", "spacingmark": "Mc",
+	"me": "Me", "enclosingmark": "Me",
+	"n": "N", "number": "N",
+	"nd": "Nd", "decimalnumber": "Nd",
+	"nl": "Nl", "letternumber": "Nl",
+	"no": "No", "othernumber": "No",
+	"p": "P", "punctuation": "P",
+	"pc": "Pc", "connectorpunctuation": "Pc",
+	"pd": "Pd", "dashpunctuation": "Pd",
+	"ps": "Ps", "openpunctuation": "Ps",
+	"pe": "Pe", "closepunctuation": "Pe",
+	"pi": "Pi", "initialpunctuation": "Pi",
+	"pf": "Pf", "finalpunctuation": "Pf",
+	"po": "Po", "otherpunctuation": "Po",
+	"s": "S", "symbol": "S",
+	"sm": "Sm", "mathsymbol": "Sm",
+	"sc": "Sc", "currencysymbol": "Sc",
+	"sk": "Sk", "modifiersymbol": "Sk",
+	"so": "So", "othersymbol": "So",
+	"z": "Z", "separator": "Z",
+	"zs": "Zs", "spaceseparator": "Zs",
+	"zl": "Zl", "lineseparator": "Zl",
+	"zp": "Zp", "paragraphseparator": "Zp",
+	"c": "C", "other": "C",
+	"cc": "Cc", "control": "Cc", "cntrl": "Cc",
+	"cf": "Cf", "format": "Cf",
+	"cs": "Cs", "surrogate": "Cs",
+	"co": "Co", "privateuse": "Co",
 }
