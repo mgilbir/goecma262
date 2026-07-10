@@ -1,6 +1,6 @@
 # Docs audit — goecma262 — 2026-07-09
 
-Auditor: Claude (docs-as-artifact audit). Every accuracy claim below was tested against the
+Docs-as-artifact audit. Every accuracy claim below was tested against the
 code at commit `8bfa4bb` by running it; verdicts are **CONFIRMED** (verified by execution or
 direct code inspection) or **PLAUSIBLE** (suspected, not fully verified).
 
