@@ -8,11 +8,16 @@
 // read and advance (mirroring JavaScript semantics), so such instances must
 // not be shared between goroutines without synchronization. See SetLastIndex.
 //
-// # Execution budget
+// # Bounded matching
 //
-// Matching is a backtracking search, bounded per match operation by a step
-// budget as ReDoS protection (see SetMaxSteps). An operation that exceeds its
-// budget has no answer, which is distinct from "no match":
+// Matching is a backtracking search with an explicit, heap-allocated stack, so
+// no input can overflow the goroutine stack. Each match operation runs under a
+// budget of steps and backtracking memory (see vm.ErrStepLimit for the exact
+// bounds). By default the budget grows linearly with the input, so it stops
+// super-linear (ReDoS) searches while searches that run in linear time — which
+// the engine achieves for common shapes such as ^[a-z]+$, ^(a)+$ or ^(a|b)+$
+// — complete at any input length. An operation that exceeds its budget has no
+// answer, which is distinct from "no match":
 //
 //   - The error-returning forms — the package-level MatchString and Match, and
 //     the methods whose names end in Err — return ErrStepLimit (test with
@@ -51,6 +56,7 @@ type Regexp struct {
 	expr      string
 	flags     flags.Flags
 	code      []vm.Instruction
+	prog      *vm.Program // analysis of code, shared by every match operation
 	numGroups int
 	names     []string // group names
 
@@ -141,9 +147,11 @@ func Compile(expr string, f flags.Flags, opts ...Option) (*Regexp, error) {
 	names := extractGroupNames(ast.Body, numGroups)
 
 	return &Regexp{
-		expr:       expr,
-		flags:      f,
-		code:       code,
+		expr:  expr,
+		flags: f,
+		code:  code,
+		prog: vm.NewProgram(code, f.Has(flags.IgnoreCase), f.Has(flags.Multiline), f.Has(flags.DotAll),
+			f.Has(flags.Unicode) || f.Has(flags.UnicodeSets), false),
 		numGroups:  numGroups,
 		names:      names,
 		ignoreCase: f.Has(flags.IgnoreCase),
@@ -192,8 +200,12 @@ func (re *Regexp) MatchString(s string) bool {
 	return true
 }
 
-// SetMaxSteps sets the maximum VM instruction steps for each match operation.
-// A value of 0 uses the VM default limit (vm.DefaultMaxSteps).
+// SetMaxSteps sets the maximum VM instruction steps for each match operation
+// (a whole scan over start positions, lookarounds included). A value of 0
+// restores the default, vm.DefaultMaxSteps plus vm.DefaultStepsPerByte per
+// byte of input, which grows with the input so that linear-time searches are
+// not cut off on long inputs; a positive value is a fixed limit regardless of
+// input length.
 //
 // The step limit bounds backtracking as a ReDoS protection. When a match
 // operation exceeds it, the methods without an error result (MatchString,
@@ -888,6 +900,7 @@ func (re *Regexp) doMatchWithError(s string, startPos int) ([]int, error) {
 
 	v := &vm.VM{
 		Code:       re.code,
+		Program:    re.prog,
 		NumGroups:  re.numGroups,
 		IgnoreCase: re.ignoreCase,
 		Multiline:  re.multiline,

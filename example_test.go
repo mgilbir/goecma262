@@ -148,11 +148,17 @@ func ExampleRegexp_MatchStringErr() {
 }
 
 func ExampleMatchString() {
+	// Linear-time patterns complete at any input length: the default budget
+	// grows with the input.
+	matched, err := ecma262.MatchString(`^[a-z]+$`, flags.Flags(0), strings.Repeat("a", 1_000_000))
+	fmt.Println(matched, err)
+
 	// A catastrophic search has no answer. The error is distinct from a
 	// non-match; never read matched without checking it.
-	_, err := ecma262.MatchString(`^(a*)(a*)(a*)\1\2\3$`, flags.Flags(0), strings.Repeat("a", 300))
+	_, err = ecma262.MatchString(`^(a*)(a*)(a*)\1\2\3$`, flags.Flags(0), strings.Repeat("a", 300))
 	fmt.Println(errors.Is(err, ecma262.ErrStepLimit))
 	// Output:
+	// true <nil>
 	// true
 }
 

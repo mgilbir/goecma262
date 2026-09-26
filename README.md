@@ -10,7 +10,7 @@ Annex B web-compatibility syntax, same capture and replacement semantics,
 validated against the official [Test262](https://github.com/tc39/test262)
 suite). If you need neither, prefer the standard library: RE2 guarantees
 linear-time matching, while this engine is a backtracker whose worst case is
-bounded by a configurable step limit
+bounded by an execution budget that grows linearly with the input
 (see [Match semantics and safety](#match-semantics-and-safety)).
 
 ## Installation
@@ -170,8 +170,15 @@ the cursor directly.
 **Offsets are bytes.** All positions (`lastIndex`, `*Index` results) are byte
 offsets into the Go string, not UTF-16 code-unit indices as in JavaScript.
 
-**ReDoS protection.** The backtracking VM enforces a step limit (default
-1,000,000; tune per instance with `SetMaxSteps`).
+**Bounded matching (ReDoS protection).** Matching backtracks on an explicit,
+heap-allocated stack, so no input can overflow the goroutine stack. Every
+match operation runs under an execution budget of steps and backtracking
+memory that grows linearly with the input: by default 1,000,000 steps plus
+100 per input byte, and 256 MiB plus 32 bytes per input byte
+(`SetMaxSteps` sets a fixed step limit instead). Common patterns such as
+`^[a-z]+$`, `^(a)+$` or `^(?:a|b)+$` run in linear time and use a handful of
+steps per byte, so they complete at any input length; only super-linear
+(catastrophic) searches exhaust the budget.
 
 An operation that exceeds its budget has **no answer** — which is not the same
 as no match. The error-returning forms report it as `ErrStepLimit`:
@@ -193,15 +200,18 @@ if errors.Is(err, ecma262.ErrStepLimit) {
 **Errors.** `Compile` wraps failures as `parse error: …` or
 `compile error: …` and rejects `u`+`v` as `incompatible flags`. `flags.Parse`
 returns typed errors (`InvalidFlagError`, `DuplicateFlagError`,
-`IncompatibleFlagsError`). An exceeded step budget is `ErrStepLimit`
-(the same value as `vm.ErrStepLimit`), comparable with `errors.Is`.
+`IncompatibleFlagsError`). An exceeded execution budget is `ErrStepLimit`
+(the same value as `vm.ErrStepLimit`; the memory form wraps it), comparable
+with `errors.Is`.
 
 ## Architecture
 
 Pattern strings are parsed to an AST (`parser/`), compiled to bytecode
-(`compiler/`), and executed by a recursive backtracking VM (`vm/`) — the
-backtracking design from Russ Cox's regular-expression articles, with
-memoization of failed states and a step budget bounding worst-case cost.
+(`compiler/`), and executed by a backtracking VM (`vm/`) — the
+backtracking design from Russ Cox's regular-expression articles, run on an
+explicit stack, with memoization of failed states, a static analysis that
+keeps common patterns linear-time, and an execution budget bounding
+worst-case cost.
 Backtracking is what makes backreferences and lookarounds possible (RE2-based
 engines structurally cannot support them). Diagrams and internals — including
 how right-to-left lookbehind and the ReDoS bounds work — are in
