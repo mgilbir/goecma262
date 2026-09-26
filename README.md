@@ -171,23 +171,30 @@ the cursor directly.
 offsets into the Go string, not UTF-16 code-unit indices as in JavaScript.
 
 **ReDoS protection.** The backtracking VM enforces a step limit (default
-1,000,000; tune per instance with `SetMaxSteps`). When a match operation
-exceeds it, the boolean/string methods report **no match** — they cannot
-distinguish a limit hit from a genuine non-match. If you match untrusted
-patterns or inputs, use the error-returning variants:
+1,000,000; tune per instance with `SetMaxSteps`).
+
+An operation that exceeds its budget has **no answer** — which is not the same
+as no match. The error-returning forms report it as `ErrStepLimit`:
+the package-level `MatchString` and `Match`, and the methods ending in `Err`
+(`MatchStringErr`, `MatchErr`, `FindStringIndexErr`,
+`FindStringSubmatchIndexErr`, `FindAllStringSubmatchIndexErr`,
+`ReplaceAllStringErr`, `SplitErr`). The other methods have no error result:
+they report an exceeded budget as **no match**, and the iterating ones
+(`FindAll*`, `ReplaceAll*`, `Split`) stop at that point. If you match untrusted
+patterns or inputs, use the error-returning forms:
 
 ```go
 ok, err := re.MatchStringErr(input)
-if errors.Is(err, vm.ErrStepLimit) {
-    // pattern/input too expensive, not a non-match
+if errors.Is(err, ecma262.ErrStepLimit) {
+    // pattern/input too expensive: no answer, not a non-match
 }
 ```
 
 **Errors.** `Compile` wraps failures as `parse error: …` or
 `compile error: …` and rejects `u`+`v` as `incompatible flags`. `flags.Parse`
 returns typed errors (`InvalidFlagError`, `DuplicateFlagError`,
-`IncompatibleFlagsError`). Match-time step-limit errors are
-`vm.ErrStepLimit`, comparable with `errors.Is`.
+`IncompatibleFlagsError`). An exceeded step budget is `ErrStepLimit`
+(the same value as `vm.ErrStepLimit`), comparable with `errors.Is`.
 
 ## Architecture
 

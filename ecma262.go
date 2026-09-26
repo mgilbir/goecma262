@@ -7,6 +7,20 @@
 // With g or y, the instance carries a lastIndex cursor that match operations
 // read and advance (mirroring JavaScript semantics), so such instances must
 // not be shared between goroutines without synchronization. See SetLastIndex.
+//
+// # Execution budget
+//
+// Matching is a backtracking search, bounded per match operation by a step
+// budget as ReDoS protection (see SetMaxSteps). An operation that exceeds its
+// budget has no answer, which is distinct from "no match":
+//
+//   - The error-returning forms — the package-level MatchString and Match, and
+//     the methods whose names end in Err — return ErrStepLimit (test with
+//     errors.Is) and no result.
+//   - The other methods cannot return an error; they report an exceeded
+//     budget as no match, and iterating methods (FindAll*, ReplaceAll*, Split)
+//     stop at that point. Use the Err forms whenever the input or the pattern
+//     is untrusted.
 package ecma262
 
 import (
@@ -21,6 +35,12 @@ import (
 	"github.com/mgilbir/goecma262/parser"
 	"github.com/mgilbir/goecma262/vm"
 )
+
+// ErrStepLimit is returned (possibly wrapped; test with errors.Is) when a match
+// operation exceeds its execution budget. It is the same value as
+// vm.ErrStepLimit, which documents the budget. It never means "no match": the
+// input may or may not match, and the operation produced no result.
+var ErrStepLimit = vm.ErrStepLimit
 
 // Regexp is the representation of a compiled ECMA-262 regular expression.
 // Without the g or y flag it is safe for concurrent use by multiple
@@ -176,10 +196,12 @@ func (re *Regexp) MatchString(s string) bool {
 // A value of 0 uses the VM default limit (vm.DefaultMaxSteps).
 //
 // The step limit bounds backtracking as a ReDoS protection. When a match
-// operation exceeds it, the boolean/string methods (MatchString, FindString,
-// FindAllString, ReplaceAllString, ...) report it as "no match" — they cannot
-// distinguish a limit hit from a genuine non-match. Use MatchStringErr,
-// MatchErr or FindStringIndexErr to observe vm.ErrStepLimit instead.
+// operation exceeds it, the methods without an error result (MatchString,
+// FindString, FindAllString, ReplaceAllString, ...) report it as "no match" —
+// they cannot distinguish a limit hit from a genuine non-match. Use the Err
+// forms (MatchStringErr, FindStringSubmatchIndexErr,
+// FindAllStringSubmatchIndexErr, ReplaceAllStringErr, SplitErr, ...) to
+// observe ErrStepLimit instead.
 func (re *Regexp) SetMaxSteps(max int) {
 	if max < 0 {
 		max = 0
@@ -205,7 +227,7 @@ func (re *Regexp) LastIndex() int {
 }
 
 // MatchStringErr reports whether the string s contains any match of the regular expression.
-// If matching exceeds the VM step limit, it returns vm.ErrStepLimit.
+// If matching exceeds the execution budget, it returns ErrStepLimit.
 // Unlike MatchString, it always searches from the start of s: lastIndex is
 // neither consulted nor updated, even with the g or y flag.
 func (re *Regexp) MatchStringErr(s string) (bool, error) {
@@ -222,7 +244,7 @@ func (re *Regexp) Match(b []byte) bool {
 }
 
 // MatchErr reports whether the byte slice b contains any match of the regular expression.
-// If matching exceeds the VM step limit, it returns vm.ErrStepLimit.
+// If matching exceeds the execution budget, it returns ErrStepLimit.
 func (re *Regexp) MatchErr(b []byte) (bool, error) {
 	return re.MatchStringErr(string(b))
 }
@@ -288,7 +310,7 @@ func (re *Regexp) FindStringIndex(s string) []int {
 }
 
 // FindStringIndexErr returns the location of the leftmost match in s.
-// If matching exceeds the VM step limit, it returns vm.ErrStepLimit.
+// If matching exceeds the execution budget, it returns ErrStepLimit.
 func (re *Regexp) FindStringIndexErr(s string) ([]int, error) {
 	groups, err := re.doMatchWithError(s, 0)
 	if err != nil {
@@ -386,6 +408,18 @@ func (re *Regexp) FindSubmatchIndex(b []byte) []int {
 	return re.FindStringSubmatchIndex(string(b))
 }
 
+// FindStringSubmatchIndexErr is like FindStringSubmatchIndex, but if matching
+// exceeds the execution budget it returns ErrStepLimit instead of reporting
+// no match. Like FindStringSubmatchIndex it searches from the start of s,
+// ignoring lastIndex.
+func (re *Regexp) FindStringSubmatchIndexErr(s string) ([]int, error) {
+	groups, err := re.doMatchWithError(s, 0)
+	if err != nil || groups == nil {
+		return nil, err
+	}
+	return re.submatchIndex(groups), nil
+}
+
 // FindAllStringIndex returns a slice of all successive match locations of the
 // regular expression, each as a two-element {start, end} slice of byte offsets.
 // A return value of nil indicates no match.
@@ -428,6 +462,22 @@ func (re *Regexp) FindAllSubmatchIndex(b []byte, n int) [][]int {
 	return re.FindAllStringSubmatchIndex(string(b), n)
 }
 
+// FindAllStringSubmatchIndexErr is like FindAllStringSubmatchIndex, but if
+// matching exceeds the execution budget it returns ErrStepLimit and no matches,
+// rather than the matches found before the budget ran out. The budget applies
+// to each successive match search.
+func (re *Regexp) FindAllStringSubmatchIndexErr(s string, n int) ([][]int, error) {
+	matches, err := re.findAllMatchesErr(s, n)
+	if err != nil || len(matches) == 0 {
+		return nil, err
+	}
+	result := make([][]int, len(matches))
+	for i, g := range matches {
+		result[i] = re.submatchIndex(g)
+	}
+	return result, nil
+}
+
 // findAllMatches returns the capture-group slices of every successive match,
 // scanning left to right. It is the single source of truth for how the search
 // cursor advances, so every iterating method (FindAll*, ReplaceAll*, Split)
@@ -438,9 +488,19 @@ func (re *Regexp) FindAllSubmatchIndex(b []byte, n int) [][]int {
 // match the cursor advances to matchEnd, and for an empty match it advances one
 // further rune past matchEnd so the same zero-width position is not re-reported.
 // limit < 0 means unlimited; limit == 0 returns no matches.
+//
+// If a search exceeds the execution budget, iteration stops there and the
+// matches found so far are returned; findAllMatchesErr reports the error.
 func (re *Regexp) findAllMatches(s string, limit int) [][]int {
+	matches, _ := re.findAllMatchesErr(s, limit)
+	return matches
+}
+
+// findAllMatchesErr is findAllMatches, also returning the budget error that
+// stopped the iteration, if any (with the matches found before it).
+func (re *Regexp) findAllMatchesErr(s string, limit int) ([][]int, error) {
 	if limit == 0 {
-		return nil
+		return nil, nil
 	}
 	var matches [][]int
 	searchStart := 0
@@ -448,7 +508,10 @@ func (re *Regexp) findAllMatches(s string, limit int) [][]int {
 		if searchStart > len(s) {
 			break
 		}
-		groups := re.doMatch(s, searchStart)
+		groups, err := re.doMatchWithError(s, searchStart)
+		if err != nil {
+			return matches, err
+		}
 		if groups == nil || len(groups) < 2 {
 			break
 		}
@@ -466,7 +529,7 @@ func (re *Regexp) findAllMatches(s string, limit int) [][]int {
 			searchStart = matchEnd + size
 		}
 	}
-	return matches
+	return matches, nil
 }
 
 // FindAllString returns a slice of all successive matches of the regular expression.
@@ -536,7 +599,27 @@ func (re *Regexp) ReplaceAllString(src, repl string) string {
 		limit = 1
 	}
 	matches := re.findAllMatches(src, limit)
+	return re.replaceMatches(src, repl, matches)
+}
 
+// ReplaceAllStringErr is like ReplaceAllString, but if matching exceeds the
+// execution budget it returns ErrStepLimit and an empty string, rather than a
+// copy of src in which only the matches found before the budget ran out were
+// replaced.
+func (re *Regexp) ReplaceAllStringErr(src, repl string) (string, error) {
+	limit := -1
+	if !re.global {
+		limit = 1
+	}
+	matches, err := re.findAllMatchesErr(src, limit)
+	if err != nil {
+		return "", err
+	}
+	return re.replaceMatches(src, repl, matches), nil
+}
+
+// replaceMatches expands repl for each match and splices the results into src.
+func (re *Regexp) replaceMatches(src, repl string, matches [][]int) string {
 	var result strings.Builder
 	lastEnd := 0
 	for _, groups := range matches {
@@ -717,12 +800,29 @@ func (re *Regexp) Split(s string, n int) []string {
 	if n == 0 {
 		return nil
 	}
+	return re.splitMatches(s, n, re.findAllMatches(s, -1))
+}
 
+// SplitErr is like Split, but if matching exceeds the execution budget it
+// returns ErrStepLimit and no substrings, rather than splitting only at the
+// matches found before the budget ran out.
+func (re *Regexp) SplitErr(s string, n int) ([]string, error) {
+	if n == 0 {
+		return nil, nil
+	}
+	matches, err := re.findAllMatchesErr(s, -1)
+	if err != nil {
+		return nil, err
+	}
+	return re.splitMatches(s, n, matches), nil
+}
+
+// splitMatches slices s around matches, returning at most n substrings (n < 0
+// means all).
+func (re *Regexp) splitMatches(s string, n int, matches [][]int) []string {
 	if n < 0 {
 		n = len(s) + 1
 	}
-
-	matches := re.findAllMatches(s, -1)
 
 	var result []string
 	lastEnd := 0
@@ -764,61 +864,21 @@ func (re *Regexp) String() string {
 	return re.expr
 }
 
-// doMatch performs the actual matching and returns the capture groups
+// doMatch performs the actual matching and returns the capture groups. An
+// exceeded execution budget is reported as no match; see doMatchWithError.
 func (re *Regexp) doMatch(s string, startPos int) []int {
+	groups, _ := re.doMatchWithError(s, startPos)
+	return groups
+}
+
+// doMatchWithError returns the capture groups of the leftmost match at or
+// after startPos (exactly at startPos with the sticky flag), or nil if there is
+// none. If the search exceeds its execution budget it returns ErrStepLimit
+// (possibly wrapped) and no groups.
+func (re *Regexp) doMatchWithError(s string, startPos int) ([]int, error) {
 	// Clamp the start position. A negative lastIndex is treated as 0; a
 	// start position beyond the input yields no match (ECMA-262 semantics),
 	// never a panic.
-	if startPos < 0 {
-		startPos = 0
-	}
-	if startPos > len(s) {
-		return nil
-	}
-
-	v := &vm.VM{
-		Code:       re.code,
-		NumGroups:  re.numGroups,
-		IgnoreCase: re.ignoreCase,
-		Multiline:  re.multiline,
-		DotAll:     re.dotAll,
-		Unicode:    re.unicode,
-		MaxSteps:   re.maxSteps,
-	}
-
-	// Sticky flag: only attempt match at startPos (anchored)
-	if re.sticky {
-		matched, _, groups := v.MatchAt(s, startPos)
-		if v.Err != nil || !matched {
-			return nil
-		}
-		return groups
-	}
-
-	// Try different starting positions to find a match
-	for pos := startPos; pos <= len(s); {
-		matched, _, groups := v.MatchAt(s, pos)
-		if v.Err != nil {
-			return nil
-		}
-		if matched {
-			return groups
-		}
-
-		// Advance by one rune (or byte if at end)
-		if pos >= len(s) {
-			break
-		}
-		_, size := utf8.DecodeRuneInString(s[pos:])
-		pos += size
-	}
-
-	return nil
-}
-
-// doMatchWithError performs the actual matching and returns the capture groups.
-// If the VM exceeds its step limit, returns vm.ErrStepLimit.
-func (re *Regexp) doMatchWithError(s string, startPos int) ([]int, error) {
 	if startPos < 0 {
 		startPos = 0
 	}
@@ -848,6 +908,7 @@ func (re *Regexp) doMatchWithError(s string, startPos int) ([]int, error) {
 		return groups, nil
 	}
 
+	// Try successive start positions; they share one budget.
 	for pos := startPos; pos <= len(s); {
 		matched, _, groups := v.MatchAt(s, pos)
 		if v.Err != nil {
@@ -868,24 +929,31 @@ func (re *Regexp) doMatchWithError(s string, startPos int) ([]int, error) {
 
 // Convenience functions
 
-// Match reports whether the byte slice b contains any match of the regular expression pattern
-// with the given flags
+// Match reports whether the byte slice b contains any match of the regular
+// expression pattern with the given flags. err is non-nil if the pattern does
+// not compile, or if matching exceeds the execution budget; in the latter case
+// errors.Is(err, ErrStepLimit) holds and matched carries no information.
 func Match(pattern string, f flags.Flags, b []byte) (matched bool, err error) {
-	re, err := Compile(pattern, f)
-	if err != nil {
-		return false, err
-	}
-	return re.Match(b), nil
+	return MatchString(pattern, f, string(b))
 }
 
-// MatchString reports whether the string s contains any match of the regular expression pattern
-// with the given flags
+// MatchString reports whether the string s contains any match of the regular
+// expression pattern with the given flags. err is non-nil if the pattern does
+// not compile, or if matching exceeds the execution budget; in the latter case
+// errors.Is(err, ErrStepLimit) holds and matched carries no information.
+//
+// With the g or y flag, matching starts at lastIndex 0 of the freshly compiled
+// Regexp, as for Regexp.MatchString.
 func MatchString(pattern string, f flags.Flags, s string) (matched bool, err error) {
 	re, err := Compile(pattern, f)
 	if err != nil {
 		return false, err
 	}
-	return re.MatchString(s), nil
+	groups, err := re.doMatchWithError(s, 0)
+	if err != nil {
+		return false, err
+	}
+	return groups != nil, nil
 }
 
 // Helper functions

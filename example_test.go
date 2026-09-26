@@ -3,6 +3,7 @@ package ecma262_test
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/mgilbir/goecma262"
 	"github.com/mgilbir/goecma262/flags"
@@ -142,6 +143,15 @@ func ExampleRegexp_MatchStringErr() {
 	re.SetMaxSteps(100)
 	_, err := re.MatchStringErr("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab")
 	fmt.Println(errors.Is(err, vm.ErrStepLimit))
+	// Output:
+	// true
+}
+
+func ExampleMatchString() {
+	// A catastrophic search has no answer. The error is distinct from a
+	// non-match; never read matched without checking it.
+	_, err := ecma262.MatchString(`^(a*)(a*)(a*)\1\2\3$`, flags.Flags(0), strings.Repeat("a", 300))
+	fmt.Println(errors.Is(err, ecma262.ErrStepLimit))
 	// Output:
 	// true
 }
