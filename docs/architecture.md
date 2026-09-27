@@ -89,9 +89,12 @@ Details worth knowing before touching the VM:
   patterns like `(a+)+$` — takes the split's exit instead of re-exploring
   branch A. See "Bounded execution" below for how states are keyed.
 - **Iteration helpers share one cursor implementation.** `findAllMatches`
-  in the root package is the single source of truth for how `FindAll*`,
-  `ReplaceAll*`, and `Split` advance past matches (including the
-  zero-width-match rune-step rule), so their behaviors cannot drift apart.
+  in the root package is the single source of truth for how `FindAll*` and
+  `ReplaceAll*` advance past matches (including the zero-width-match
+  rune-step rule), so their behaviors cannot drift apart. `Split` is the
+  exception: it follows ECMA-262's `@@split` position loop instead, where an
+  empty match never splits at the start of the input, at its end, or where
+  the previous match ended.
 
 ## Lookarounds and right-to-left lookbehind
 

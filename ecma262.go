@@ -806,48 +806,88 @@ func (re *Regexp) expandRepl(repl, src string, groups []int) string {
 	return result.String()
 }
 
-// Split slices s into substrings separated by the expression and returns
-// a slice of the substrings between those expression matches
+// Split slices s into substrings separated by the expression and returns a
+// slice of the substrings between those expression matches. It splits where
+// JavaScript's String.prototype.split does: an empty match splits between
+// characters but never at the start of s, at its end, or where the previous
+// match ended, so an expression that can match the empty string splits s into
+// characters, and splitting "" gives no substrings when the expression matches
+// it. Unlike JavaScript, n follows Go's regexp: n > 0 returns at most n
+// substrings, the last being the unsplit remainder; n == 0 returns nil; n < 0
+// returns all of them. Capture groups are not interleaved into the result.
+//
+// If matching exceeds the execution budget, Split stops splitting there and
+// returns the rest of s as the last substring; SplitErr reports it instead.
 func (re *Regexp) Split(s string, n int) []string {
-	if n == 0 {
-		return nil
-	}
-	return re.splitMatches(s, n, re.findAllMatches(s, -1))
+	parts, _ := re.split(s, n)
+	return parts
 }
 
 // SplitErr is like Split, but if matching exceeds the execution budget it
 // returns ErrStepLimit and no substrings, rather than splitting only at the
 // matches found before the budget ran out.
 func (re *Regexp) SplitErr(s string, n int) ([]string, error) {
-	if n == 0 {
-		return nil, nil
-	}
-	matches, err := re.findAllMatchesErr(s, -1)
+	parts, err := re.split(s, n)
 	if err != nil {
 		return nil, err
 	}
-	return re.splitMatches(s, n, matches), nil
+	return parts, nil
 }
 
-// splitMatches slices s around matches, returning at most n substrings (n < 0
-// means all).
-func (re *Regexp) splitMatches(s string, n int, matches [][]int) []string {
-	if n < 0 {
-		n = len(s) + 1
+// split implements ECMA-262's RegExp.prototype[@@split] position loop, which
+// tries the separator at each position q in turn: a match at q that ends at p,
+// where the current substring began, is empty and does not split, and no match
+// is tried at the end of s. On an exceeded budget it returns the substrings so
+// far, with the rest of s as the last, and the error.
+func (re *Regexp) split(s string, n int) ([]string, error) {
+	if n == 0 {
+		return nil, nil
 	}
-
-	var result []string
-	lastEnd := 0
-	for _, groups := range matches {
-		if len(result) >= n-1 {
+	if len(s) == 0 {
+		groups, err := re.doMatchWithError(s, 0)
+		if err != nil {
+			return []string{s}, err
+		}
+		if groups != nil {
+			return []string{}, nil
+		}
+		return []string{s}, nil
+	}
+	var parts []string
+	p, q := 0, 0
+	for q < len(s) && (n < 0 || len(parts) < n-1) {
+		groups, err := re.doMatchWithError(s, q)
+		if err != nil {
+			return append(parts, s[p:]), err
+		}
+		if groups == nil {
+			if !re.sticky {
+				break
+			}
+			// The separator is matched at each position in turn; a sticky
+			// search tries only q, so move on as JavaScript does.
+			q = nextRune(s, q)
+			continue
+		}
+		start, end := groups[0], groups[1]
+		if start >= len(s) {
 			break
 		}
-		result = append(result, s[lastEnd:groups[0]])
-		lastEnd = groups[1]
+		if end == p {
+			// Empty, where the substring began (so start == q == p).
+			q = nextRune(s, q)
+			continue
+		}
+		parts = append(parts, s[p:start])
+		p, q = end, end
 	}
+	return append(parts, s[p:]), nil
+}
 
-	result = append(result, s[lastEnd:])
-	return result
+// nextRune returns the index of the rune after the one at i.
+func nextRune(s string, i int) int {
+	_, size := utf8.DecodeRuneInString(s[i:])
+	return i + size
 }
 
 // NumSubexp returns the number of parenthesized subexpressions in this Regexp
