@@ -93,6 +93,27 @@ regressions where a previously compiling pattern stops compiling:
 TEST262_STRICT=1 go test ./tests/ -run TestTest262Generated
 ```
 
+## Differential testing against node
+
+Test262 checks the cases its authors thought of. `tools/difftest` finds the
+rest by asking a real JavaScript engine: it generates patterns, flags and
+inputs, runs each case through `node` and through this engine, and reports
+every disagreement — a pattern one side rejects, a different match, a
+different capture, replacement or split. Node is the only requirement.
+
+```bash
+go run ./tools/difftest -n 200000 -seed 1          # random cases
+node tools/difftest/gen-corpus.mjs > /tmp/corpus.txt
+go run ./tools/difftest -cases /tmp/corpus.txt     # the structured corpus
+```
+
+`-nov`, `-nomod` and `-only xars` narrow a run to one area while working on
+it. The oracle (`fuzz-oracle.mjs`) and the corpus (`corpus.mjs`) are shared
+with [ktecma262](https://github.com/mgilbir/ktecma262), including the
+detectors for known V8 defects, which are skipped and counted rather than
+reported. A failure prints the exact pattern, flags and input, so it can be
+turned into a regression test directly.
+
 ## Refreshing the README benchmark numbers
 
 The README quotes `go test ./tests/ -bench . -benchmem` output. If your
