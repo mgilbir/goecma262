@@ -7,12 +7,11 @@ import (
 	"github.com/mgilbir/goecma262/flags"
 )
 
-// The Test262 corpus is extracted by running each test file in a JS engine and
-// recording the assertions that executed. A pattern that is a SyntaxError
-// throws before any assertion, so it is never captured — the generated corpus
-// contains no "must not compile" cases. This hand-maintained table fills that
-// gap: every pattern here must fail to compile under the given flags. Add a case
-// whenever a fix makes the engine correctly reject something it used to accept.
+// Test262's own "must not compile" cases are in
+// test262_syntax_generated_test.go. This hand-maintained table adds cases
+// Test262 does not have, or that were reported against this engine: every
+// pattern here must fail to compile under the given flags. Add a case whenever
+// a fix makes the engine correctly reject something it used to accept.
 func TestNegativeCorpus_SyntaxErrors(t *testing.T) {
 	cases := []struct {
 		name    string
