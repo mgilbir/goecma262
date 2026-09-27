@@ -1212,182 +1212,144 @@ func resolveUnicodePropertyCached(prop string) (func(rune) bool, bool) {
 	return fn, ok
 }
 
-// resolveUnicodeProperty maps a property expression to a rune predicate. It
-// accepts "Name=Value" (general category or script) and lone names (a general
-// category value or a binary property). It returns ok=false for anything it
-// does not recognize.
+// resolveUnicodeProperty maps a property expression to a rune predicate: a
+// lone General_Category value or binary property, or Name=Value for
+// General_Category, Script or Script_Extensions. Names and values must be
+// spelled exactly as ECMA-262 and PropertyValueAliases.txt give them, so
+// \p{Lu} and \p{Uppercase_Letter} are valid and \p{uppercase_letter} is not.
+// It returns ok=false for anything else.
 func resolveUnicodeProperty(prop string) (func(rune) bool, bool) {
-	if eq := strings.IndexByte(prop, '='); eq >= 0 {
-		name := normalizeUnicodeProperty(prop[:eq])
-		value := prop[eq+1:]
+	if name, value, ok := strings.Cut(prop, "="); ok {
 		switch name {
-		case "gc", "generalcategory":
-			if t := categoryTable(value); t != nil {
-				return func(r rune) bool { return unicode.Is(t, r) }, true
-			}
-		case "sc", "script", "scx", "scriptextensions":
-			if t := scriptTable(value); t != nil {
-				return func(r rune) bool { return unicode.Is(t, r) }, true
-			}
+		case "General_Category", "gc":
+			return generalCategory(value)
+		case "Script", "sc", "Script_Extensions", "scx":
+			// Script_Extensions is approximated by Script: Go's unicode
+			// package has no Script_Extensions data.
+			return script(value)
 		}
 		return nil, false
 	}
-	if t := categoryTable(prop); t != nil {
-		return func(r rune) bool { return unicode.Is(t, r) }, true
-	}
-	return binaryProperty(prop)
-}
-
-// categoryTable resolves a general-category name or alias (short or long, in any
-// case, with underscores/hyphens/spaces ignored) to its unicode.RangeTable.
-func categoryTable(name string) *unicode.RangeTable {
-	short, ok := categoryAliases[normalizeUnicodeProperty(name)]
-	if !ok {
-		return nil
-	}
-	return unicode.Categories[short]
-}
-
-// scriptTable resolves a script name (ignoring case and separators) to its table.
-func scriptTable(name string) *unicode.RangeTable {
-	norm := normalizeUnicodeProperty(name)
-	for scriptName, table := range unicode.Scripts {
-		if normalizeUnicodeProperty(scriptName) == norm {
-			return table
-		}
-	}
-	return nil
-}
-
-// binaryProperty resolves a lone \p{Name} to a predicate, covering the ECMA-262
-// binary properties: computed derivations, aliases onto Go's unicode.Properties
-// tables, and the general/canonical names directly.
-func binaryProperty(prop string) (func(rune) bool, bool) {
-	norm := normalizeUnicodeProperty(prop)
-	if fn, ok := binaryPropertyPredicates[norm]; ok {
+	if fn, ok := generalCategory(prop); ok {
 		return fn, true
 	}
-	if canonical, ok := binaryPropertyAliases[norm]; ok {
-		if t := unicode.Properties[canonical]; t != nil {
-			return func(r rune) bool { return unicode.Is(t, r) }, true
-		}
-	}
-	// Canonical long names directly (e.g. \p{White_Space}, \p{Dash}).
-	for name, table := range unicode.Properties {
-		if normalizeUnicodeProperty(name) == norm {
-			t := table
-			return func(r rune) bool { return unicode.Is(t, r) }, true
-		}
-	}
-	return nil, false
+	fn, ok := binaryProperties[prop]
+	return fn, ok
 }
 
-// binaryPropertyPredicates holds the ECMA-262 binary properties that are
-// computed from Go's categories/case mappings rather than a single table.
-// Some (Case_Ignorable, Default_Ignorable_Code_Point, XID_*) are close
-// approximations of the full Unicode definitions.
-var binaryPropertyPredicates = map[string]func(rune) bool{
-	"ascii": func(r rune) bool { return r <= 0x7F },
-	"any":   func(r rune) bool { return true },
-	"assigned": func(r rune) bool {
-		return r != unicode.ReplacementChar && (unicode.IsGraphic(r) || unicode.IsControl(r) || unicode.Is(unicode.Cf, r))
-	},
-	// Emoji properties: Go's unicode package has no tables for these, so
-	// they come from tools/genemoji (emoji_props.go).
-	"emoji":                     emojiProperty("Emoji"),
-	"emojicomponent":            emojiProperty("Emoji_Component"),
-	"ecomp":                     emojiProperty("Emoji_Component"),
-	"emojimodifier":             emojiProperty("Emoji_Modifier"),
-	"emod":                      emojiProperty("Emoji_Modifier"),
-	"emojimodifierbase":         emojiProperty("Emoji_Modifier_Base"),
-	"ebase":                     emojiProperty("Emoji_Modifier_Base"),
-	"emojipresentation":         emojiProperty("Emoji_Presentation"),
-	"epres":                     emojiProperty("Emoji_Presentation"),
-	"extendedpictographic":      emojiProperty("Extended_Pictographic"),
-	"extpict":                   emojiProperty("Extended_Pictographic"),
-	"alphabetic":                isAlphabetic,
-	"alpha":                     isAlphabetic,
-	"lowercase":                 func(r rune) bool { return unicode.IsLower(r) || unicode.Is(unicode.Other_Lowercase, r) },
-	"lower":                     func(r rune) bool { return unicode.IsLower(r) || unicode.Is(unicode.Other_Lowercase, r) },
-	"uppercase":                 func(r rune) bool { return unicode.IsUpper(r) || unicode.Is(unicode.Other_Uppercase, r) },
-	"upper":                     func(r rune) bool { return unicode.IsUpper(r) || unicode.Is(unicode.Other_Uppercase, r) },
-	"cased":                     isCased,
-	"caseignorable":             isCaseIgnorable,
-	"ci":                        isCaseIgnorable,
-	"whitespace":                unicode.IsSpace,
-	"space":                     unicode.IsSpace,
-	"wspace":                    unicode.IsSpace,
-	"math":                      func(r rune) bool { return unicode.Is(unicode.Sm, r) || unicode.Is(unicode.Other_Math, r) },
-	"idstart":                   isIDStart,
-	"ids":                       isIDStart,
-	"idcontinue":                isIDContinue,
-	"idc":                       isIDContinue,
-	"xidstart":                  isIDStart,    // NFKC-closure approximation
-	"xids":                      isIDStart,    // NFKC-closure approximation
-	"xidcontinue":               isIDContinue, // NFKC-closure approximation
-	"xidc":                      isIDContinue, // NFKC-closure approximation
-	"graphemeextend":            isGraphemeExtend,
-	"grext":                     isGraphemeExtend,
-	"changeswhenuppercased":     func(r rune) bool { return unicode.ToUpper(r) != r },
-	"cwu":                       func(r rune) bool { return unicode.ToUpper(r) != r },
-	"changeswhenlowercased":     func(r rune) bool { return unicode.ToLower(r) != r },
-	"cwl":                       func(r rune) bool { return unicode.ToLower(r) != r },
-	"changeswhentitlecased":     func(r rune) bool { return unicode.ToTitle(r) != r },
-	"cwt":                       func(r rune) bool { return unicode.ToTitle(r) != r },
-	"defaultignorablecodepoint": isDefaultIgnorable,
-	"di":                        isDefaultIgnorable,
-	"digit":                     func(r rune) bool { return unicode.Is(unicode.Nd, r) }, // non-standard alias for Nd
+func generalCategory(value string) (func(rune) bool, bool) {
+	short, ok := generalCategoryNames[value]
+	if !ok {
+		return nil, false
+	}
+	t := unicode.Categories[short]
+	return func(r rune) bool { return unicode.Is(t, r) }, true
 }
 
-// binaryPropertyAliases maps ECMA-262 binary-property aliases to the canonical
-// names keying Go's unicode.Properties table.
-var binaryPropertyAliases = map[string]string{
-	"asciihexdigit":         "ASCII_Hex_Digit",
-	"ahex":                  "ASCII_Hex_Digit",
-	"bidicontrol":           "Bidi_Control",
-	"bidic":                 "Bidi_Control",
-	"dash":                  "Dash",
-	"deprecated":            "Deprecated",
-	"dep":                   "Deprecated",
-	"diacritic":             "Diacritic",
-	"dia":                   "Diacritic",
-	"extender":              "Extender",
-	"ext":                   "Extender",
-	"hexdigit":              "Hex_Digit",
-	"hex":                   "Hex_Digit",
-	"hyphen":                "Hyphen",
-	"idsbinaryoperator":     "IDS_Binary_Operator",
-	"idsb":                  "IDS_Binary_Operator",
-	"idstrinaryoperator":    "IDS_Trinary_Operator",
-	"idst":                  "IDS_Trinary_Operator",
-	"ideographic":           "Ideographic",
-	"ideo":                  "Ideographic",
-	"joincontrol":           "Join_Control",
-	"joinc":                 "Join_Control",
-	"logicalorderexception": "Logical_Order_Exception",
-	"loe":                   "Logical_Order_Exception",
-	"noncharactercodepoint": "Noncharacter_Code_Point",
-	"nchar":                 "Noncharacter_Code_Point",
-	"patternsyntax":         "Pattern_Syntax",
-	"patsyn":                "Pattern_Syntax",
-	"patternwhitespace":     "Pattern_White_Space",
-	"patws":                 "Pattern_White_Space",
-	"quotationmark":         "Quotation_Mark",
-	"qmark":                 "Quotation_Mark",
-	"radical":               "Radical",
-	"regionalindicator":     "Regional_Indicator",
-	"ri":                    "Regional_Indicator",
-	"sentenceterminal":      "Sentence_Terminal",
-	"sterm":                 "Sentence_Terminal",
-	"softdotted":            "Soft_Dotted",
-	"sd":                    "Soft_Dotted",
-	"terminalpunctuation":   "Terminal_Punctuation",
-	"term":                  "Terminal_Punctuation",
-	"unifiedideograph":      "Unified_Ideograph",
-	"uideo":                 "Unified_Ideograph",
-	"variationselector":     "Variation_Selector",
-	"vs":                    "Variation_Selector",
+func script(value string) (func(rune) bool, bool) {
+	long, ok := scriptNames[value]
+	if !ok {
+		return nil, false
+	}
+	if long == "Unknown" {
+		return isUnknownScript, true
+	}
+	t := unicode.Scripts[long]
+	return func(r rune) bool { return unicode.Is(t, r) }, true
 }
+
+// anyScript holds the code points of every script Go has a table for, which
+// is every script but Unknown.
+var anyScript = sync.OnceValue(func() []RuneRange {
+	var rs []RuneRange
+	for _, t := range unicode.Scripts {
+		for _, r := range t.R16 {
+			for c := rune(r.Lo); c <= rune(r.Hi); c += rune(r.Stride) {
+				rs = append(rs, RuneRange{c, c})
+			}
+		}
+		for _, r := range t.R32 {
+			for c := rune(r.Lo); c <= rune(r.Hi); c += rune(r.Stride) {
+				rs = append(rs, RuneRange{c, c})
+			}
+		}
+	}
+	return NewCharSetRanges(rs).Ranges
+})
+
+// isUnknownScript is Script=Unknown (Zzzz): a code point in no other script.
+func isUnknownScript(r rune) bool { return !inRanges(anyScript(), r) }
+
+// binaryProperties maps each spelling of each binary property in ECMA-262's
+// table of binary Unicode property aliases to its predicate. Names are exact.
+// Bidi_Mirrored, Changes_When_Casefolded, Changes_When_Casemapped,
+// Changes_When_NFKC_Casefolded and Grapheme_Base are missing: Go's unicode
+// package has no data for them. Some computed ones (Case_Ignorable,
+// Default_Ignorable_Code_Point, XID_*) are close approximations.
+var binaryProperties = func() map[string]func(rune) bool {
+	m := map[string]func(rune) bool{}
+	add := func(fn func(rune) bool, names ...string) {
+		for _, n := range names {
+			m[n] = fn
+		}
+	}
+	table := func(name string) func(rune) bool {
+		t := unicode.Properties[name]
+		if t == nil {
+			panic("vm: no unicode.Properties table " + name)
+		}
+		return func(r rune) bool { return unicode.Is(t, r) }
+	}
+	add(func(r rune) bool { return r <= 0x7F }, "ASCII")
+	add(func(r rune) bool { return true }, "Any")
+	add(func(r rune) bool { return !unicode.Is(unicode.Categories["Cn"], r) }, "Assigned")
+	add(table("ASCII_Hex_Digit"), "ASCII_Hex_Digit", "AHex")
+	add(isAlphabetic, "Alphabetic", "Alpha")
+	add(table("Bidi_Control"), "Bidi_Control", "Bidi_C")
+	add(isCaseIgnorable, "Case_Ignorable", "CI")
+	add(isCased, "Cased")
+	add(func(r rune) bool { return unicode.ToLower(r) != r }, "Changes_When_Lowercased", "CWL")
+	add(func(r rune) bool { return unicode.ToTitle(r) != r }, "Changes_When_Titlecased", "CWT")
+	add(func(r rune) bool { return unicode.ToUpper(r) != r }, "Changes_When_Uppercased", "CWU")
+	add(table("Dash"), "Dash")
+	add(isDefaultIgnorable, "Default_Ignorable_Code_Point", "DI")
+	add(table("Deprecated"), "Deprecated", "Dep")
+	add(table("Diacritic"), "Diacritic", "Dia")
+	add(emojiProperty("Emoji"), "Emoji")
+	add(emojiProperty("Emoji_Component"), "Emoji_Component", "EComp")
+	add(emojiProperty("Emoji_Modifier"), "Emoji_Modifier", "EMod")
+	add(emojiProperty("Emoji_Modifier_Base"), "Emoji_Modifier_Base", "EBase")
+	add(emojiProperty("Emoji_Presentation"), "Emoji_Presentation", "EPres")
+	add(emojiProperty("Extended_Pictographic"), "Extended_Pictographic", "ExtPict")
+	add(table("Extender"), "Extender", "Ext")
+	add(isGraphemeExtend, "Grapheme_Extend", "Gr_Ext")
+	add(table("Hex_Digit"), "Hex_Digit", "Hex")
+	add(table("IDS_Binary_Operator"), "IDS_Binary_Operator", "IDSB")
+	add(table("IDS_Trinary_Operator"), "IDS_Trinary_Operator", "IDST")
+	add(isIDContinue, "ID_Continue", "IDC")
+	add(isIDStart, "ID_Start", "IDS")
+	add(table("Ideographic"), "Ideographic", "Ideo")
+	add(table("Join_Control"), "Join_Control", "Join_C")
+	add(table("Logical_Order_Exception"), "Logical_Order_Exception", "LOE")
+	add(func(r rune) bool { return unicode.IsLower(r) || unicode.Is(unicode.Other_Lowercase, r) }, "Lowercase", "Lower")
+	add(func(r rune) bool { return unicode.Is(unicode.Sm, r) || unicode.Is(unicode.Other_Math, r) }, "Math")
+	add(table("Noncharacter_Code_Point"), "Noncharacter_Code_Point", "NChar")
+	add(table("Pattern_Syntax"), "Pattern_Syntax", "Pat_Syn")
+	add(table("Pattern_White_Space"), "Pattern_White_Space", "Pat_WS")
+	add(table("Quotation_Mark"), "Quotation_Mark", "QMark")
+	add(table("Radical"), "Radical")
+	add(table("Regional_Indicator"), "Regional_Indicator", "RI")
+	add(table("Sentence_Terminal"), "Sentence_Terminal", "STerm")
+	add(table("Soft_Dotted"), "Soft_Dotted", "SD")
+	add(table("Terminal_Punctuation"), "Terminal_Punctuation", "Term")
+	add(table("Unified_Ideograph"), "Unified_Ideograph", "UIdeo")
+	add(func(r rune) bool { return unicode.IsUpper(r) || unicode.Is(unicode.Other_Uppercase, r) }, "Uppercase", "Upper")
+	add(table("Variation_Selector"), "Variation_Selector", "VS")
+	add(table("White_Space"), "White_Space", "space", "WSpace")
+	add(isIDContinue, "XID_Continue", "XIDC") // NFKC-closure approximation
+	add(isIDStart, "XID_Start", "XIDS")       // NFKC-closure approximation
+	return m
+}()
 
 func isAlphabetic(r rune) bool {
 	return unicode.IsLetter(r) || unicode.Is(unicode.Nl, r) || unicode.Is(unicode.Other_Alphabetic, r)
@@ -1422,54 +1384,4 @@ func isDefaultIgnorable(r rune) bool {
 	// Approximation of Default_Ignorable_Code_Point.
 	return unicode.Is(unicode.Other_Default_Ignorable_Code_Point, r) ||
 		unicode.Is(unicode.Cf, r) || unicode.Is(unicode.Variation_Selector, r)
-}
-
-func normalizeUnicodeProperty(prop string) string {
-	prop = strings.TrimSpace(prop)
-	prop = strings.ReplaceAll(prop, "_", "")
-	prop = strings.ReplaceAll(prop, "-", "")
-	prop = strings.ReplaceAll(prop, " ", "")
-	return strings.ToLower(prop)
-}
-
-// categoryAliases maps normalized general-category names (short codes and long
-// names/aliases) to the short code keying unicode.Categories.
-var categoryAliases = map[string]string{
-	"l": "L", "letter": "L",
-	"lu": "Lu", "uppercaseletter": "Lu",
-	"ll": "Ll", "lowercaseletter": "Ll",
-	"lt": "Lt", "titlecaseletter": "Lt",
-	"lm": "Lm", "modifierletter": "Lm",
-	"lo": "Lo", "otherletter": "Lo",
-	"lc": "L", "casedletter": "L",
-	"m": "M", "mark": "M", "combiningmark": "M",
-	"mn": "Mn", "nonspacingmark": "Mn",
-	"mc": "Mc", "spacingcombiningmark": "Mc", "spacingmark": "Mc",
-	"me": "Me", "enclosingmark": "Me",
-	"n": "N", "number": "N",
-	"nd": "Nd", "decimalnumber": "Nd",
-	"nl": "Nl", "letternumber": "Nl",
-	"no": "No", "othernumber": "No",
-	"p": "P", "punctuation": "P",
-	"pc": "Pc", "connectorpunctuation": "Pc",
-	"pd": "Pd", "dashpunctuation": "Pd",
-	"ps": "Ps", "openpunctuation": "Ps",
-	"pe": "Pe", "closepunctuation": "Pe",
-	"pi": "Pi", "initialpunctuation": "Pi",
-	"pf": "Pf", "finalpunctuation": "Pf",
-	"po": "Po", "otherpunctuation": "Po",
-	"s": "S", "symbol": "S",
-	"sm": "Sm", "mathsymbol": "Sm",
-	"sc": "Sc", "currencysymbol": "Sc",
-	"sk": "Sk", "modifiersymbol": "Sk",
-	"so": "So", "othersymbol": "So",
-	"z": "Z", "separator": "Z",
-	"zs": "Zs", "spaceseparator": "Zs",
-	"zl": "Zl", "lineseparator": "Zl",
-	"zp": "Zp", "paragraphseparator": "Zp",
-	"c": "C", "other": "C",
-	"cc": "Cc", "control": "Cc", "cntrl": "Cc",
-	"cf": "Cf", "format": "Cf",
-	"cs": "Cs", "surrogate": "Cs",
-	"co": "Co", "privateuse": "Co",
 }

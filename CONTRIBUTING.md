@@ -140,6 +140,15 @@ go run ./tools/genemoji -seq emoji-sequences.txt -zwj emoji-zwj-sequences.txt -d
 The generator refuses files whose declared version does not match, and
 `TestEmojiDataVersion` fails once `unicode.Version` moves past the data.
 
+The spellings ECMA-262 accepts for general categories and scripts in
+`\p{...}` are generated the same way, into `vm/property_names.go`, and
+`TestPropertyNamesVersion` checks their version:
+
+```bash
+curl -fsSO https://www.unicode.org/Public/$V/ucd/PropertyValueAliases.txt
+go run ./tools/genpropnames -in PropertyValueAliases.txt
+```
+
 ## Refreshing the README benchmark numbers
 
 The README quotes `go test ./tests/ -bench . -benchmem` output. If your

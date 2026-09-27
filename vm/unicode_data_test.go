@@ -24,3 +24,10 @@ func TestEmojiPropertyRangesSorted(t *testing.T) {
 		}
 	}
 }
+
+// The property names must come from the Unicode version of Go's tables.
+func TestPropertyNamesVersion(t *testing.T) {
+	if propertyNamesVersion != unicode.Version {
+		t.Errorf("property names are Unicode %s but unicode.Version is %s: regenerate with tools/genpropnames", propertyNamesVersion, unicode.Version)
+	}
+}
