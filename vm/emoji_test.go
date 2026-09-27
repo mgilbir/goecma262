@@ -1,0 +1,26 @@
+package vm
+
+import (
+	"strings"
+	"testing"
+	"unicode"
+)
+
+// The generated emoji data must describe the same Unicode as Go's character
+// tables, which every other property comes from.
+func TestEmojiDataVersion(t *testing.T) {
+	if !strings.HasPrefix(unicode.Version, emojiVersion+".") {
+		t.Errorf("emoji data is Emoji %s but unicode.Version is %s: regenerate with tools/genemoji", emojiVersion, unicode.Version)
+	}
+}
+
+// inRanges binary-searches, so each table must be sorted and disjoint.
+func TestEmojiPropertyRangesSorted(t *testing.T) {
+	for name, rs := range emojiProperties {
+		for i, r := range rs {
+			if r.Start > r.End || i > 0 && r.Start <= rs[i-1].End+1 {
+				t.Errorf("%s: range %d (%X-%X) not sorted, disjoint and non-adjacent", name, i, r.Start, r.End)
+			}
+		}
+	}
+}

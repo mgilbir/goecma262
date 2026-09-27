@@ -39,3 +39,12 @@ func PropertyOfStrings(name string) ([]string, bool) {
 	members, ok := propertiesOfStrings[name]
 	return members, ok
 }
+
+// emojiProperty returns the membership test for an emoji binary property.
+func emojiProperty(name string) func(rune) bool {
+	ranges, ok := emojiProperties[name]
+	if !ok {
+		panic("vm: no emoji property " + name)
+	}
+	return func(r rune) bool { return inRanges(ranges, r) }
+}

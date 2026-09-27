@@ -1292,6 +1292,19 @@ var binaryPropertyPredicates = map[string]func(rune) bool{
 	"assigned": func(r rune) bool {
 		return r != unicode.ReplacementChar && (unicode.IsGraphic(r) || unicode.IsControl(r) || unicode.Is(unicode.Cf, r))
 	},
+	// Emoji properties: Go's unicode package has no tables for these, so
+	// they come from tools/genemoji (emoji_props.go).
+	"emoji":                     emojiProperty("Emoji"),
+	"emojicomponent":            emojiProperty("Emoji_Component"),
+	"ecomp":                     emojiProperty("Emoji_Component"),
+	"emojimodifier":             emojiProperty("Emoji_Modifier"),
+	"emod":                      emojiProperty("Emoji_Modifier"),
+	"emojimodifierbase":         emojiProperty("Emoji_Modifier_Base"),
+	"ebase":                     emojiProperty("Emoji_Modifier_Base"),
+	"emojipresentation":         emojiProperty("Emoji_Presentation"),
+	"epres":                     emojiProperty("Emoji_Presentation"),
+	"extendedpictographic":      emojiProperty("Extended_Pictographic"),
+	"extpict":                   emojiProperty("Extended_Pictographic"),
 	"alphabetic":                isAlphabetic,
 	"alpha":                     isAlphabetic,
 	"lowercase":                 func(r rune) bool { return unicode.IsLower(r) || unicode.Is(unicode.Other_Lowercase, r) },

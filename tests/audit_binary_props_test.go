@@ -30,6 +30,22 @@ func TestAudit_BinaryProperties(t *testing.T) {
 		{`\p{Cased}`, "5", false},       // digit is not cased
 		{`\p{White_Space}`, "x", false}, // negative
 		{`\p{Ideographic}`, "中", true},  // canonical table
+		// Emoji properties, from tools/genemoji (expectations from node)
+		{`\p{Emoji}`, "#", true},
+		{`\p{Emoji}`, "\u00a9", true},
+		{`\p{Emoji}`, "a", false},
+		{`\p{Emoji}`, "\U0001f600", true},
+		{`\p{EPres}`, "\u00a9", false},
+		{`\p{Emoji_Presentation}`, "\U0001f600", true},
+		{`\p{EComp}`, "\u200d", true},
+		{`\p{Emoji_Component}`, "\U0001f1e6", true},
+		{`\p{EMod}`, "\U0001f3fb", true},
+		{`\p{Emoji_Modifier}`, "a", false},
+		{`\p{EBase}`, "\U0001f44b", true},
+		{`\p{Emoji_Modifier_Base}`, "\U0001f600", false},
+		{`\p{ExtPict}`, "\u00a9", true},
+		{`\p{Extended_Pictographic}`, "#", false},
+		{`\p{Extended_Pictographic}`, "\U0001fffd", true},
 	}
 	for _, tc := range cases {
 		re, err := ecma262.Compile(tc.prop, flags.Unicode)
@@ -53,10 +69,10 @@ func TestAudit_BinaryPropertiesNegationAndClass(t *testing.T) {
 	}
 }
 
-// Still-unsupported properties (e.g. Emoji, which Go has no table for) remain a
-// compile error rather than silently matching nothing.
+// Unknown properties remain a compile error rather than silently matching
+// nothing, and so do properties of strings outside the v flag.
 func TestAudit_UnsupportedPropertyStillErrors(t *testing.T) {
-	for _, p := range []string{`\p{Emoji}`, `\p{Bogus}`} {
+	for _, p := range []string{`\p{Bogus}`, `\p{RGI_Emoji}`, `\p{Basic_Emoji}`} {
 		if _, err := ecma262.Compile(p, flags.Unicode); err == nil {
 			t.Errorf("expected compile error for %s", p)
 		}

@@ -22,8 +22,6 @@ pasting unverified snippets into the README.
 
 ## Areas that need work
 
-- Emoji-family Unicode properties (`\p{Emoji}`, `\p{Extended_Pictographic}`, …)
-  — need embedded Unicode data; currently rejected at compile time
 - Performance optimizations
 
 ## The Test262 pipeline
@@ -114,22 +112,26 @@ detectors for known V8 defects, which are skipped and counted rather than
 reported. A failure prints the exact pattern, flags and input, so it can be
 turned into a regression test directly.
 
-## Regenerating the properties of strings
+## Regenerating the emoji data
 
-The members of `\p{RGI_Emoji}` and the other properties of strings live in
-the generated `vm/emoji_strings.go`. When Go's `unicode.Version` changes,
-regenerate it from the matching Unicode version's emoji files, fetched from the
-numbered directory rather than `/Public/emoji/latest`, which runs ahead of Go
-and of the JavaScript engines:
+Go's `unicode` package has no emoji tables, so they are generated: the
+members of `\p{RGI_Emoji}` and the other properties of strings in
+`vm/emoji_strings.go`, and the emoji binary properties (`\p{Emoji}`, …) in
+`vm/emoji_props.go`. When Go's `unicode.Version` changes, regenerate them
+from the matching Unicode version's files, fetched from the numbered directory
+rather than `/Public/emoji/latest`, which runs ahead of Go and of the
+JavaScript engines:
 
 ```bash
 V=17.0.0   # go doc unicode.Version
 curl -fsSO https://www.unicode.org/Public/$V/emoji/emoji-sequences.txt
 curl -fsSO https://www.unicode.org/Public/$V/emoji/emoji-zwj-sequences.txt
-go run ./tools/genemoji -seq emoji-sequences.txt -zwj emoji-zwj-sequences.txt
+curl -fsSO https://www.unicode.org/Public/$V/ucd/emoji/emoji-data.txt
+go run ./tools/genemoji -seq emoji-sequences.txt -zwj emoji-zwj-sequences.txt -data emoji-data.txt
 ```
 
-The generator refuses files whose declared version does not match.
+The generator refuses files whose declared version does not match, and
+`TestEmojiDataVersion` fails once `unicode.Version` moves past the data.
 
 ## Refreshing the README benchmark numbers
 
