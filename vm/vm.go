@@ -95,6 +95,11 @@ const (
 
 	// Group reset for quantifier body repeats (ES2022 group-reset semantics)
 	OpResetGroups // Reset groups[A..B] (inclusive, 1-indexed) to -1
+
+	// Empty-iteration check for quantifiers whose body can match empty
+	// (ECMA-262 RepeatMatcher). Mark slots follow the capture slots.
+	OpMark          // Slot A = current position
+	OpCheckProgress // Fail if the position equals slot A
 )
 
 // Instruction represents a single VM instruction
@@ -189,6 +194,10 @@ func (i Instruction) String() string {
 		return fmt.Sprintf("not-unicode-prop %s", i.Prop)
 	case OpResetGroups:
 		return fmt.Sprintf("reset-groups %d..%d", i.A, i.B)
+	case OpMark:
+		return fmt.Sprintf("mark %d", i.A)
+	case OpCheckProgress:
+		return fmt.Sprintf("check-progress %d", i.A)
 	default:
 		return fmt.Sprintf("unknown(%d)", i.Op)
 	}
@@ -390,9 +399,8 @@ func (vm *VM) Match(input string, pos int) (bool, int, []int) {
 // from "budget exceeded".
 //
 // Successive MatchAt calls on the same input string also share the failure
-// memo when that is sound (programs without backreferences or empty-matching
-// loops), so states that already failed from an earlier start position are not
-// explored again. The VM's configuration must not change between such calls.
+// memo when that is sound (programs without backreferences), so states that
+// already failed from an earlier start position are not explored again. The VM's configuration must not change between such calls.
 func (vm *VM) MatchAt(input string, pos int) (bool, int, []int) {
 	vm.prepare(input)
 	if vm.Err != nil {
@@ -404,7 +412,8 @@ func (vm *VM) MatchAt(input string, pos int) (bool, int, []int) {
 	}
 
 	st := &vm.main
-	st.init((vm.NumGroups+1)*2, nil)
+	nCaptures := (vm.NumGroups + 1) * 2
+	st.init(max(nCaptures, vm.prog.slots), nil)
 	st.base, st.choiceBase = 0, 0
 	st.endPC = -1
 	st.backward = vm.Backward
@@ -425,7 +434,7 @@ func (vm *VM) MatchAt(input string, pos int) (bool, int, []int) {
 	if !matched {
 		return false, 0, nil
 	}
-	groups := make([]int, len(st.groups))
+	groups := make([]int, nCaptures)
 	copy(groups, st.groups)
 	return true, end, groups
 }
@@ -521,18 +530,34 @@ func (vm *VM) setGroup(st *runState, slot, val int) bool {
 	return true
 }
 
-// memoVisit reports whether the split state (pc, pos, and the captures when the
-// program needs them) was already visited, marking it if not. ok is false if
-// marking exceeded the memory budget.
+// memoVisit reports whether the split state (pc, pos, the captures when the
+// program needs them, and its iteration marks) was already visited, marking it
+// if not. ok is false if marking exceeded the memory budget.
+//
+// An iteration mark enters the key only as whether it equals pos. That is all
+// the rest of the run can observe of it: a mark is read only by its loop's
+// progress check, positions move only one way within a run, and any mark the
+// run can still read before overwriting it is at or behind pos in that
+// direction — so one that differs from pos now differs from every later
+// position its check can run at. (A mark the run cannot read, such as an
+// enclosing run's, only splits states further, which is sound.) Keying on the
+// exact value instead would make the states of an empty-matching loop
+// quadratic in the input.
 func (vm *VM) memoVisit(st *runState, pc, pos int) (visited, ok bool) {
 	before := st.memo.bytes
 	key := memoKey{pc: pc}
+	lo := min(vm.prog.markLo, len(st.groups))
 	if vm.prog.exact {
 		if !st.gidOK {
-			st.gid = st.memo.internGroups(st.groups)
+			st.gid = st.memo.internGroups(st.groups[:lo])
 			st.gidOK = true
 		}
 		key.gid = st.gid
+	}
+	for i, v := range st.groups[lo:] {
+		if v == pos {
+			key.marks |= 1 << i
+		}
 	}
 	visited = st.memo.visit(key, pos)
 	if d := st.memo.bytes - before; d != 0 {
@@ -757,11 +782,11 @@ func (vm *VM) run(st *runState, pc, pos int) (bool, int) {
 				// that state, so once a split state has been visited its branch
 				// A needs no second exploration: a revisit takes the exit B.
 				// The state includes the captures when the program has
-				// backreferences (which make outcomes depend on them) or
-				// empty-matching loops (where a revisit can be a cycle, not a
-				// completed failure); keying on (pos, pc) alone there wrongly
-				// prunes branches reachable with different captures, e.g.
-				// (?:(a)|a)(?:b|c)\1 on "ab".
+				// backreferences (which make outcomes depend on them); keying
+				// on (pos, pc) alone there wrongly prunes branches reachable
+				// with different captures, e.g. (?:(a)|a)(?:b|c)\1 on "ab". It
+				// includes the iteration marks of loops whose body can match
+				// empty, since those decide whether an iteration may end here.
 				visited, mok := vm.memoVisit(st, pc, pos)
 				if !mok {
 					return false, 0
@@ -821,7 +846,9 @@ func (vm *VM) run(st *runState, pc, pos int) (bool, int) {
 				}
 				if positive {
 					// Propagate captures from the body back into outer groups.
-					for i, v := range sub.groups {
+					// Iteration marks stay behind: they belong to loops in the
+					// body, and only the body's own runs may read them.
+					for i, v := range sub.groups[:(vm.NumGroups+1)*2] {
 						if v >= 0 && !vm.setGroup(st, i, v) {
 							return false, 0
 						}
@@ -840,6 +867,20 @@ func (vm *VM) run(st *runState, pc, pos int) (bool, int) {
 					}
 				}
 				pc++
+
+			case OpMark:
+				if !vm.setGroup(st, inst.A, pos) {
+					return false, 0
+				}
+				pc++
+
+			case OpCheckProgress:
+				// An optional iteration that consumed nothing fails.
+				if st.groups[inst.A] == pos {
+					ok = false
+				} else {
+					pc++
+				}
 
 			default:
 				ok = false

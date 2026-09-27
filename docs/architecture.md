@@ -143,20 +143,43 @@ a match, never its result:
   multi-byte rune. When no rune the loop consumes can begin its exit, the
   loop is possessive and keeps no frame at all.
 - **Memo keying.** The failure memo keys a state by (pc, position) when the
-  program has neither backreferences nor an empty-matching loop. Then a
-  state's outcome is independent of the captures and a revisited state is
-  always one that already failed, so the memo is pure pruning; it is kept in
-  paged bitsets (one bit per state) and, because a failed state fails from
-  any start position, it carries over from one start position to the next —
-  which makes unanchored searches such as `[a-z]+$` linear rather than
-  quadratic. Otherwise the capture vector is part of the key (interned to a
-  small id), and the memo is per attempt: backreferences make outcomes depend
-  on captures, and in an empty-matching loop a revisit can be a cycle rather
-  than a completed failure, where taking the exit is what terminates it.
+  program has no backreferences. Then a state's outcome is independent of
+  the captures and a revisited state is always one that already failed, so
+  the memo is pure pruning; it is kept in paged bitsets (one bit per state)
+  and, because a failed state fails from any start position, it carries over
+  from one start position to the next — which makes unanchored searches such
+  as `[a-z]+$` linear rather than quadratic. With backreferences, outcomes
+  depend on the captures, so the capture vector is part of the key (interned
+  to a small id) and the memo is per attempt.
 
 `TestOptimisedMatchesReference` (with a fuzz target) checks all of this
 differentially: `vm.SetOptimize(false)`, available to tests, disables the
 analysis and runs the plain algorithm as the reference.
+
+## Empty iterations
+
+ECMA-262's RepeatMatcher rejects an iteration that is taken once the
+quantifier's minimum is met and ends where it began: `(a*)*` on `"b"` leaves
+the group undefined, because its only iteration would be empty, and
+`(\w??|_)*` must make each iteration consume something. The compiler guards
+each loop whose body can match the empty string (`canMatchEmpty`, an
+over-approximation) with a *mark* at the start of every optional iteration
+and a *progress check* at its end. Marks live in slots after the capture
+slots, so backtracking restores them like captures, and they are not carried
+out of a lookaround with its captures (they belong to the loops in its body).
+Mandatory iterations — the first of a `+`, the `n` of `{n,m}` — may be
+empty; a `+` shares its body's code between its first iteration and the rest
+and relies on the mark being behind any position the loop can be re-entered
+at, which holds because positions only move one way within a run.
+
+The checks also bound the memo. With every empty-matching loop guarded, no
+cycle that consumes nothing can execute, so the program is keyed by (pc,
+position) like any other. A mark enters the key only as "does it equal the
+position": that is all its check can observe, since a mark that has fallen
+behind the position stays behind. Keying on its value would make these loops
+quadratic; before the checks, the same loops needed the capture vector in the
+key and a fresh memo per start position, and `(?:x*|y)*z` exhausted the
+budget on 1,000 characters.
 
 ## Case folding and Unicode properties
 

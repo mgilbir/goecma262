@@ -6,11 +6,11 @@ import "encoding/binary"
 // the current search, so a revisit takes the split's B branch instead of
 // re-exploring branch A (see the OpSplit case in run).
 //
-// A state is (pc, pos) plus, when the program has backreferences or an
-// empty-matching loop (Program.exact), the full capture vector. Capture vectors
-// are interned to small ids, and the positions visited for each (pc, id) are
-// kept in a paged bitset, so marking costs one bit per visited position rather
-// than one allocated string per visit.
+// A state is (pc, pos, which iteration marks equal pos) plus, when the program
+// has backreferences (Program.exact), the full capture vector. Capture vectors
+// are interned to small ids, and the positions visited for each key are kept
+// in a paged bitset, so marking costs one bit per visited position rather than
+// one allocated string per visit.
 
 const (
 	memoPageBits  = 1024
@@ -32,6 +32,9 @@ type posSet struct {
 type memoKey struct {
 	pc  int
 	gid int32
+	// marks has bit i set when iteration mark i equals the position; see
+	// memoVisit for why that is all of a mark the key needs.
+	marks uint64
 }
 
 type memo struct {

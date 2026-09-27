@@ -18,10 +18,15 @@ type Program struct {
 	backward                               bool // direction of the top-level program
 	exact                                  bool // memo keys must include capture groups
 	anchored                               bool // top level begins with a non-multiline ^
-	dir                                    []bool
-	first                                  []*firstSet  // indexed by pc; set for split targets and loop exits
-	loops                                  []greedyLoop // indexed by pc; ok for recognised loops
-	leafCache                              map[int]*[4]uint64
+	slots                                  int  // length of the slot vector the marks need
+	// markLo is the first iteration-mark slot (marks occupy markLo..slots-1),
+	// or noMarks when there are none or the memo must key on every slot's
+	// exact value (more marks than its bitmask holds).
+	markLo    int
+	dir       []bool
+	first     []*firstSet  // indexed by pc; set for split targets and loop exits
+	loops     []greedyLoop // indexed by pc; ok for recognised loops
+	leafCache map[int]*[4]uint64
 }
 
 // firstSet over-approximates what an execution starting at some pc can do
@@ -47,6 +52,9 @@ type greedyLoop struct {
 	possessive bool
 }
 
+// noMarks is Program.markLo for a program whose slots are all keyed exactly.
+const noMarks = int(^uint(0) >> 1)
+
 // optimize enables the analysis-driven shortcuts. Tests turn it off to run the
 // plain backtracking semantics (captures always in the memo key, every
 // alternative explored, no loop scanning) as a reference for differential
@@ -71,13 +79,26 @@ func NewProgram(code []Instruction, ignoreCase, multiline, dotAll, unicode, back
 	}
 	p.first = make([]*firstSet, len(code))
 	p.loops = make([]greedyLoop, len(code))
+	p.markLo = -1
+	for _, inst := range code {
+		if inst.Op == OpMark || inst.Op == OpCheckProgress {
+			p.slots = max(p.slots, inst.A+1)
+			if p.markLo < 0 || inst.A < p.markLo {
+				p.markLo = inst.A
+			}
+		}
+	}
+	tooManyMarks := p.markLo >= 0 && p.slots-p.markLo > 64
+	if p.markLo < 0 || tooManyMarks {
+		p.markLo = noMarks
+	}
 	if !optimize {
 		p.exact = true
 		p.leafCache = nil
 		return p
 	}
 	p.computeDirections()
-	p.exact = hasBackref(code) || hasEpsilonCycle(code)
+	p.exact = hasBackref(code) || hasEpsilonCycle(code) || tooManyMarks
 	p.anchored = !backward && !multiline && len(code) > 1 &&
 		code[0].Op == OpSaveStart && code[0].A == 0 && code[1].Op == OpStartLine
 
@@ -186,6 +207,11 @@ func epsilonSuccs(code []Instruction, pc int, out []int) []int {
 		return append(out, inst.A, inst.B)
 	case inst.Op == OpMatch || isSingleRune(inst.Op):
 		return out
+	case inst.Op == OpCheckProgress:
+		// Every path back to a loop's split passes through its iteration's
+		// mark and then this check, so one that consumed nothing fails here:
+		// an empty-matching loop body is not a cycle that can be executed.
+		return out
 	default:
 		// Saves, resets, anchors, word boundaries, lookarounds and
 		// backreferences (which may match the empty string) fall through.
@@ -194,10 +220,12 @@ func epsilonSuccs(code []Instruction, pc int, out []int) []int {
 }
 
 // hasEpsilonCycle reports whether control can return to an instruction
-// without consuming input (a quantifier whose body can match empty). Only then
-// can a state be revisited while it is still being explored, which is the one
-// case where the failure memo's "already visited" answer changes results
-// rather than merely pruning a subtree known to fail.
+// without consuming input. Only then can a state be revisited while it is
+// still being explored, which is the one case where the failure memo's
+// "already visited" answer changes results rather than merely pruning a
+// subtree known to fail. The compiler guards every loop whose body can match
+// empty with a progress check (see epsilonSuccs), so this holds only for
+// hand-built programs.
 func hasEpsilonCycle(code []Instruction) bool {
 	const (
 		white = iota
@@ -504,6 +532,7 @@ func (p *Program) computeFirst(start int, w *frontierWalker) *firstSet {
 		case inst.Op == OpSplit:
 			w.stack = append(w.stack, inst.B, inst.A)
 		case inst.Op == OpSaveStart, inst.Op == OpSaveEnd, inst.Op == OpResetGroups,
+			inst.Op == OpMark, inst.Op == OpCheckProgress,
 			inst.Op == OpStartLine, inst.Op == OpEndLine,
 			inst.Op == OpWordBound, inst.Op == OpNonWordBound:
 			w.stack = append(w.stack, pc+1)
