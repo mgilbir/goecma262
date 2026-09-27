@@ -11,10 +11,6 @@ import (
 // name or an alias from its tables and PropertyValueAliases.txt, with no
 // loose matching of case, spaces, hyphens or underscores, and only the binary
 // properties it lists. Expectations were taken from node (V8, Unicode 17.0).
-// Bidi_Mirrored, Changes_When_Casefolded, Changes_When_Casemapped,
-// Changes_When_NFKC_Casefolded and Grapheme_Base are valid in JavaScript but
-// not supported here yet (Go's unicode package has no data for them), so they
-// are not listed.
 func TestPropertyNames_Exact(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -93,6 +89,16 @@ func TestPropertyNames_Exact(t *testing.T) {
 		{`Lu `, false},
 		{`gc =Lu`, false},
 		{`RGI_Emoji`, false},
+		{`Bidi_Mirrored`, true},
+		{`Bidi_M`, true},
+		{`Grapheme_Base`, true},
+		{`Gr_Base`, true},
+		{`Changes_When_Casefolded`, true},
+		{`CWCF`, true},
+		{`Changes_When_Casemapped`, true},
+		{`CWCM`, true},
+		{`Changes_When_NFKC_Casefolded`, true},
+		{`CWKCF`, true},
 	}
 	for _, tc := range cases {
 		_, err := ecma262.Compile(`\p{`+tc.name+`}`, flags.Unicode)
@@ -107,7 +113,9 @@ func TestPropertyNames_Exact(t *testing.T) {
 
 // Values whose resolution the exact tables changed: Cased_Letter is Lu, Ll
 // and Lt (not every letter), Cn is computed, and so are Assigned and
-// Script=Unknown.
+// Script=Unknown. The rest come from the generated UCD tables, at code points
+// where the approximations they replace were wrong, and Script_Extensions,
+// which differs from Script where ScriptExtensions.txt lists a code point.
 func TestPropertyNames_Members(t *testing.T) {
 	cases := []struct {
 		pattern string
@@ -135,6 +143,40 @@ func TestPropertyNames_Members(t *testing.T) {
 		{`\p{White_Space}`, "\u180e", false},
 		{`\p{gc=punct}`, "!", true},
 		{`\p{digit}`, "\u0660", true},
+		{`\p{Case_Ignorable}`, "'", true},
+		{`\p{CI}`, "a", false},
+		{`\p{Changes_When_Titlecased}`, "\u00df", true},
+		{`\p{CWU}`, "\u00df", true},
+		{`\p{Changes_When_Uppercased}`, "\u0149", true},
+		{`\p{Default_Ignorable_Code_Point}`, "\u0600", false},
+		{`\p{DI}`, "\u00ad", true},
+		{`\p{ID_Start}`, "\u2e2f", false},
+		{`\p{IDS}`, "a", true},
+		{`\p{ID_Continue}`, "\u2e2f", false},
+		{`\p{XID_Start}`, "\u037a", false},
+		{`\p{XIDS}`, "\u0e33", false},
+		{`\p{XID_Continue}`, "\u309b", false},
+		{`\p{XIDC}`, "_", true},
+		{`\p{Bidi_Mirrored}`, "(", true},
+		{`\p{Bidi_M}`, "a", false},
+		{`\p{Changes_When_Casefolded}`, "A", true},
+		{`\p{CWCF}`, "a", false},
+		{`\p{Changes_When_Casemapped}`, "a", true},
+		{`\p{CWCM}`, "1", false},
+		{`\p{Changes_When_NFKC_Casefolded}`, "\u00a0", true},
+		{`\p{CWKCF}`, "a", false},
+		{`\p{Grapheme_Base}`, "a", true},
+		{`\p{Gr_Base}`, "\u0300", false},
+		{`\p{scx=Latn}`, "\u0363", true},
+		{`\p{sc=Latn}`, "\u0363", false},
+		{`\p{scx=Arab}`, "\u060c", true},
+		{`\p{sc=Arab}`, "\u060c", false},
+		{`\p{scx=Syrc}`, "\u060c", true},
+		{`\p{Script_Extensions=Greek}`, "\u0342", true},
+		{`\p{scx=Zyyy}`, "\u060c", false},
+		{`\p{scx=Zyyy}`, "1", true},
+		{`\p{scx=Zinh}`, "\u0363", false},
+		{`\p{scx=Zzzz}`, "\u0378", true},
 	}
 	for _, tc := range cases {
 		re := ecma262.MustCompile(`^`+tc.pattern+`$`, flags.Unicode)

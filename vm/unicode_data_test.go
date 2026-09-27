@@ -31,3 +31,20 @@ func TestPropertyNamesVersion(t *testing.T) {
 		t.Errorf("property names are Unicode %s but unicode.Version is %s: regenerate with tools/genpropnames", propertyNamesVersion, unicode.Version)
 	}
 }
+
+func TestUCDTablesSorted(t *testing.T) {
+	check := func(name string, rs []RuneRange) {
+		for i, r := range rs {
+			if r.Start > r.End || i > 0 && r.Start <= rs[i-1].End+1 {
+				t.Errorf("%s: range %d (%X-%X) not sorted, disjoint and non-adjacent", name, i, r.Start, r.End)
+			}
+		}
+	}
+	for name, rs := range ucdProperties {
+		check(name, rs)
+	}
+	for name, rs := range scriptExtensions {
+		check("scx="+name, rs)
+	}
+	check("scriptExtensionsListed", scriptExtensionsListed)
+}

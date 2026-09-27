@@ -141,12 +141,17 @@ The generator refuses files whose declared version does not match, and
 `TestEmojiDataVersion` fails once `unicode.Version` moves past the data.
 
 The spellings ECMA-262 accepts for general categories and scripts in
-`\p{...}` are generated the same way, into `vm/property_names.go`, and
+`\p{...}` are generated the same way, into `vm/property_names.go`, together
+with the tables for the properties Go lacks (`vm/ucd_props.go`);
 `TestPropertyNamesVersion` checks their version:
 
 ```bash
-curl -fsSO https://www.unicode.org/Public/$V/ucd/PropertyValueAliases.txt
-go run ./tools/genpropnames -in PropertyValueAliases.txt
+for f in PropertyValueAliases.txt DerivedCoreProperties.txt DerivedNormalizationProps.txt \
+         extracted/DerivedBinaryProperties.txt ScriptExtensions.txt; do
+  curl -fsSO https://www.unicode.org/Public/$V/ucd/$f
+done
+go run ./tools/genpropnames -in PropertyValueAliases.txt -core DerivedCoreProperties.txt \
+    -norm DerivedNormalizationProps.txt -binary DerivedBinaryProperties.txt -scx ScriptExtensions.txt
 ```
 
 ## Refreshing the README benchmark numbers

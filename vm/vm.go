@@ -1223,10 +1223,10 @@ func resolveUnicodeProperty(prop string) (func(rune) bool, bool) {
 		switch name {
 		case "General_Category", "gc":
 			return generalCategory(value)
-		case "Script", "sc", "Script_Extensions", "scx":
-			// Script_Extensions is approximated by Script: Go's unicode
-			// package has no Script_Extensions data.
+		case "Script", "sc":
 			return script(value)
+		case "Script_Extensions", "scx":
+			return scriptExtension(value)
 		}
 		return nil, false
 	}
@@ -1258,6 +1258,23 @@ func script(value string) (func(rune) bool, bool) {
 	return func(r rune) bool { return unicode.Is(t, r) }, true
 }
 
+// scriptExtension is Script_Extensions=value: the code points
+// ScriptExtensions.txt lists with that script, and those it does not list
+// whose Script is that script.
+func scriptExtension(value string) (func(rune) bool, bool) {
+	sc, ok := script(value)
+	if !ok {
+		return nil, false
+	}
+	ext := scriptExtensions[scriptNames[value]]
+	return func(r rune) bool {
+		if inRanges(scriptExtensionsListed, r) {
+			return inRanges(ext, r)
+		}
+		return sc(r)
+	}, true
+}
+
 // anyScript holds the code points of every script Go has a table for, which
 // is every script but Unknown.
 var anyScript = sync.OnceValue(func() []RuneRange {
@@ -1282,10 +1299,8 @@ func isUnknownScript(r rune) bool { return !inRanges(anyScript(), r) }
 
 // binaryProperties maps each spelling of each binary property in ECMA-262's
 // table of binary Unicode property aliases to its predicate. Names are exact.
-// Bidi_Mirrored, Changes_When_Casefolded, Changes_When_Casemapped,
-// Changes_When_NFKC_Casefolded and Grapheme_Base are missing: Go's unicode
-// package has no data for them. Some computed ones (Case_Ignorable,
-// Default_Ignorable_Code_Point, XID_*) are close approximations.
+// Properties Go's unicode package has no exact table for come from the UCD
+// tables tools/genpropnames generates (ucd_props.go).
 var binaryProperties = func() map[string]func(rune) bool {
 	m := map[string]func(rune) bool{}
 	add := func(fn func(rune) bool, names ...string) {
@@ -1300,19 +1315,30 @@ var binaryProperties = func() map[string]func(rune) bool {
 		}
 		return func(r rune) bool { return unicode.Is(t, r) }
 	}
+	ucd := func(name string) func(rune) bool {
+		rs := ucdProperties[name]
+		if rs == nil {
+			panic("vm: no generated table " + name)
+		}
+		return func(r rune) bool { return inRanges(rs, r) }
+	}
 	add(func(r rune) bool { return r <= 0x7F }, "ASCII")
 	add(func(r rune) bool { return true }, "Any")
 	add(func(r rune) bool { return !unicode.Is(unicode.Categories["Cn"], r) }, "Assigned")
 	add(table("ASCII_Hex_Digit"), "ASCII_Hex_Digit", "AHex")
 	add(isAlphabetic, "Alphabetic", "Alpha")
 	add(table("Bidi_Control"), "Bidi_Control", "Bidi_C")
-	add(isCaseIgnorable, "Case_Ignorable", "CI")
+	add(ucd("Bidi_Mirrored"), "Bidi_Mirrored", "Bidi_M")
+	add(ucd("Case_Ignorable"), "Case_Ignorable", "CI")
 	add(isCased, "Cased")
+	add(ucd("Changes_When_Casefolded"), "Changes_When_Casefolded", "CWCF")
+	add(ucd("Changes_When_Casemapped"), "Changes_When_Casemapped", "CWCM")
 	add(func(r rune) bool { return unicode.ToLower(r) != r }, "Changes_When_Lowercased", "CWL")
-	add(func(r rune) bool { return unicode.ToTitle(r) != r }, "Changes_When_Titlecased", "CWT")
-	add(func(r rune) bool { return unicode.ToUpper(r) != r }, "Changes_When_Uppercased", "CWU")
+	add(ucd("Changes_When_NFKC_Casefolded"), "Changes_When_NFKC_Casefolded", "CWKCF")
+	add(ucd("Changes_When_Titlecased"), "Changes_When_Titlecased", "CWT")
+	add(ucd("Changes_When_Uppercased"), "Changes_When_Uppercased", "CWU")
 	add(table("Dash"), "Dash")
-	add(isDefaultIgnorable, "Default_Ignorable_Code_Point", "DI")
+	add(ucd("Default_Ignorable_Code_Point"), "Default_Ignorable_Code_Point", "DI")
 	add(table("Deprecated"), "Deprecated", "Dep")
 	add(table("Diacritic"), "Diacritic", "Dia")
 	add(emojiProperty("Emoji"), "Emoji")
@@ -1322,12 +1348,13 @@ var binaryProperties = func() map[string]func(rune) bool {
 	add(emojiProperty("Emoji_Presentation"), "Emoji_Presentation", "EPres")
 	add(emojiProperty("Extended_Pictographic"), "Extended_Pictographic", "ExtPict")
 	add(table("Extender"), "Extender", "Ext")
+	add(ucd("Grapheme_Base"), "Grapheme_Base", "Gr_Base")
 	add(isGraphemeExtend, "Grapheme_Extend", "Gr_Ext")
 	add(table("Hex_Digit"), "Hex_Digit", "Hex")
 	add(table("IDS_Binary_Operator"), "IDS_Binary_Operator", "IDSB")
 	add(table("IDS_Trinary_Operator"), "IDS_Trinary_Operator", "IDST")
-	add(isIDContinue, "ID_Continue", "IDC")
-	add(isIDStart, "ID_Start", "IDS")
+	add(ucd("ID_Continue"), "ID_Continue", "IDC")
+	add(ucd("ID_Start"), "ID_Start", "IDS")
 	add(table("Ideographic"), "Ideographic", "Ideo")
 	add(table("Join_Control"), "Join_Control", "Join_C")
 	add(table("Logical_Order_Exception"), "Logical_Order_Exception", "LOE")
@@ -1346,8 +1373,8 @@ var binaryProperties = func() map[string]func(rune) bool {
 	add(func(r rune) bool { return unicode.IsUpper(r) || unicode.Is(unicode.Other_Uppercase, r) }, "Uppercase", "Upper")
 	add(table("Variation_Selector"), "Variation_Selector", "VS")
 	add(table("White_Space"), "White_Space", "space", "WSpace")
-	add(isIDContinue, "XID_Continue", "XIDC") // NFKC-closure approximation
-	add(isIDStart, "XID_Start", "XIDS")       // NFKC-closure approximation
+	add(ucd("XID_Continue"), "XID_Continue", "XIDC")
+	add(ucd("XID_Start"), "XID_Start", "XIDS")
 	return m
 }()
 
@@ -1360,28 +1387,6 @@ func isCased(r rune) bool {
 		unicode.Is(unicode.Other_Lowercase, r) || unicode.Is(unicode.Other_Uppercase, r)
 }
 
-func isCaseIgnorable(r rune) bool {
-	// Approximation of Case_Ignorable: the combining/format/modifier categories
-	// (the Word_Break refinements are omitted).
-	return unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Me, r) || unicode.Is(unicode.Cf, r) ||
-		unicode.Is(unicode.Lm, r) || unicode.Is(unicode.Sk, r)
-}
-
-func isIDStart(r rune) bool {
-	return unicode.IsLetter(r) || unicode.Is(unicode.Nl, r) || unicode.Is(unicode.Other_ID_Start, r)
-}
-
-func isIDContinue(r rune) bool {
-	return isIDStart(r) || unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Mc, r) ||
-		unicode.Is(unicode.Nd, r) || unicode.Is(unicode.Pc, r) || unicode.Is(unicode.Other_ID_Continue, r)
-}
-
 func isGraphemeExtend(r rune) bool {
 	return unicode.Is(unicode.Me, r) || unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Other_Grapheme_Extend, r)
-}
-
-func isDefaultIgnorable(r rune) bool {
-	// Approximation of Default_Ignorable_Code_Point.
-	return unicode.Is(unicode.Other_Default_Ignorable_Code_Point, r) ||
-		unicode.Is(unicode.Cf, r) || unicode.Is(unicode.Variation_Selector, r)
 }
