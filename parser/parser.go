@@ -439,9 +439,62 @@ func (p *Parser) parseGroup() Expression {
 			return p.finishLookaround(true, true)
 		}
 		return p.parseNamedGroup()
+	case p.peekAt(0) == '-' || modifierFlag(p.peekAt(0)) != 0:
+		return p.parseModifierGroup()
 	}
 	p.fail("invalid group")
 	return nil
+}
+
+// parseModifierGroup parses the rest of (?add-remove:...), pos after the '?'.
+// Only i, m and s may be modified; a flag may appear once, and not in both
+// lists; and the lists may not both be empty.
+func (p *Parser) parseModifierGroup() Expression {
+	add := p.readModifiers()
+	var remove Modifiers
+	if p.eat('-') {
+		remove = p.readModifiers()
+		if add == 0 && remove == 0 {
+			p.fail("invalid group: (?-: modifies no flag")
+		}
+	}
+	if add&remove != 0 {
+		p.fail("invalid group: a flag is both added and removed")
+	}
+	if !p.eat(':') {
+		p.fail("invalid group")
+	}
+	body := p.parseDisjunction()
+	p.expectGroupClose()
+	return p.applyQuantifier(&ModifierGroup{Add: add, Remove: remove, Body: body})
+}
+
+func (p *Parser) readModifiers() Modifiers {
+	var seen Modifiers
+	for !p.atEnd() {
+		m := modifierFlag(p.peek())
+		if m == 0 {
+			break
+		}
+		if seen&m != 0 {
+			p.fail("invalid group: repeated flag %c", p.peek())
+		}
+		seen |= m
+		p.pos++
+	}
+	return seen
+}
+
+func modifierFlag(r rune) Modifiers {
+	switch r {
+	case 'i':
+		return ModIgnoreCase
+	case 'm':
+		return ModMultiline
+	case 's':
+		return ModDotAll
+	}
+	return 0
 }
 
 func (p *Parser) expectGroupClose() {
@@ -1297,6 +1350,9 @@ func (p *Parser) pathNames(node Expression) (nameSet, error) {
 		}
 		return result, nil
 	case *NonCapturingGroup:
+		return p.pathNames(n.Body)
+	case *ModifierGroup:
+		// Transparent to naming: names inside collide with names outside.
 		return p.pathNames(n.Body)
 	case *Lookahead:
 		return p.pathNames(n.Body)

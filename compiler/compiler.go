@@ -22,8 +22,12 @@ type Compiler struct {
 	numGroups int // capture groups in the pattern
 	numMarks  int // iteration-start mark slots allocated so far
 
-	ignoreCase  bool
-	unicodeSets bool
+	// ignoreCase, multiline and dotAll are the flags in effect where code is
+	// being emitted, which a modifier group changes; mode stamps them onto
+	// each instruction inside one (0 elsewhere, meaning the VM's flags).
+	ignoreCase, multiline, dotAll bool
+	mode                          vm.Mode
+	unicodeSets                   bool
 	// classSets memoizes evaluated v-mode classes, which a counted quantifier
 	// compiles once per copy.
 	classSets map[*parser.ClassSetExpression]classSetValue
@@ -38,6 +42,8 @@ func Compile(pattern *parser.Pattern) ([]vm.Instruction, int, error) {
 		code:        make([]vm.Instruction, 0),
 		numGroups:   pattern.NumGroups,
 		ignoreCase:  pattern.Flags.IgnoreCase,
+		multiline:   pattern.Flags.Multiline,
+		dotAll:      pattern.Flags.DotAll,
 		unicodeSets: pattern.Flags.UnicodeSets,
 	}
 
@@ -59,8 +65,38 @@ func Compile(pattern *parser.Pattern) ([]vm.Instruction, int, error) {
 
 func (c *Compiler) emit(inst vm.Instruction) int {
 	idx := len(c.code)
+	inst.Mode = c.mode
 	c.code = append(c.code, inst)
 	return idx
+}
+
+// compileModifierGroup compiles the body of (?add-remove:...) with its flags.
+func (c *Compiler) compileModifierGroup(g *parser.ModifierGroup) error {
+	ic, ml, da, mode := c.ignoreCase, c.multiline, c.dotAll, c.mode
+	apply := func(on *bool, m parser.Modifiers) {
+		if g.Add&m != 0 {
+			*on = true
+		}
+		if g.Remove&m != 0 {
+			*on = false
+		}
+	}
+	apply(&c.ignoreCase, parser.ModIgnoreCase)
+	apply(&c.multiline, parser.ModMultiline)
+	apply(&c.dotAll, parser.ModDotAll)
+	c.mode = vm.ModeSet
+	if c.ignoreCase {
+		c.mode |= vm.ModeIgnoreCase
+	}
+	if c.multiline {
+		c.mode |= vm.ModeMultiline
+	}
+	if c.dotAll {
+		c.mode |= vm.ModeDotAll
+	}
+	err := c.compileNode(g.Body)
+	c.ignoreCase, c.multiline, c.dotAll, c.mode = ic, ml, da, mode
+	return err
 }
 
 func (c *Compiler) patchJump(idx, target int) {
@@ -102,6 +138,8 @@ func (c *Compiler) compileNode(node parser.Node) error {
 		return c.compileNamedGroup(n)
 	case *parser.NonCapturingGroup:
 		return c.compileNode(n.Body)
+	case *parser.ModifierGroup:
+		return c.compileModifierGroup(n)
 	case *parser.Lookahead:
 		return c.compileLookahead(n)
 	case *parser.NegativeLookahead:
@@ -448,6 +486,8 @@ func canMatchEmpty(e parser.Expression) bool {
 		return canMatchEmpty(n.Body)
 	case *parser.NonCapturingGroup:
 		return canMatchEmpty(n.Body)
+	case *parser.ModifierGroup:
+		return canMatchEmpty(n.Body)
 	case *parser.Backreference:
 		// A reference to an unset or empty group matches empty.
 		return true
@@ -622,6 +662,8 @@ func reverseExpr(e parser.Expression) parser.Expression {
 		return &parser.NamedGroup{Index: n.Index, Name: n.Name, Body: reverseExpr(n.Body)}
 	case *parser.NonCapturingGroup:
 		return &parser.NonCapturingGroup{Body: reverseExpr(n.Body)}
+	case *parser.ModifierGroup:
+		return &parser.ModifierGroup{Add: n.Add, Remove: n.Remove, Body: reverseExpr(n.Body)}
 	case *parser.ClassSetExpression:
 		return reverseClassSet(n)
 	default:
@@ -662,6 +704,8 @@ func groupIndexRange(node parser.Expression) (lo, hi int, has bool) {
 			consider(e.Index, &lo, &hi, &has)
 			walk(e.Body)
 		case *parser.NonCapturingGroup:
+			walk(e.Body)
+		case *parser.ModifierGroup:
 			walk(e.Body)
 		case *parser.Disjunction:
 			for _, alt := range e.Alternatives {

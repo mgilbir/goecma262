@@ -59,6 +59,7 @@ Runnable, test-asserted examples for every feature below live in
 ### ECMA-262 specific
 - ✅ Flags: `i`, `g`, `m`, `s`, `u`, `v`, `y`, `d` (see [Flags](#flags))
 - ✅ Named capture groups `(?<name>abc)` and backreferences `\k<name>`
+- ✅ Modifier groups `(?i:...)`, `(?-i:...)`, `(?ms-i:...)`: turn `i`, `m` and `s` on or off for part of a pattern
 - ✅ Lookahead `(?=...)`, `(?!...)`
 - ✅ Lookbehind `(?<=...)`, `(?<!...)` — including variable-length, with ECMA-262 right-to-left capture semantics
 - ✅ Unicode property escapes `\p{...}`, `\P{...}` (requires `u`/`v`; all general categories, scripts via `Script=`, common binary properties; unknown names are rejected)

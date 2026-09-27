@@ -196,6 +196,19 @@ Go's `unicode` tables, cached in a `sync.Map` keyed by property expression;
 unknown property names are compile errors ("invalid unicode property
 escape") rather than silently-empty classes.
 
+## Modifier groups
+
+`(?ims-ims:...)` changes `i`, `m` and `s` for part of a pattern, so those
+flags belong to instructions rather than to the VM. The compiler tracks the
+flags in effect and stamps them into `vm.Instruction.Mode` on every
+instruction inside a modifier group. Instructions outside any group leave it
+zero and use the VM's flags. Everything that reads a flag, matching and the
+analysis in `vm.NewProgram` alike, asks the instruction (`vm.ignoreCase(inst)`,
+`Program.ignoreCaseAt`). Two consequences to keep in mind: a backreference
+outside `(?i:...)` stays case-sensitive even if its group is inside one, and
+`(?m:^)` at the start of a pattern does not make it anchored. Class sets are
+evaluated with the flags in effect where they appear.
+
 ## Class sets (`v` flag)
 
 Under `v`, a character class is a `ClassSetExpression`: a set algebra with

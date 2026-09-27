@@ -1006,6 +1006,8 @@ func extractGroupNames(node parser.Node, numGroups int) []string {
 			extract(v.Body)
 		case *parser.NonCapturingGroup:
 			extract(v.Body)
+		case *parser.ModifierGroup:
+			extract(v.Body)
 		case *parser.Quantifier:
 			extract(v.Body)
 		case *parser.Lookahead:

@@ -55,28 +55,28 @@ func NewCharSetRanges(rs []RuneRange) *CharSet {
 }
 
 // matchCharSet reports whether r is in s under vm's case sensitivity.
-func (vm *VM) matchCharSet(s *CharSet, r rune) bool {
+func (vm *VM) matchCharSet(ic bool, s *CharSet, r rune) bool {
 	switch s.Op {
 	case CharSetRanges:
-		return vm.anyFold(r, func(f rune) bool { return inRanges(s.Ranges, f) })
+		return vm.anyFold(ic, r, func(f rune) bool { return inRanges(s.Ranges, f) })
 	case CharSetEscape:
-		return vm.anyFold(r, func(f rune) bool { return vm.matchEscape(s.Atom, f) }) != s.Atom.Negated
+		return vm.anyFold(ic, r, func(f rune) bool { return vm.matchEscape(ic, s.Atom, f) }) != s.Atom.Negated
 	case CharSetUnion:
 		for _, it := range s.Items {
-			if vm.matchCharSet(it, r) {
+			if vm.matchCharSet(ic, it, r) {
 				return true
 			}
 		}
 		return false
 	case CharSetIntersection:
 		for _, it := range s.Items {
-			if !vm.matchCharSet(it, r) {
+			if !vm.matchCharSet(ic, it, r) {
 				return false
 			}
 		}
 		return true
 	case CharSetComplement:
-		return !vm.matchCharSet(s.Items[0], r)
+		return !vm.matchCharSet(ic, s.Items[0], r)
 	}
 	return false
 }
@@ -87,11 +87,11 @@ func (vm *VM) matchCharSet(s *CharSet, r rune) bool {
 // both, and Canonicalize is simple case folding. Without u or v it is the
 // legacy uppercase mapping, which no escape's set is affected by (it never
 // maps a non-ASCII rune to ASCII), so pred alone decides.
-func (vm *VM) anyFold(r rune, pred func(rune) bool) bool {
+func (vm *VM) anyFold(ic bool, r rune, pred func(rune) bool) bool {
 	if pred(r) {
 		return true
 	}
-	if !vm.IgnoreCase || !vm.Unicode {
+	if !ic || !vm.Unicode {
 		return false
 	}
 	for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
@@ -129,8 +129,8 @@ func (s *RuneSwitch) target(key rune) (int, bool) {
 	return s.Targets[i], true
 }
 
-func (vm *VM) switchKey(r rune) rune {
-	if vm.IgnoreCase {
+func (vm *VM) switchKey(ic bool, r rune) rune {
+	if ic {
 		return CanonicalFold(r)
 	}
 	return r
@@ -149,18 +149,18 @@ func CanonicalFold(r rune) rune {
 // wordChar reports whether r is in ECMA-262's WordCharacters: [A-Za-z0-9_],
 // plus, under IgnoreCase in Unicode mode, the runes that fold to one of those
 // (ſ and the Kelvin sign K). It decides \w, \W, \b and \B.
-func (vm *VM) wordChar(r rune) bool {
-	return isWordChar(r) || vm.anyFold(r, isWordChar)
+func (vm *VM) wordChar(ic bool, r rune) bool {
+	return isWordChar(r) || vm.anyFold(ic, r, isWordChar)
 }
 
 // matchEscape reports whether r is in the set of the escape a, ignoring
 // a.Negated.
-func (vm *VM) matchEscape(a ClassAtom, r rune) bool {
+func (vm *VM) matchEscape(ic bool, a ClassAtom, r rune) bool {
 	switch a.Kind {
 	case ClassAtomDigit:
 		return isECMADigit(r)
 	case ClassAtomWord:
-		return vm.wordChar(r)
+		return vm.wordChar(ic, r)
 	case ClassAtomSpace:
 		return isSpace(r)
 	case ClassAtomUnicodeProp:

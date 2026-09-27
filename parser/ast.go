@@ -164,6 +164,27 @@ type ClassStrings struct {
 
 func (c *ClassStrings) classSetNode() {}
 
+// Modifiers is a set of the flags a modifier group can change.
+type Modifiers uint8
+
+const (
+	ModIgnoreCase Modifiers = 1 << iota // i
+	ModMultiline                        // m
+	ModDotAll                           // s
+)
+
+// ModifierGroup is (?add-remove:...), a non-capturing group whose body
+// matches with the i, m and s flags in Add turned on and those in Remove
+// turned off.
+type ModifierGroup struct {
+	Add    Modifiers
+	Remove Modifiers
+	Body   Expression
+}
+
+func (m *ModifierGroup) node() {}
+func (m *ModifierGroup) expr() {}
+
 // Dot represents the . metacharacter
 type Dot struct{}
 
