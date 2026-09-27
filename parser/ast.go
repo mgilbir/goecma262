@@ -249,6 +249,16 @@ type Backreference struct {
 	Index      int    // primary group index (1-indexed)
 	Name       string // empty if using numeric index
 	AltIndices []int  // additional group indices for ES2022 duplicate named groups
+
+	// Fallback, when non-nil, makes the compiler emit these characters
+	// literally instead of a backreference.
+	//
+	// Deprecated: the parser no longer sets Fallback. It classifies an Annex B
+	// \N against the group count before parsing, so a \N that names no group
+	// is parsed as a legacy octal escape or literal digits directly. The field
+	// is kept, and still honored by the compiler, so existing importers keep
+	// compiling and working.
+	Fallback []rune
 }
 
 func (b *Backreference) node() {}

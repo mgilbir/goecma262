@@ -480,6 +480,14 @@ func (c *Compiler) compileNamedGroup(g *parser.NamedGroup) error {
 }
 
 func (c *Compiler) compileBackreference(b *parser.Backreference) error {
+	// A caller-built AST may still use the deprecated Fallback: literal
+	// characters in place of a backreference.
+	if b.Fallback != nil {
+		for _, r := range b.Fallback {
+			c.emit(vm.Instruction{Op: vm.OpChar, Char: r})
+		}
+		return nil
+	}
 	c.emit(vm.Instruction{Op: vm.OpBackref, A: b.Index, AltA: b.AltIndices})
 	return nil
 }
