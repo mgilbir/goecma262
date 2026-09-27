@@ -66036,7 +66036,7 @@ var test262GeneratedCases = []struct {
 	{"builtin-coerce-lastindex.js#2", "test/built-ins/RegExp/prototype/Symbol.match/builtin-coerce-lastindex.js", ".", "y", "abc", "submatch", "b", 0, 0, 1, ""},
 	{"builtin-failure-return-val.js#1", "test/built-ins/RegExp/prototype/Symbol.match/builtin-failure-return-val.js", "a", "", "b", "match", "false", 0, 0, 0, ""},
 	{"builtin-failure-y-return-val.js#1", "test/built-ins/RegExp/prototype/Symbol.match/builtin-failure-y-return-val.js", "a", "y", "ba", "match", "false", 0, 0, 0, ""},
-	{"builtin-infer-unicode.js#1", "test/built-ins/RegExp/prototype/Symbol.match/builtin-infer-unicode.js", "\\udf06", "", "𝌆", "match", "false", 0, 0, 0, ""},
+	{"builtin-infer-unicode.js#1", "test/built-ins/RegExp/prototype/Symbol.match/builtin-infer-unicode.js", "\\udf06", "u", "𝌆", "match", "false", 0, 0, 0, ""},
 	{"builtin-success-return-val-groups.js#4", "test/built-ins/RegExp/prototype/Symbol.match/builtin-success-return-val-groups.js", "b(.).(.).", "", "abcdefg", "submatch", "bcdef", 0, 0, 0, ""},
 	{"builtin-success-return-val.js#4", "test/built-ins/RegExp/prototype/Symbol.match/builtin-success-return-val.js", "b.", "", "abcd", "submatch", "bc", 0, 0, 0, ""},
 	{"builtin-success-u-return-val-groups.js#4", "test/built-ins/RegExp/prototype/Symbol.match/builtin-success-u-return-val-groups.js", "b(.).(.).", "u", "ab𝌆defg", "submatch", "b𝌆def", 0, 0, 0, ""},

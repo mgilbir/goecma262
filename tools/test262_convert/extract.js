@@ -51,12 +51,33 @@ const harnessSources = new Map(harnessFiles.map((hf) => {
   return [hf, src];
 }));
 
+// originalSource and originalFlags read a regex's [[OriginalSource]] and
+// [[OriginalFlags]], the ones it matches with, through RegExp.prototype's own
+// accessors. regex.flags would read the flag properties instead, which a test
+// may shadow: builtin-infer-unicode.js gives /\udf06/u an own `unicode` of
+// false to show that matching ignores it.
+const protoGetter = (name) => Object.getOwnPropertyDescriptor(RegExp.prototype, name).get;
+const sourceGetter = protoGetter("source");
+const flagGetters = [
+  ["d", "hasIndices"], ["g", "global"], ["i", "ignoreCase"], ["m", "multiline"],
+  ["s", "dotAll"], ["u", "unicode"], ["v", "unicodeSets"], ["y", "sticky"],
+].map(([c, name]) => [c, protoGetter(name)]);
+
+function originalSource(regex) {
+  return sourceGetter.call(regex);
+}
+
+function originalFlags(regex) {
+  return flagGetters.filter(([, get]) => get.call(regex)).map(([c]) => c).join("");
+}
+
 const files = listJSFiles(root);
 const cases = [];
 let filesScanned = 0;
 let filesFailed = 0;
 let assertCount = 0;
 let captured = 0;
+let notRegExp = 0;
 
 for (const file of files) {
   filesScanned++;
@@ -85,7 +106,7 @@ fs.writeFileSync(outPath, JSON.stringify({
 }, null, 2) + "\n");
 
 console.log(
-  `captured ${captured} cases from ${assertCount} assert.sameValue calls (files scanned: ${filesScanned}, failed: ${filesFailed}) -> ${outPath}`
+  `captured ${captured} cases from ${assertCount} assert.sameValue calls (files scanned: ${filesScanned}, failed: ${filesFailed}; calls on non-RegExp receivers skipped: ${notRegExp}) -> ${outPath}`
 );
 
 // coerceLastIndexForJSON converts a JS lastIndex value to an integer suitable
@@ -139,10 +160,18 @@ function runFile(relPath, content, harnessFiles) {
   }
 
   function recordCall(method, regex, input, result, extra = {}) {
+    let pattern, flags;
+    try {
+      pattern = originalSource(regex);
+      flags = originalFlags(regex);
+    } catch {
+      notRegExp++; // test and the String methods are generic
+      return;
+    }
     calls.push({
       method,
-      pattern: regex.source,
-      flags: regex.flags,
+      pattern,
+      flags,
       input: safeToString(input),
       result,
       extra,
