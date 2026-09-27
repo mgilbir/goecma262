@@ -1464,7 +1464,9 @@ var binaryProperties = func() map[string]func(rune) bool {
 	add(table("Unified_Ideograph"), "Unified_Ideograph", "UIdeo")
 	add(func(r rune) bool { return unicode.IsUpper(r) || unicode.Is(unicode.Other_Uppercase, r) }, "Uppercase", "Upper")
 	add(table("Variation_Selector"), "Variation_Selector", "VS")
-	add(table("White_Space"), "White_Space", "space", "WSpace")
+	// ECMA-262's table lists only space as White_Space's alias; Unicode's
+	// WSpace is not a name the spec accepts, although V8 does.
+	add(table("White_Space"), "White_Space", "space")
 	add(ucd("XID_Continue"), "XID_Continue", "XIDC")
 	add(ucd("XID_Start"), "XID_Start", "XIDS")
 	return m

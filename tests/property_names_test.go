@@ -10,7 +10,8 @@ import (
 // ECMA-262 matches Unicode property names and values exactly: a canonical
 // name or an alias from its tables and PropertyValueAliases.txt, with no
 // loose matching of case, spaces, hyphens or underscores, and only the binary
-// properties it lists. Expectations were taken from node (V8, Unicode 17.0).
+// properties it lists. Expectations were taken from node (V8, Unicode 17.0),
+// except WSpace, which V8 accepts and the spec's table does not list.
 func TestPropertyNames_Exact(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -56,7 +57,7 @@ func TestPropertyNames_Exact(t *testing.T) {
 		{`sc=Katakana_Or_Hiragana`, false},
 		{`Script_Extensions=Greek`, true},
 		{`White_Space`, true},
-		{`WSpace`, true},
+		{`WSpace`, false}, // Unicode's alias, not in ECMA-262's table; V8 accepts it
 		{`space`, true},
 		{`whitespace`, false},
 		{`White-Space`, false},

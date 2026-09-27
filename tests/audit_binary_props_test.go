@@ -16,7 +16,7 @@ func TestAudit_BinaryProperties(t *testing.T) {
 		match bool
 	}{
 		{`\p{White_Space}`, " ", true},
-		{`\p{WSpace}`, "\t", true},      // alias
+		{`\p{space}`, "\t", true},       // alias
 		{`\p{Hex_Digit}`, "F", true},    // canonical
 		{`\p{AHex}`, "f", true},         // ASCII_Hex_Digit alias
 		{`\p{Dash}`, "-", true},         // canonical table
