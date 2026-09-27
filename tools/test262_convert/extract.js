@@ -34,6 +34,23 @@ const harnessFiles = fs
   .filter((f) => f.endsWith(".js"))
   .map((f) => path.join(harnessDir, f));
 
+// regExpUtils.js aliases testExtendedCharacterClass with a top-level const,
+// which the instrumentation below could not replace. Make it a var, and stop
+// if the harness no longer has that line, rather than silently capturing
+// nothing from the v-flag suites.
+const harnessSources = new Map(harnessFiles.map((hf) => {
+  let src = fs.readFileSync(hf, "utf8");
+  if (path.basename(hf) === "regExpUtils.js") {
+    const decl = "const testExtendedCharacterClass = testPropertyOfStrings;";
+    if (!src.includes(decl)) {
+      console.error(`${hf}: expected "${decl}"; update tools/test262_convert/extract.js`);
+      process.exit(1);
+    }
+    src = src.replace(decl, decl.replace("const", "var"));
+  }
+  return [hf, src];
+}));
+
 const files = listJSFiles(root);
 const cases = [];
 let filesScanned = 0;
@@ -113,7 +130,7 @@ function runFile(relPath, content, harnessFiles) {
   const ctx = vm.createContext(context);
 
   for (const hf of harnessFiles) {
-    const h = fs.readFileSync(hf, "utf8");
+    const h = harnessSources.get(hf);
     try {
       vm.runInContext(h, ctx, { filename: hf });
     } catch {
@@ -207,6 +224,33 @@ function runFile(relPath, content, harnessFiles) {
         try { return origSameValue(actual, expected); } catch (e) { return undefined; }
       };
     }
+    // The v-flag suites (unicodeSets/generated, and the properties of strings)
+    // check matches with assert(), which records nothing. These replace the
+    // harness helpers with equivalents that make the same checks through
+    // assert.sameValue: the joined strings where the harness accepts those,
+    // and each string only where it falls back to them.
+    // testPropertyEscapes is left alone: its inputs span whole Unicode
+    // ranges, too large to embed in the generated test file.
+    function checkStrings(args) {
+      const re = args.regExp;
+      const all = args.matchStrings.join("");
+      const allMatch = re.test(all);
+      if (allMatch) {
+        globalThis.assert.sameValue(allMatch, true);
+      } else {
+        for (const s of args.matchStrings) globalThis.assert.sameValue(re.test(s), true);
+      }
+      if (!args.nonMatchStrings) return;
+      const none = args.nonMatchStrings.join("");
+      const noneMatch = re.test(none);
+      if (!noneMatch) {
+        globalThis.assert.sameValue(noneMatch, false);
+      } else {
+        for (const s of args.nonMatchStrings) globalThis.assert.sameValue(re.test(s), false);
+      }
+    }
+    globalThis.testPropertyOfStrings = checkStrings;
+    globalThis.testExtendedCharacterClass = checkStrings;
   })();`;
 
   const assert = ctx.assert || {};

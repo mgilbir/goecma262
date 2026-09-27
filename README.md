@@ -246,7 +246,7 @@ go test ./...
 ```
 
 The implementation is tested against the official ECMAScript
-[Test262](https://github.com/tc39/test262) suite: **all 66,136 extracted
+[Test262](https://github.com/tc39/test262) suite: **all 66,346 extracted
 cases pass or are explicitly skipped**. The 14 permanent skips need a real
 JavaScript runtime (e.g. a JS function as replacement argument) or exceed
 compile-time limits; [`tests/test262_skip_test.go`](tests/test262_skip_test.go)

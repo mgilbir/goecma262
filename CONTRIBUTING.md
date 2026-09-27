@@ -57,6 +57,13 @@ go run ./tools/test262_from_json/ \
 This is the only supported pipeline; earlier generator tools that wrote a
 different case-table schema have been removed.
 
+The extractor records the `assert.sameValue` checks a test makes on a
+`RegExp` call. The `v`-flag suites check with `assert()` inside harness
+helpers instead, so the extractor replaces `testPropertyOfStrings` and
+`testExtendedCharacterClass` with equivalents that make the same checks
+through `assert.sameValue`. `testPropertyEscapes` is deliberately not
+replaced: its inputs span whole Unicode ranges, too large to embed.
+
 ## The known-failure skip list
 
 `tests/test262_skip_test.go` is the **canonical record** of which Test262
