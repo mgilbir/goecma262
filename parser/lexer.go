@@ -7,6 +7,8 @@ import (
 )
 
 // TokenType represents the type of a token
+//
+// Deprecated: Parser no longer tokenizes; see Lexer.
 type TokenType int
 
 const (
@@ -38,13 +40,22 @@ const (
 )
 
 // Token represents a lexical token
+//
+// Deprecated: Parser no longer tokenizes; see Lexer.
 type Token struct {
 	Type  TokenType
 	Value string
 	Pos   int
 }
 
-// Lexer tokenizes a regex pattern string
+// Lexer tokenizes a regex pattern string.
+//
+// Deprecated: Parser no longer uses Lexer and Lexer is not maintained. Which
+// characters an escape may name depends on whether it is in a character class
+// and on the grammar parameters, which a context-free tokenizer cannot know;
+// Lexer accepts escapes that are syntax errors (such as \- outside a class in
+// Unicode mode) and rejects valid Annex B ones. It is kept only so existing
+// importers keep compiling.
 type Lexer struct {
 	input   string
 	pos     int
@@ -54,6 +65,8 @@ type Lexer struct {
 }
 
 // NewLexer creates a new lexer for the given input
+//
+// Deprecated: see Lexer.
 func NewLexer(input string, flags Flags) *Lexer {
 	l := &Lexer{input: input, flags: flags}
 	l.readChar()
@@ -76,18 +89,6 @@ func (l *Lexer) peekChar() byte {
 	}
 	return l.input[l.readPos]
 }
-
-// lexerState is a snapshot of the lexer's scanning position, used to backtrack
-// when an Annex B construct turns out not to parse (e.g. a malformed quantifier
-// whose '{' must be re-read as a literal).
-type lexerState struct {
-	pos     int
-	readPos int
-	ch      byte
-}
-
-func (l *Lexer) save() lexerState     { return lexerState{l.pos, l.readPos, l.ch} }
-func (l *Lexer) restore(s lexerState) { l.pos, l.readPos, l.ch = s.pos, s.readPos, s.ch }
 
 // NextToken returns the next token from the input
 func (l *Lexer) NextToken() Token {
@@ -173,17 +174,6 @@ func (l *Lexer) makeQuantifierToken(tt TokenType, ch byte) Token {
 	l.readPos = pos + 1
 	l.ch = ch
 	return Token{Type: tt, Value: string(ch), Pos: pos}
-}
-
-// isGreedy returns whether the quantifier token is greedy (not lazy).
-// For *, +, and {n,m}: greedy if no trailing '?', non-greedy if trailing '?'.
-// For the ? quantifier itself: greedy if value is "?", non-greedy if value is "??".
-func (t Token) isGreedy() bool {
-	if t.Type == TokenQuestion {
-		// "?" is greedy (0-or-1), "??" is non-greedy (0-or-1 lazy)
-		return t.Value == "?"
-	}
-	return !strings.HasSuffix(t.Value, "?")
 }
 
 func (l *Lexer) readNumber() Token {
@@ -485,81 +475,6 @@ func isSyntaxCharacter(ch byte) bool {
 		return true
 	}
 	return false
-}
-
-func decodeEscape(s string) (rune, error) {
-	if len(s) < 2 || s[0] != '\\' {
-		return 0, fmt.Errorf("not an escape sequence: %s", s)
-	}
-
-	ch := s[1]
-	switch ch {
-	case 'f':
-		return '\f', nil
-	case 'n':
-		return '\n', nil
-	case 'r':
-		return '\r', nil
-	case 't':
-		return '\t', nil
-	case 'v':
-		return '\v', nil
-	case 'x':
-		if len(s) != 4 {
-			return 0, fmt.Errorf("invalid hex escape: %s", s)
-		}
-		var val rune
-		for i := 2; i < 4; i++ {
-			val = val*16 + hexValue(s[i])
-		}
-		return val, nil
-	case 'u':
-		if s[2] == '{' {
-			// \u{...}
-			end := strings.IndexByte(s, '}')
-			if end == -1 {
-				return 0, fmt.Errorf("unterminated unicode escape: %s", s)
-			}
-			var val rune
-			for i := 3; i < end; i++ {
-				val = val*16 + hexValue(s[i])
-			}
-			return val, nil
-		}
-		// \uXXXX
-		if len(s) != 6 {
-			return 0, fmt.Errorf("invalid unicode escape: %s", s)
-		}
-		var val rune
-		for i := 2; i < 6; i++ {
-			val = val*16 + hexValue(s[i])
-		}
-		return val, nil
-	case 'c':
-		if len(s) != 3 {
-			return 0, fmt.Errorf("invalid control escape: %s", s)
-		}
-		ctrl := s[2]
-		if ctrl >= 'a' && ctrl <= 'z' {
-			return rune(ctrl - 'a' + 1), nil
-		}
-		if ctrl >= 'A' && ctrl <= 'Z' {
-			return rune(ctrl - 'A' + 1), nil
-		}
-		return 0, fmt.Errorf("invalid control escape: %s", s)
-	case '0', '1', '2', '3', '4', '5', '6', '7':
-		// Octal escape
-		var val rune
-		for i := 1; i < len(s) && i < 4; i++ {
-			if s[i] < '0' || s[i] > '7' {
-				break
-			}
-			val = val*8 + rune(s[i]-'0')
-		}
-		return val, nil
-	default:
-		return rune(ch), nil
-	}
 }
 
 func hexValue(b byte) rune {

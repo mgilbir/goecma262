@@ -24,8 +24,7 @@ static analysis that keeps common patterns linear-time.
 ```mermaid
 flowchart LR
     subgraph Compile["Compile(expr, flags, opts) — once per pattern"]
-        SRC["pattern string"] --> LEX["parser.Lexer<br/>(tokens)"]
-        LEX --> PARSE["parser.Parser<br/>recursive descent<br/>Annex B or strict syntax"]
+        SRC["pattern string"] --> PARSE["parser.Parser<br/>recursive descent over the text<br/>u/v, strict or Annex B grammar"]
         PARSE --> AST["AST (parser.Pattern)"]
         AST --> COMP["compiler.Compile<br/>lookbehind bodies reversed"]
         COMP --> CODE["[]vm.Instruction<br/>+ numGroups + group names"]
@@ -44,7 +43,7 @@ The five packages map onto the pipeline:
 
 | Package | Role | Key entry point |
 |---|---|---|
-| `parser` | Pattern string → AST. Recursive descent; enforces `MaxNestingDepth`. Handles Annex B leniencies when enabled. | `parser.New(...).Parse()` |
+| `parser` | Pattern string → AST. Recursive descent over the pattern text, one function per ECMA-262 production, with the grammar parameters (Unicode mode, UnicodeSets mode, named groups, Annex B) as state — which escapes are valid depends on them and on whether the escape is in a class, so there is no separate tokenizer. Enforces `MaxNestingDepth`. | `parser.New(...).Parse()` |
 | `compiler` | AST → bytecode. Enforces `MaxQuantifierRepeat` and `MaxProgramSize`. Reverses lookbehind bodies (see below). | `compiler.Compile(ast)` |
 | `vm` | Analyses bytecode once (`vm.NewProgram`), then executes it against input: backtracking on an explicit stack, with memoization and a step and memory budget. | `vm.VM.MatchAt` |
 | `flags` | ECMA-262 flag parsing/printing; rejects duplicates and `u`+`v`. | `flags.Parse` |

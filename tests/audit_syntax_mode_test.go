@@ -44,7 +44,7 @@ func TestAudit_AnnexBDefault(t *testing.T) {
 // SyntaxStrict rejects the Annex B constructs as compile errors.
 func TestAudit_StrictModeRejects(t *testing.T) {
 	strict := ecma262.WithSyntax(ecma262.SyntaxStrict)
-	for _, p := range []string{`\5`, `\8`, `a{2 x}`, `\c1`} {
+	for _, p := range []string{`\5`, `\8`, `a{2 x}`, `\c1`, `\u{41}`, `\k<missing>`} {
 		if _, err := ecma262.Compile(p, flags.Flags(0), strict); err == nil {
 			t.Errorf("strict mode should reject %q", p)
 		}

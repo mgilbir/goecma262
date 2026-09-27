@@ -262,9 +262,12 @@ type Flags struct {
 	UnicodeSets bool
 	DotAll      bool
 	Multiline   bool
-	// AnnexB enables the web-compatibility (Annex B) leniencies: legacy octal
-	// escapes, out-of-range numeric backreferences, invalid \c, and malformed
-	// {..} quantifiers are accepted as literals rather than being SyntaxErrors.
-	// It is always false in Unicode mode.
+	// AnnexB selects the web-compatibility grammar of ECMA-262 Annex B
+	// (B.1.2) for patterns that are not in Unicode mode: legacy octal escapes,
+	// out-of-range numeric backreferences, identity escapes of any character
+	// but c (and k when the pattern has named groups), a \ before an invalid
+	// \c as a literal, lone ] { } and malformed {..} quantifiers as literals,
+	// ranges with a class escape as an endpoint, and quantified lookaheads. It
+	// has no effect with Unicode or UnicodeSets.
 	AnnexB bool
 }

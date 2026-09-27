@@ -2,7 +2,7 @@ package parser
 
 import (
 	"fmt"
-	"strconv"
+	"math"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -11,12 +11,27 @@ import (
 // MaxNestingDepth is the maximum allowed nesting depth for the parser
 const MaxNestingDepth = 200
 
-// Parser parses ECMA-262 regular expressions
+// Parser parses ECMA-262 regular expressions.
+//
+// It is a recursive-descent parser over the pattern text that follows the
+// grammar of ECMA-262 §22.2.1 production by production, with the grammar
+// parameters as fields: UnicodeMode (the u or v flag), UnicodeSetsMode (v),
+// NamedCaptureGroups, and — outside Unicode mode, when Flags.AnnexB is set —
+// the web-compatibility grammar of Annex B.1.2 in place of the standard one.
+// Which characters an escape may name depends on where it is (an atom or a
+// class) and on those parameters, so escapes are decoded where they are
+// parsed rather than by a context-free tokenizer.
 type Parser struct {
-	lexer          *Lexer
-	curToken       Token
-	peekToken      Token
-	flags          Flags
+	src   string
+	pos   int
+	flags Flags
+
+	unicodeMode bool // [+UnicodeMode]: u or v
+	setsMode    bool // [+UnicodeSetsMode]: v
+	annexB      bool // the Annex B grammar applies: Flags.AnnexB and not unicodeMode
+	named       bool // [+NamedCaptureGroups]
+
+	sawGroupName   bool // the pattern has a GroupSpecifier (for Annex B's reparse)
 	groupCount     int
 	namedGroups    map[string][]int // name -> all group numbers (ES2022: duplicates allowed across alternatives)
 	backreferences []backrefInfo    // to resolve after parsing
@@ -32,54 +47,50 @@ type backrefInfo struct {
 
 // New creates a new parser for the given pattern and flags
 func New(pattern string, flags Flags) *Parser {
-	l := NewLexer(pattern, flags)
-	p := &Parser{
-		lexer:       l,
-		flags:       flags,
-		namedGroups: make(map[string][]int),
-	}
-	// Read two tokens so curToken and peekToken are set
-	p.nextToken()
-	p.nextToken()
-	return p
+	return &Parser{src: pattern, flags: flags}
 }
 
-func (p *Parser) nextToken() {
-	p.curToken = p.peekToken
-	p.peekToken = p.lexer.NextToken()
-}
-
-// parserState snapshots enough to rewind the parser (both lookahead tokens and
-// the lexer position) so an Annex B construct can be retried as a literal.
-type parserState struct {
-	cur  Token
-	peek Token
-	lex  lexerState
-}
-
-func (p *Parser) save() parserState {
-	return parserState{cur: p.curToken, peek: p.peekToken, lex: p.lexer.save()}
-}
-
-func (p *Parser) restore(s parserState) {
-	p.curToken = s.cur
-	p.peekToken = s.peek
-	p.lexer.restore(s.lex)
-}
-
-// Parse parses the pattern and returns the AST
+// Parse parses the pattern and returns the AST, or the first syntax error
+// (an ECMA-262 SyntaxError: the pattern does not match the grammar, or an
+// early error applies).
 func (p *Parser) Parse() (*Pattern, error) {
+	p.unicodeMode = p.flags.Unicode || p.flags.UnicodeSets
+	p.setsMode = p.flags.UnicodeSets
+	p.annexB = p.flags.AnnexB && !p.unicodeMode
+	if !p.annexB {
+		// ParsePattern (§22.2.3.4): NamedCaptureGroups is always on.
+		return p.parseAs(true)
+	}
+	// Annex B ParsePattern (B.1.2.9): parse with ~NamedCaptureGroups, where
+	// \k is an identity escape; if the pattern has a named group, parse it
+	// again with +NamedCaptureGroups, where \k must name a group.
+	pat, err := p.parseAs(false)
+	if err != nil || !p.sawGroupName {
+		return pat, err
+	}
+	return p.parseAs(true)
+}
+
+func (p *Parser) parseAs(named bool) (*Pattern, error) {
+	p.named = named
+	p.pos = 0
+	p.sawGroupName = false
+	p.groupCount = 0
+	p.namedGroups = make(map[string][]int)
+	p.backreferences = nil
+	p.depth = 0
+
 	body, err := p.parseDisjunction()
 	if err != nil {
 		return nil, err
 	}
+	if p.pos < len(p.src) {
+		// parseDisjunction stops early only at a ')' with no open group.
+		return nil, fmt.Errorf("unmatched ')' at offset %d", p.pos)
+	}
 
 	if err := p.validateNamedGroupAlternatives(body); err != nil {
 		return nil, err
-	}
-
-	if p.curToken.Type != TokenEOF {
-		return nil, fmt.Errorf("unexpected token: %s", p.curToken.Value)
 	}
 
 	// Resolve backreferences
@@ -99,12 +110,12 @@ func (p *Parser) Parse() (*Pattern, error) {
 		}
 		// Numeric backreference to a group that does not exist.
 		if br.index > p.groupCount {
-			if p.flags.AnnexB {
+			if p.annexB {
 				// Web-compat: re-interpret as a legacy octal escape and/or
 				// literal digits (e.g. \5 -> U+0005, \8 -> "8", \58 -> U+0005,"8").
 				br.node.Fallback = legacyOctalRunes(br.digits)
 			} else {
-				return nil, fmt.Errorf("backreference to non-existent group: \\%d", br.index)
+				return nil, fmt.Errorf("backreference to non-existent group: \\%s", br.digits)
 			}
 		}
 	}
@@ -128,77 +139,65 @@ func (p *Parser) leaveNesting() {
 	p.depth--
 }
 
+func (p *Parser) eof() bool { return p.pos >= len(p.src) }
+
+// peek returns the byte at pos+off, or 0 past the end.
+func (p *Parser) peek(off int) byte {
+	if p.pos+off < len(p.src) && p.pos+off >= 0 {
+		return p.src[p.pos+off]
+	}
+	return 0
+}
+
+func (p *Parser) at(prefix string) bool { return strings.HasPrefix(p.src[p.pos:], prefix) }
+
+func (p *Parser) eat(c byte) bool {
+	if p.peek(0) == c && !p.eof() {
+		p.pos++
+		return true
+	}
+	return false
+}
+
+// nextRune decodes and consumes the source character at pos.
+func (p *Parser) nextRune() (rune, error) {
+	r, size := utf8.DecodeRuneInString(p.src[p.pos:])
+	if r == utf8.RuneError && size <= 1 {
+		return 0, fmt.Errorf("invalid utf-8 sequence at offset %d", p.pos)
+	}
+	p.pos += size
+	return r, nil
+}
+
 // parseDisjunction parses alternatives (a|b|c)
 func (p *Parser) parseDisjunction() (Expression, error) {
-	left, err := p.parseSequence()
-	if err != nil {
-		return nil, err
-	}
-
-	if p.curToken.Type != TokenPipe {
-		return left, nil
-	}
-
-	alternatives := []Expression{left}
-
-	for p.curToken.Type == TokenPipe {
-		p.nextToken()
-		alt, err := p.parseSequence()
+	var alternatives []Expression
+	for {
+		alt, err := p.parseAlternative()
 		if err != nil {
 			return nil, err
 		}
 		alternatives = append(alternatives, alt)
+		if !p.eat('|') {
+			break
+		}
 	}
-
+	if len(alternatives) == 1 {
+		return alternatives[0], nil
+	}
 	return &Disjunction{Alternatives: alternatives}, nil
 }
 
-// parseSequence parses a sequence of atoms
-func (p *Parser) parseSequence() (Expression, error) {
+// parseAlternative parses a sequence of terms, up to '|', ')' or the end.
+func (p *Parser) parseAlternative() (Expression, error) {
 	var elements []Expression
-
-	for p.curToken.Type != TokenEOF &&
-		p.curToken.Type != TokenPipe &&
-		p.curToken.Type != TokenRParen {
-		atom, err := p.parseAtom()
+	for !p.eof() && p.peek(0) != '|' && p.peek(0) != ')' {
+		term, err := p.parseTerm()
 		if err != nil {
 			return nil, err
 		}
-
-		// Check for quantifier
-		if p.curToken.Type == TokenStar ||
-			p.curToken.Type == TokenPlus ||
-			p.curToken.Type == TokenQuestion {
-			atom = p.parseQuantifier(atom)
-		} else if p.curToken.Type == TokenLBrace && p.peekToken.Type == TokenDigit {
-			// Snapshot so a malformed quantifier can be rewound in Annex B mode,
-			// where "{" is then a literal (e.g. a{2 x} matches the text "a{2 x}").
-			st := p.save()
-			quant, err := p.parseBracedQuantifier(atom)
-			if err != nil {
-				if !p.flags.AnnexB {
-					return nil, err
-				}
-				// Rewind: leave the base atom in place and re-read "{" as a literal
-				// on the next loop iteration.
-				p.restore(st)
-			} else {
-				// Out-of-order {n,m} (m < n) is an early error in every mode.
-				if quant.Max != -1 && quant.Max < quant.Min {
-					return nil, fmt.Errorf("quantifier range out of order: {%d,%d}", quant.Min, quant.Max)
-				}
-				atom = quant
-				// Check for non-greedy modifier after braced quantifier
-				if p.curToken.Type == TokenQuestion {
-					p.nextToken()
-					quant.Greedy = false
-				}
-			}
-		}
-
-		elements = append(elements, atom)
+		elements = append(elements, term)
 	}
-
 	if len(elements) == 0 {
 		return &Sequence{Elements: []Expression{}}, nil
 	}
@@ -208,480 +207,616 @@ func (p *Parser) parseSequence() (Expression, error) {
 	return &Sequence{Elements: elements}, nil
 }
 
-// parseAtom parses a single atom
-func (p *Parser) parseAtom() (Expression, error) {
-	switch p.curToken.Type {
-	case TokenEOF:
-		return nil, fmt.Errorf("unexpected end of pattern")
-
-	case TokenLiteral:
-		val := p.curToken.Value
-		p.nextToken()
-		// If the value starts with \ and has at least 2 chars, it's an escape
-		// sequence that needs decoding (e.g. \uXXXX, \xHH, \n, etc.).
-		// A single \ means the lexer already decoded it to a literal backslash.
-		if strings.HasPrefix(val, "\\") && len(val) >= 2 {
-			return p.parseEscape(val)
-		}
-		if len(val) == 1 {
-			return &Literal{Char: rune(val[0])}, nil
-		}
-		// Multi-byte rune
-		r, _ := utf8.DecodeRuneInString(val)
-		return &Literal{Char: r}, nil
-
-	case TokenDot:
-		p.nextToken()
-		return &Dot{}, nil
-
-	case TokenLParen:
-		return p.parseGroup()
-
-	case TokenLBracket:
-		return p.parseCharacterClass()
-
-	case TokenCaret:
-		p.nextToken()
-		return &Anchor{Type: StartOfLine}, nil
-
-	case TokenDollar:
-		p.nextToken()
-		return &Anchor{Type: EndOfLine}, nil
-
-	case TokenBackslash:
-		val := p.curToken.Value
-		p.nextToken()
-		return p.parseEscape(val)
-
-	case TokenComma:
-		// Comma is a literal outside of character classes and quantifiers
-		p.nextToken()
-		return &Literal{Char: ','}, nil
-
-	case TokenLBrace:
-		// '{' is a literal when not part of a valid quantifier
-		p.nextToken()
-		return &Literal{Char: '{'}, nil
-
-	case TokenRBrace:
-		// '}' is a literal when not part of a valid quantifier
-		p.nextToken()
-		return &Literal{Char: '}'}, nil
-
-	case TokenHyphen:
-		// Hyphen is a literal outside of character classes
-		p.nextToken()
-		return &Literal{Char: '-'}, nil
-
-	case TokenColon:
-		p.nextToken()
-		return &Literal{Char: ':'}, nil
-
-	case TokenEquals:
-		p.nextToken()
-		return &Literal{Char: '='}, nil
-
-	case TokenLess:
-		p.nextToken()
-		return &Literal{Char: '<'}, nil
-
-	case TokenGreater:
-		p.nextToken()
-		return &Literal{Char: '>'}, nil
-
-	case TokenExclaim:
-		p.nextToken()
-		return &Literal{Char: '!'}, nil
-
-	case TokenDigit:
-		// Digits are literal characters in the pattern body.
-		// The lexer may return multiple contiguous digits as one token (e.g. "12"),
-		// so we consume only the first character and leave the rest for next call.
-		val := p.curToken.Value
-		if len(val) == 0 {
-			return nil, fmt.Errorf("empty digit token")
-		}
-		firstChar := rune(val[0])
-		if len(val) > 1 {
-			// Leave remaining digits as curToken (don't advance the lexer)
-			p.curToken = Token{Type: TokenDigit, Value: val[1:], Pos: p.curToken.Pos + 1}
-		} else {
-			p.nextToken()
-		}
-		return &Literal{Char: firstChar}, nil
-
+// parseTerm parses an assertion, or an atom and its optional quantifier.
+func (p *Parser) parseTerm() (Expression, error) {
+	var atom Expression
+	switch {
+	case p.eat('^'):
+		atom = &Anchor{Type: StartOfLine}
+	case p.eat('$'):
+		atom = &Anchor{Type: EndOfLine}
+	case p.at(`\b`):
+		p.pos += 2
+		atom = &Anchor{Type: WordBoundary}
+	case p.at(`\B`):
+		p.pos += 2
+		atom = &Anchor{Type: NonWordBoundary}
 	default:
-		return nil, fmt.Errorf("unexpected token: %s", p.curToken.Value)
+		var err error
+		if atom, err = p.parseAtom(); err != nil {
+			return nil, err
+		}
 	}
+
+	quantifiable := true
+	switch atom.(type) {
+	case *Anchor, *Lookbehind, *NegativeLookbehind:
+		// Assertions take no quantifier.
+		quantifiable = false
+	case *Lookahead, *NegativeLookahead:
+		// Annex B QuantifiableAssertion: only outside Unicode mode.
+		quantifiable = p.annexB
+	}
+	if !quantifiable {
+		if p.quantifierAt(p.pos) {
+			return nil, fmt.Errorf("nothing to repeat at offset %d: an assertion cannot be quantified", p.pos)
+		}
+		return atom, nil
+	}
+	return p.parseQuantifier(atom)
 }
 
-// parseEscape parses an escape sequence
-func (p *Parser) parseEscape(val string) (Expression, error) {
-	if len(val) < 2 {
-		return nil, fmt.Errorf("invalid escape: %s", val)
+// quantifierAt reports whether a well-formed quantifier prefix starts at i.
+func (p *Parser) quantifierAt(i int) bool {
+	if i >= len(p.src) {
+		return false
 	}
+	switch p.src[i] {
+	case '*', '+', '?':
+		return true
+	case '{':
+		_, _, _, _, ok := p.scanBracedQuantifier(i)
+		return ok
+	}
+	return false
+}
 
-	ch := val[1]
+// scanBracedQuantifier recognises { DecimalDigits } , { DecimalDigits , } or
+// { DecimalDigits , DecimalDigits } at i, returning the digit strings (max is
+// "" for an open upper bound, and equals min for {n}) and the offset after the
+// closing brace.
+func (p *Parser) scanBracedQuantifier(i int) (min, max string, open bool, end int, ok bool) {
+	s := p.src
+	if i >= len(s) || s[i] != '{' {
+		return "", "", false, 0, false
+	}
+	j := i + 1
+	k := j
+	for k < len(s) && isDigit(s[k]) {
+		k++
+	}
+	if k == j {
+		return "", "", false, 0, false
+	}
+	min = s[j:k]
+	if k < len(s) && s[k] == '}' {
+		return min, min, false, k + 1, true
+	}
+	if k >= len(s) || s[k] != ',' {
+		return "", "", false, 0, false
+	}
+	k++
+	j = k
+	for k < len(s) && isDigit(s[k]) {
+		k++
+	}
+	if k >= len(s) || s[k] != '}' {
+		return "", "", false, 0, false
+	}
+	if k == j {
+		return min, "", true, k + 1, true
+	}
+	return min, s[j:k], false, k + 1, true
+}
 
-	switch ch {
-	case 'b':
-		return &Anchor{Type: WordBoundary}, nil
-	case 'B':
-		return &Anchor{Type: NonWordBoundary}, nil
-	case 'd':
-		return &Digit{}, nil
-	case 'D':
-		return &NonDigit{}, nil
-	case 'w':
-		return &WordChar{}, nil
-	case 'W':
-		return &NonWordChar{}, nil
-	case 's':
-		return &Whitespace{}, nil
-	case 'S':
-		return &NonWhitespace{}, nil
-	case 'p', 'P':
-		// Unicode property
-		return p.parseUnicodeProperty(val)
-	case 'k':
-		// Named backreference
-		return p.parseNamedBackreference(val)
+// parseQuantifier parses an optional quantifier after atom.
+func (p *Parser) parseQuantifier(atom Expression) (Expression, error) {
+	q := &Quantifier{Greedy: true, Body: atom}
+	switch p.peek(0) {
+	case '*':
+		p.pos++
+		q.Min, q.Max = 0, -1
+	case '+':
+		p.pos++
+		q.Min, q.Max = 1, -1
+	case '?':
+		p.pos++
+		q.Min, q.Max = 0, 1
+	case '{':
+		min, max, open, end, ok := p.scanBracedQuantifier(p.pos)
+		if !ok {
+			if p.annexB {
+				// ExtendedPatternCharacter: the { is a literal, read as the next atom.
+				return atom, nil
+			}
+			return nil, fmt.Errorf("incomplete quantifier at offset %d", p.pos)
+		}
+		// Out-of-order {n,m} (m < n) is an early error in every mode.
+		if !open && decimalLess(max, min) {
+			return nil, fmt.Errorf("quantifier range out of order: {%s,%s}", min, max)
+		}
+		p.pos = end
+		q.Min = decimalValue(min)
+		q.Max = -1
+		if !open {
+			q.Max = decimalValue(max)
+		}
 	default:
-		if ch >= '1' && ch <= '9' {
-			// Backreference
-			return p.parseBackreference(val)
+		return atom, nil
+	}
+	if p.eat('?') {
+		q.Greedy = false
+	}
+	return q, nil
+}
+
+// decimalValue converts DecimalDigits to an int, saturating at MaxInt32 (the
+// compiler rejects anything above its repeat limit long before that).
+func decimalValue(digits string) int {
+	v := 0
+	for i := 0; i < len(digits); i++ {
+		v = v*10 + int(digits[i]-'0')
+		if v > math.MaxInt32 {
+			return math.MaxInt32
 		}
-		// \u{...} code point escape: only valid in unicode mode in pattern body.
-		if ch == 'u' && len(val) >= 3 && val[2] == '{' {
-			if !(p.flags.Unicode || p.flags.UnicodeSets) {
-				return nil, fmt.Errorf("unicode code point escape requires unicode flag")
-			}
-			if _, err := validateCodePointEscape(val); err != nil {
-				return nil, err
-			}
+	}
+	return v
+}
+
+// decimalLess compares two DecimalDigits strings numerically, exactly (they
+// may be longer than any integer type).
+func decimalLess(a, b string) bool {
+	a = strings.TrimLeft(a, "0")
+	b = strings.TrimLeft(b, "0")
+	if len(a) != len(b) {
+		return len(a) < len(b)
+	}
+	return a < b
+}
+
+// parseAtom parses an Atom (or, under Annex B, an ExtendedAtom).
+func (p *Parser) parseAtom() (Expression, error) {
+	switch c := p.peek(0); c {
+	case '.':
+		p.pos++
+		return &Dot{}, nil
+	case '(':
+		return p.parseGroup()
+	case '[':
+		return p.parseCharacterClass()
+	case '\\':
+		return p.parseAtomEscape()
+	case '*', '+', '?':
+		return nil, fmt.Errorf("nothing to repeat at offset %d", p.pos)
+	case '{':
+		if p.quantifierAt(p.pos) {
+			// Annex B InvalidBracedQuantifier, or a quantifier with no atom.
+			return nil, fmt.Errorf("nothing to repeat at offset %d", p.pos)
 		}
-		// \c not followed by a control letter (A-Za-z). In Annex B this is not a
-		// control escape at all: the backslash and following characters are all
-		// literal (e.g. \c1 matches the three characters "\", "c", "1"). In strict
-		// mode it is a SyntaxError.
-		if ch == 'c' && !(len(val) == 3 && isASCIILetter(val[2])) {
-			if !p.flags.AnnexB {
-				return nil, fmt.Errorf("invalid control escape: %s", val)
-			}
-			seq := make([]Expression, 0, len(val))
-			for _, r := range val {
-				seq = append(seq, &Literal{Char: r})
-			}
-			return &Sequence{Elements: seq}, nil
+		if p.annexB {
+			p.pos++
+			return &Literal{Char: '{'}, nil
 		}
-		// Character escape
-		r, err := decodeEscape(val)
+		return nil, fmt.Errorf("lone quantifier bracket at offset %d", p.pos)
+	case '}', ']':
+		if p.annexB {
+			// ExtendedPatternCharacter.
+			p.pos++
+			return &Literal{Char: rune(c)}, nil
+		}
+		return nil, fmt.Errorf("lone %q at offset %d", c, p.pos)
+	default:
+		// PatternCharacter. ^ $ ) | are handled by the callers.
+		r, err := p.nextRune()
 		if err != nil {
 			return nil, err
 		}
-		// In Unicode mode, combine surrogate pairs: \uD800-\uDBFF followed by \uDC00-\uDFFF
-		if (p.flags.Unicode || p.flags.UnicodeSets) && r >= 0xD800 && r <= 0xDBFF {
-			// r is a high surrogate; check if curToken is a low surrogate \uXXXX
-			next := p.curToken
-			if next.Type == TokenLiteral && strings.HasPrefix(next.Value, "\\u") &&
-				!strings.HasPrefix(next.Value, "\\u{") && len(next.Value) == 6 {
-				low, err2 := decodeEscape(next.Value)
-				if err2 == nil && low >= 0xDC00 && low <= 0xDFFF {
-					// Combine into a single code point
-					combined := 0x10000 + (r-0xD800)*0x400 + (low - 0xDC00)
-					p.nextToken() // consume the low surrogate token
-					return &Literal{Char: combined}, nil
-				}
-			}
-		}
 		return &Literal{Char: r}, nil
 	}
 }
 
-func isASCIILetter(b byte) bool {
-	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
+// parseAtomEscape parses \ AtomEscape (at the backslash).
+func (p *Parser) parseAtomEscape() (Expression, error) {
+	start := p.pos
+	p.pos++ // '\'
+	if p.eof() {
+		return nil, fmt.Errorf(`\ at end of pattern`)
+	}
+	switch c := p.peek(0); c {
+	case '1', '2', '3', '4', '5', '6', '7', '8', '9':
+		// DecimalEscape: a backreference. Whether the group exists is only
+		// known once the whole pattern is parsed; see Parse.
+		j := p.pos
+		for j < len(p.src) && isDigit(p.src[j]) {
+			j++
+		}
+		digits := p.src[p.pos:j]
+		p.pos = j
+		br := &Backreference{Index: decimalValue(digits)}
+		p.backreferences = append(p.backreferences, backrefInfo{index: br.Index, digits: digits, node: br})
+		return br, nil
+	case 'k':
+		if p.named {
+			p.pos++
+			if p.peek(0) != '<' {
+				return nil, fmt.Errorf(`invalid named reference at offset %d: \k must be followed by <name>`, start)
+			}
+			name, err := p.parseGroupName()
+			if err != nil {
+				return nil, err
+			}
+			br := &Backreference{}
+			p.backreferences = append(p.backreferences, backrefInfo{name: name, node: br})
+			return br, nil
+		}
+		// Annex B, ~NamedCaptureGroups: an identity escape.
+		p.pos++
+		return &Literal{Char: 'k'}, nil
+	case 'd':
+		p.pos++
+		return &Digit{}, nil
+	case 'D':
+		p.pos++
+		return &NonDigit{}, nil
+	case 'w':
+		p.pos++
+		return &WordChar{}, nil
+	case 'W':
+		p.pos++
+		return &NonWordChar{}, nil
+	case 's':
+		p.pos++
+		return &Whitespace{}, nil
+	case 'S':
+		p.pos++
+		return &NonWhitespace{}, nil
+	case 'p', 'P':
+		if p.unicodeMode {
+			prop, err := p.parsePropertyExpression()
+			if err != nil {
+				return nil, err
+			}
+			return &UnicodeProperty{Property: prop, Negated: c == 'P'}, nil
+		}
+	}
+	r, err := p.parseCharacterEscape(false)
+	if err != nil {
+		return nil, err
+	}
+	return &Literal{Char: r}, nil
 }
 
-// parseGroup parses a group: (...), (?:...), (?=...), (?!...), (?<=...), (?<!...), (?<name>...)
-func (p *Parser) parseGroup() (Expression, error) {
-	if p.curToken.Type != TokenLParen {
-		return nil, fmt.Errorf("expected (")
+// parseCharacterEscape parses a CharacterEscape (or, in a class, the part of a
+// ClassEscape that denotes one character) after the backslash, which has been
+// consumed, and returns the character.
+//
+// Under Annex B, a \ followed by a c that does not begin a control escape is
+// itself the character: parseCharacterEscape then returns '\' and leaves the c
+// unconsumed, to be read as the next character.
+func (p *Parser) parseCharacterEscape(inClass bool) (rune, error) {
+	escStart := p.pos - 1
+	c := p.peek(0)
+	switch c {
+	case 'f':
+		p.pos++
+		return '\f', nil
+	case 'n':
+		p.pos++
+		return '\n', nil
+	case 'r':
+		p.pos++
+		return '\r', nil
+	case 't':
+		p.pos++
+		return '\t', nil
+	case 'v':
+		p.pos++
+		return '\v', nil
+	case 'c':
+		if l := p.peek(1); isASCIILetter(l) && p.pos+1 < len(p.src) {
+			p.pos += 2
+			return rune(l % 32), nil
+		}
+		if p.annexB {
+			// ClassEscape :: c ClassControlLetter, in a class only.
+			if l := p.peek(1); inClass && p.pos+1 < len(p.src) && (isDigit(l) || l == '_') {
+				p.pos += 2
+				return rune(l % 32), nil
+			}
+			// ExtendedAtom / ClassAtomNoDash :: \ [lookahead = c]
+			return '\\', nil
+		}
+		return 0, fmt.Errorf(`invalid control escape at offset %d: \c must be followed by a letter`, escStart)
+	case '0':
+		if !isDigit(p.peek(1)) || p.pos+1 >= len(p.src) {
+			p.pos++
+			return 0, nil
+		}
+		if p.annexB {
+			return p.parseLegacyOctal(), nil
+		}
+		return 0, fmt.Errorf(`invalid decimal escape at offset %d: \0 followed by a digit`, escStart)
+	case '1', '2', '3', '4', '5', '6', '7', '8', '9':
+		// Reached only in a class, where there are no backreferences.
+		if p.annexB {
+			if c <= '7' {
+				return p.parseLegacyOctal(), nil
+			}
+			p.pos++ // \8 and \9 are identity escapes
+			return rune(c), nil
+		}
+		return 0, fmt.Errorf(`invalid decimal escape in class at offset %d`, escStart)
+	case 'x':
+		if isHexDigit(p.peek(1)) && isHexDigit(p.peek(2)) && p.pos+2 < len(p.src) {
+			v := hexValue(p.src[p.pos+1])<<4 | hexValue(p.src[p.pos+2])
+			p.pos += 3
+			return v, nil
+		}
+		if p.annexB {
+			p.pos++
+			return 'x', nil
+		}
+		return 0, fmt.Errorf(`invalid hex escape at offset %d`, escStart)
+	case 'u':
+		r, ok, err := p.parseRegExpUnicodeEscape(p.unicodeMode)
+		if err != nil {
+			return 0, err
+		}
+		if ok {
+			return r, nil
+		}
+		if p.annexB {
+			p.pos++
+			return 'u', nil
+		}
+		return 0, fmt.Errorf(`invalid unicode escape at offset %d`, escStart)
 	}
 
+	// IdentityEscape.
+	r, err := p.nextRune()
+	if err != nil {
+		return 0, err
+	}
+	switch {
+	case p.unicodeMode:
+		// [+UnicodeMode] SyntaxCharacter or /. (\- in a class is a
+		// ClassEscape, handled by the class parser.)
+		if r < utf8.RuneSelf && (isSyntaxCharacter(byte(r)) || r == '/') {
+			return r, nil
+		}
+	case p.annexB:
+		// SourceCharacterIdentityEscape: anything but c, and k when the
+		// pattern has named groups.
+		if r != 'k' || !p.named {
+			return r, nil
+		}
+	default:
+		// [~UnicodeMode] SourceCharacter but not UnicodeIDContinue.
+		if !isIDContinue(r) {
+			return r, nil
+		}
+	}
+	return 0, fmt.Errorf(`invalid escape \%c at offset %d`, r, escStart)
+}
+
+// parseLegacyOctal parses an Annex B LegacyOctalEscapeSequence at pos (the
+// first digit, 0-7): at most three digits when the first is 0-3, otherwise
+// at most two, so the value stays below 0o400.
+func (p *Parser) parseLegacyOctal() rune {
+	maxDigits := 2
+	if p.src[p.pos] <= '3' {
+		maxDigits = 3
+	}
+	v := rune(0)
+	for n := 0; n < maxDigits && p.pos < len(p.src) && isOctalDigit(p.src[p.pos]); n++ {
+		v = v*8 + rune(p.src[p.pos]-'0')
+		p.pos++
+	}
+	return v
+}
+
+// parseRegExpUnicodeEscape parses RegExpUnicodeEscapeSequence at pos (the u).
+// In Unicode mode that is u{CodePoint} or u Hex4Digits, where a lead surrogate
+// followed by \u and a trail surrogate is one code point; otherwise only
+// u Hex4Digits. ok is false, with nothing consumed, when the text is not such
+// an escape; err reports a malformed u{...} in Unicode mode.
+func (p *Parser) parseRegExpUnicodeEscape(unicodeMode bool) (r rune, ok bool, err error) {
+	escStart := p.pos - 1
+	if unicodeMode && p.peek(1) == '{' {
+		j := p.pos + 2
+		v := rune(0)
+		for j < len(p.src) && isHexDigit(p.src[j]) {
+			if v <= unicode.MaxRune {
+				v = v<<4 | hexValue(p.src[j])
+			}
+			j++
+		}
+		if j == p.pos+2 || j >= len(p.src) || p.src[j] != '}' {
+			return 0, false, fmt.Errorf(`invalid unicode code point escape at offset %d`, escStart)
+		}
+		if v > unicode.MaxRune {
+			return 0, false, fmt.Errorf(`unicode code point escape out of range at offset %d`, escStart)
+		}
+		p.pos = j + 1
+		return v, true, nil
+	}
+	v, ok := p.hex4(p.pos + 1)
+	if !ok {
+		return 0, false, nil
+	}
+	p.pos += 5
+	if unicodeMode && v >= 0xD800 && v <= 0xDBFF && p.at(`\u`) {
+		if lo, ok := p.hex4(p.pos + 2); ok && lo >= 0xDC00 && lo <= 0xDFFF {
+			p.pos += 6
+			return 0x10000 + (v-0xD800)<<10 + (lo - 0xDC00), true, nil
+		}
+	}
+	return v, true, nil
+}
+
+// hex4 decodes four hex digits at i.
+func (p *Parser) hex4(i int) (rune, bool) {
+	if i+4 > len(p.src) {
+		return 0, false
+	}
+	v := rune(0)
+	for k := i; k < i+4; k++ {
+		if !isHexDigit(p.src[k]) {
+			return 0, false
+		}
+		v = v<<4 | hexValue(p.src[k])
+	}
+	return v, true
+}
+
+// parsePropertyExpression parses {UnicodePropertyValueExpression} after \p or
+// \P (at the p) and returns the expression. Whether it names a property is
+// checked by the compiler.
+func (p *Parser) parsePropertyExpression() (string, error) {
+	escStart := p.pos - 1
+	p.pos++ // p or P
+	if !p.eat('{') {
+		return "", fmt.Errorf(`invalid property escape at offset %d: expected {`, escStart)
+	}
+	end := strings.IndexByte(p.src[p.pos:], '}')
+	if end < 0 {
+		return "", fmt.Errorf(`unterminated property escape at offset %d`, escStart)
+	}
+	expr := p.src[p.pos : p.pos+end]
+	// UnicodePropertyName :: [A-Za-z_]+; UnicodePropertyValue :: [A-Za-z0-9_]+.
+	name, value, hasValue := strings.Cut(expr, "=")
+	valid := func(s string, digits bool) bool {
+		if s == "" {
+			return false
+		}
+		for i := 0; i < len(s); i++ {
+			if ok := isASCIILetter(s[i]) || s[i] == '_' || digits && isDigit(s[i]); !ok {
+				return false
+			}
+		}
+		return true
+	}
+	if ok := hasValue && valid(name, false) && valid(value, true) || !hasValue && valid(name, true); !ok {
+		return "", fmt.Errorf(`invalid property escape at offset %d: \p{%s}`, escStart, expr)
+	}
+	p.pos += end + 1
+	return expr, nil
+}
+
+// parseGroup parses a group: (...), (?:...), (?=...), (?!...), (?<=...),
+// (?<!...) or (?<name>...), at the opening parenthesis.
+func (p *Parser) parseGroup() (Expression, error) {
+	start := p.pos
 	if err := p.enterNesting(); err != nil {
 		return nil, err
 	}
 	defer p.leaveNesting()
+	p.pos++ // '('
 
-	p.nextToken()
-
-	// Check for special group types
-	if p.curToken.Type == TokenQuestion {
-		p.nextToken()
-		return p.parseSpecialGroup()
+	// build wraps the parsed body, then consumes the closing parenthesis.
+	body := func(build func(Expression) Expression) (Expression, error) {
+		b, err := p.parseDisjunction()
+		if err != nil {
+			return nil, err
+		}
+		if !p.eat(')') {
+			return nil, fmt.Errorf("unterminated group at offset %d", start)
+		}
+		return build(b), nil
 	}
 
-	// Regular capturing group. The index is fixed at the opening paren, before
-	// the body (which may contain further, higher-numbered groups) is parsed.
-	p.groupCount++
-	idx := p.groupCount
-
-	body, err := p.parseDisjunction()
-	if err != nil {
-		return nil, err
+	if !p.eat('?') {
+		// Capturing group. The index is fixed at the opening paren, before
+		// the body (which may contain further, higher-numbered groups).
+		p.groupCount++
+		idx := p.groupCount
+		return body(func(b Expression) Expression { return &Group{Index: idx, Body: b} })
 	}
-
-	if p.curToken.Type != TokenRParen {
-		return nil, fmt.Errorf("expected )")
+	switch {
+	case p.eat(':'):
+		return body(func(b Expression) Expression { return &NonCapturingGroup{Body: b} })
+	case p.eat('='):
+		return body(func(b Expression) Expression { return &Lookahead{Body: b} })
+	case p.eat('!'):
+		return body(func(b Expression) Expression { return &NegativeLookahead{Body: b} })
+	case p.at("<="):
+		p.pos += 2
+		return body(func(b Expression) Expression { return &Lookbehind{Body: b} })
+	case p.at("<!"):
+		p.pos += 2
+		return body(func(b Expression) Expression { return &NegativeLookbehind{Body: b} })
+	case p.peek(0) == '<':
+		name, err := p.parseGroupName()
+		if err != nil {
+			return nil, err
+		}
+		p.sawGroupName = true
+		p.groupCount++
+		idx := p.groupCount
+		// ES2022: allow duplicate named groups across alternatives; track all indices
+		p.namedGroups[name] = append(p.namedGroups[name], idx)
+		return body(func(b Expression) Expression { return &NamedGroup{Index: idx, Name: name, Body: b} })
 	}
-	p.nextToken()
-
-	return &Group{Index: idx, Body: body}, nil
+	return nil, fmt.Errorf("invalid group at offset %d", start)
 }
 
-// parseSpecialGroup parses special group types after (?
-func (p *Parser) parseSpecialGroup() (Expression, error) {
-	switch p.curToken.Type {
-	case TokenColon:
-		// Non-capturing group (?:...)
-		p.nextToken()
-		body, err := p.parseDisjunction()
-		if err != nil {
-			return nil, err
-		}
-		if p.curToken.Type != TokenRParen {
-			return nil, fmt.Errorf("expected )")
-		}
-		p.nextToken()
-		return &NonCapturingGroup{Body: body}, nil
-
-	case TokenEquals:
-		// Positive lookahead (?=...)
-		p.nextToken()
-		body, err := p.parseDisjunction()
-		if err != nil {
-			return nil, err
-		}
-		if p.curToken.Type != TokenRParen {
-			return nil, fmt.Errorf("expected )")
-		}
-		p.nextToken()
-		return &Lookahead{Body: body}, nil
-
-	case TokenExclaim:
-		// Negative lookahead (?!...)
-		p.nextToken()
-		body, err := p.parseDisjunction()
-		if err != nil {
-			return nil, err
-		}
-		if p.curToken.Type != TokenRParen {
-			return nil, fmt.Errorf("expected )")
-		}
-		p.nextToken()
-		return &NegativeLookahead{Body: body}, nil
-
-	case TokenLess:
-		// Could be lookbehind or named group
-		p.nextToken()
-		return p.parseLookbehindOrNamedGroup()
-
-	default:
-		return nil, fmt.Errorf("unknown group type: %s", p.curToken.Value)
-	}
-}
-
-// parseLookbehindOrNamedGroup parses (?<=...), (?<!...), or (?<name>...)
-func (p *Parser) parseLookbehindOrNamedGroup() (Expression, error) {
-	if p.curToken.Type == TokenEquals {
-		// Positive lookbehind (?<=...)
-		p.nextToken()
-		body, err := p.parseDisjunction()
-		if err != nil {
-			return nil, err
-		}
-		if p.curToken.Type != TokenRParen {
-			return nil, fmt.Errorf("expected )")
-		}
-		p.nextToken()
-		return &Lookbehind{Body: body}, nil
-	}
-
-	if p.curToken.Type == TokenExclaim {
-		// Negative lookbehind (?<!...)
-		p.nextToken()
-		body, err := p.parseDisjunction()
-		if err != nil {
-			return nil, err
-		}
-		if p.curToken.Type != TokenRParen {
-			return nil, fmt.Errorf("expected )")
-		}
-		p.nextToken()
-		return &NegativeLookbehind{Body: body}, nil
-	}
-
-	// Named group (?<name>...)
-	return p.parseNamedGroup()
-}
-
-// parseNamedGroup parses (?<name>...)
-func (p *Parser) parseNamedGroup() (Expression, error) {
-	// Parse the name
-	name, err := p.parseGroupName()
-	if err != nil {
-		return nil, err
-	}
-
-	if p.curToken.Type != TokenGreater {
-		return nil, fmt.Errorf("expected > after group name")
-	}
-	p.nextToken() // consume >
-
-	p.groupCount++
-	idx := p.groupCount
-	// ES2022: allow duplicate named groups across alternatives; track all indices
-	p.namedGroups[name] = append(p.namedGroups[name], idx)
-
-	body, err := p.parseDisjunction()
-	if err != nil {
-		return nil, err
-	}
-
-	if p.curToken.Type != TokenRParen {
-		return nil, fmt.Errorf("expected )")
-	}
-	p.nextToken()
-
-	return &NamedGroup{Index: idx, Name: name, Body: body}, nil
-}
-
-// parseGroupName parses a group name identifier.
-// ECMA-262 allows Unicode identifier names in group names, including:
-//   - Direct Unicode characters (including astral-plane chars as UTF-8)
-//   - \uXXXX and \u{XXXX} escape sequences
-//   - Surrogate pairs \uD800-\uDBFF followed by \uDC00-\uDFFF
-//   - $ (TokenDollar) as identifier start
-//   - Digits (TokenDigit) as identifier continuation
+// parseGroupName parses < RegExpIdentifierName > at the <.
 func (p *Parser) parseGroupName() (string, error) {
+	start := p.pos
+	p.pos++ // '<'
 	var sb strings.Builder
-	unicodeMode := p.flags.Unicode || p.flags.UnicodeSets
-
-	// readGroupNameRune tries to decode one identifier rune from the current token.
-	// Returns (rune, decoded, ok) where decoded=true means a rune was consumed.
-	readGroupNameRune := func() (rune, bool) {
-		tok := p.curToken
-		switch tok.Type {
-		case TokenDollar:
-			p.nextToken()
-			return '$', true
-		case TokenLiteral:
-			// Could be a direct char, a \uXXXX escape, or a \u{...} escape.
-			val := tok.Value
-			if strings.HasPrefix(val, "\\u") {
-				// Decode to rune
-				r, err := decodeEscape(val)
-				if err != nil {
-					return 0, false
-				}
-				p.nextToken()
-				// Handle surrogate pairs: if this is a high surrogate, look ahead
-				// for a matching low surrogate (\uDC00-\uDFFF).
-				if r >= 0xD800 && r <= 0xDBFF {
-					next := p.curToken
-					if next.Type == TokenLiteral && strings.HasPrefix(next.Value, "\\u") &&
-						!strings.HasPrefix(next.Value, "\\u{") {
-						low, err2 := decodeEscape(next.Value)
-						if err2 == nil && low >= 0xDC00 && low <= 0xDFFF {
-							combined := 0x10000 + (r-0xD800)*0x400 + (low - 0xDC00)
-							p.nextToken()
-							return combined, true
-						}
-					}
-				}
-				return r, true
-			}
-			// Direct character (possibly multi-byte astral).
-			r, size := utf8.DecodeRuneInString(val)
-			if r == utf8.RuneError && size == 1 {
-				return 0, false
-			}
-			p.nextToken()
-			return r, true
-		default:
-			return 0, false
-		}
-	}
-
-	// First character must be identifier start.
-	// Special-case: $ is a valid identifier start.
-	var firstRune rune
-	var ok bool
-	switch p.curToken.Type {
-	case TokenDollar:
-		firstRune = '$'
-		p.nextToken()
-		ok = true
-	case TokenLiteral:
-		firstRune, ok = readGroupNameRune()
-	default:
-		return "", fmt.Errorf("expected group name")
-	}
-	if !ok {
-		return "", fmt.Errorf("invalid group name start")
-	}
-	if !isIdentifierStartRune(firstRune, unicodeMode) {
-		return "", fmt.Errorf("invalid group name start: %c", firstRune)
-	}
-	sb.WriteRune(firstRune)
-
-	// Rest must be identifier part characters.
 	for {
-		tok := p.curToken
-		switch tok.Type {
-		case TokenLiteral:
-			r, decoded := readGroupNameRune()
-			if !decoded {
-				return "", fmt.Errorf("invalid group name continuation")
-			}
-			if !isIdentifierPartRune(r, unicodeMode) {
-				return "", fmt.Errorf("invalid group name continuation: %c", r)
-			}
-			sb.WriteRune(r)
-		case TokenDigit:
-			// Digits are valid identifier continuation characters.
-			val := tok.Value
-			p.nextToken()
-			for _, d := range val {
-				sb.WriteRune(d)
-			}
-		case TokenDollar:
-			// $ is also valid as a continuation.
-			sb.WriteRune('$')
-			p.nextToken()
-		default:
-			return sb.String(), nil
+		if p.eof() {
+			return "", fmt.Errorf("unterminated group name at offset %d", start)
 		}
+		if p.eat('>') {
+			break
+		}
+		var r rune
+		if p.eat('\\') {
+			// \ RegExpUnicodeEscapeSequence[+UnicodeMode], in every mode.
+			if p.peek(0) != 'u' {
+				return "", fmt.Errorf("invalid escape in group name at offset %d", p.pos-1)
+			}
+			v, ok, err := p.parseRegExpUnicodeEscape(true)
+			if err != nil {
+				return "", err
+			}
+			if !ok {
+				return "", fmt.Errorf("invalid escape in group name at offset %d", p.pos-1)
+			}
+			r = v
+		} else {
+			v, err := p.nextRune()
+			if err != nil {
+				return "", err
+			}
+			r = v
+		}
+		if sb.Len() == 0 && !isIdentifierStartRune(r) || sb.Len() > 0 && !isIdentifierPartRune(r) {
+			return "", fmt.Errorf("invalid character %q in group name at offset %d", r, start)
+		}
+		sb.WriteRune(r)
 	}
+	if sb.Len() == 0 {
+		return "", fmt.Errorf("empty group name at offset %d", start)
+	}
+	return sb.String(), nil
 }
 
-func isIdentifierStartRune(r rune, unicodeMode bool) bool {
-	if r == '$' || r == '_' {
-		return true
-	}
-	return unicode.IsLetter(r) || unicode.In(r, unicode.Nl)
+// isIdentifierStartRune reports whether r is an IdentifierStartChar:
+// UnicodeIDStart, $ or _.
+func isIdentifierStartRune(r rune) bool {
+	return r == '$' || r == '_' || isIDStart(r)
 }
 
-func isIdentifierPartRune(r rune, unicodeMode bool) bool {
-	if isIdentifierStartRune(r, unicodeMode) {
-		return true
-	}
-	// U+200C (ZWNJ) and U+200D (ZWJ) are valid identifier continuation
-	// characters per ECMA-262 §12.7.1 (Other_ID_Continue).
-	if r == 0x200C || r == 0x200D {
-		return true
-	}
-	return unicode.IsDigit(r) || unicode.In(r, unicode.Mn, unicode.Mc, unicode.Nd, unicode.Pc)
+// isIdentifierPartRune reports whether r is an IdentifierPartChar:
+// UnicodeIDContinue, $, ZWNJ or ZWJ.
+func isIdentifierPartRune(r rune) bool {
+	return r == '$' || r == 0x200C || r == 0x200D || isIDContinue(r)
+}
+
+// isIDStart reports whether r has the Unicode ID_Start property.
+func isIDStart(r rune) bool {
+	return (unicode.IsLetter(r) || unicode.In(r, unicode.Nl, unicode.Other_ID_Start)) &&
+		!unicode.In(r, unicode.Pattern_Syntax, unicode.Pattern_White_Space)
+}
+
+// isIDContinue reports whether r has the Unicode ID_Continue property.
+func isIDContinue(r rune) bool {
+	return isIDStart(r) ||
+		unicode.In(r, unicode.Mn, unicode.Mc, unicode.Nd, unicode.Pc, unicode.Other_ID_Continue) &&
+			!unicode.In(r, unicode.Pattern_Syntax, unicode.Pattern_White_Space)
 }
 
 type nameSet map[string]struct{}
@@ -761,302 +896,230 @@ func (p *Parser) pathNames(node Expression) (nameSet, error) {
 	}
 }
 
-// parseCharacterClass parses [...] or [^...]
+// parseCharacterClass parses [...] or [^...] at the opening bracket.
 func (p *Parser) parseCharacterClass() (Expression, error) {
-	if p.curToken.Type != TokenLBracket {
-		return nil, fmt.Errorf("expected [")
-	}
-	p.nextToken()
-
-	negated := false
-	if p.curToken.Type == TokenCaret {
-		negated = true
-		p.nextToken()
+	start := p.pos
+	p.pos++ // '['
+	negated := p.eat('^')
+	if p.setsMode {
+		return p.parseClassSetExpression(start, negated)
 	}
 
+	// NonemptyClassRanges: a ClassAtom followed by - and another ClassAtom is
+	// a range, unless the - is the last character of the class.
 	var atoms []ClassAtom
-
-	// Use TokenRBracket (not TokenRBrace) to terminate character classes
-	for p.curToken.Type != TokenRBracket && p.curToken.Type != TokenEOF {
-		// Multi-digit tokens inside character classes must be split into
-		// individual digit literals because the lexer reads contiguous digits
-		// as a single TokenDigit (e.g. [1234567] → TokenDigit "1234567").
-		// We expand them here so each character becomes its own atom.
-		if p.curToken.Type == TokenDigit && len(p.curToken.Value) > 1 {
-			digits := []rune(p.curToken.Value)
-			// Consume the token and inject individual single-char digit tokens
-			// by re-processing each rune. We do this by temporarily replacing
-			// the token with single-char versions and advancing manually.
-			p.nextToken() // consume the multi-digit token
-			for _, d := range digits {
-				atoms = append(atoms, &ClassLiteral{Char: d})
-			}
+	for {
+		if p.eof() {
+			return nil, fmt.Errorf("unterminated character class at offset %d", start)
+		}
+		if p.eat(']') {
+			break
+		}
+		first, err := p.parseClassAtom()
+		if err != nil {
+			return nil, err
+		}
+		if p.peek(0) != '-' || p.pos+1 >= len(p.src) || p.peek(1) == ']' {
+			atoms = append(atoms, first)
 			continue
 		}
-		if p.curToken.Type == TokenHyphen && len(atoms) > 0 {
-			// Check if this is a range
-			prevLiteral, ok := atoms[len(atoms)-1].(*ClassLiteral)
-			p.nextToken()
-			if p.curToken.Type == TokenRBracket {
-				// Trailing hyphen is literal
-				atoms = append(atoms, &ClassLiteral{Char: '-'})
-				break
-			}
-
-			endAtom, err := p.parseClassAtom()
-			if err != nil {
-				return nil, err
-			}
-
-			endLiteral, okEnd := endAtom.(*ClassLiteral)
-			if ok && okEnd {
-				// A range whose start code point exceeds its end is a
-				// SyntaxError (ECMA-262 CharacterRange), e.g. [z-a].
-				if prevLiteral.Char > endLiteral.Char {
-					return nil, fmt.Errorf("range out of order in character class: %c-%c", prevLiteral.Char, endLiteral.Char)
-				}
-				// Replace previous literal with range
-				atoms[len(atoms)-1] = &ClassRange{Start: prevLiteral.Char, End: endLiteral.Char}
-			} else {
-				// Treat hyphen as literal and keep both atoms
-				atoms = append(atoms, &ClassLiteral{Char: '-'})
-				atoms = append(atoms, endAtom)
-			}
-		} else {
-			atom, err := p.parseClassAtom()
-			if err != nil {
-				return nil, err
-			}
-			atoms = append(atoms, atom)
+		p.pos++ // '-'
+		last, err := p.parseClassAtom()
+		if err != nil {
+			return nil, err
 		}
+		lo, ok1 := first.(*ClassLiteral)
+		hi, ok2 := last.(*ClassLiteral)
+		if !ok1 || !ok2 {
+			if !p.annexB {
+				return nil, fmt.Errorf("invalid character class at offset %d: a class escape cannot be a range endpoint", start)
+			}
+			// Annex B CharacterRangeOrUnion: the union of both and '-'.
+			atoms = append(atoms, first, &ClassLiteral{Char: '-'}, last)
+			continue
+		}
+		// A range whose start code point exceeds its end is a SyntaxError
+		// (ECMA-262 CharacterRange), e.g. [z-a].
+		if lo.Char > hi.Char {
+			return nil, fmt.Errorf("range out of order in character class: %c-%c", lo.Char, hi.Char)
+		}
+		atoms = append(atoms, &ClassRange{Start: lo.Char, End: hi.Char})
 	}
-
-	if p.curToken.Type != TokenRBracket {
-		return nil, fmt.Errorf("unterminated character class")
-	}
-	p.nextToken()
-
 	return &CharacterClass{Negated: negated, Atoms: atoms}, nil
 }
 
-// parseClassAtom parses a single character or escape within a character class
+// parseClassAtom parses a ClassAtom (not in UnicodeSets mode).
 func (p *Parser) parseClassAtom() (ClassAtom, error) {
-	switch p.curToken.Type {
-	case TokenLiteral:
-		val := p.curToken.Value
-		p.nextToken()
-		if strings.HasPrefix(val, "\\") {
-			if len(val) >= 3 && val[1] == 'u' && val[2] == '{' {
-				if _, err := validateCodePointEscape(val); err != nil {
-					return nil, err
-				}
-			}
-			r, err := decodeEscape(val)
-			if err != nil {
-				return nil, err
-			}
-			return &ClassLiteral{Char: r}, nil
-		}
-		if len(val) == 1 {
-			return &ClassLiteral{Char: rune(val[0])}, nil
-		}
-		r, _ := utf8.DecodeRuneInString(val)
-		return &ClassLiteral{Char: r}, nil
-
-	case TokenBackslash:
-		val := p.curToken.Value
-		p.nextToken()
-		return p.parseClassEscape(val)
-
-	case TokenRBrace:
-		// '}' inside a character class is a literal
-		p.nextToken()
-		return &ClassLiteral{Char: '}'}, nil
-
-	case TokenLBrace:
-		// '{' inside a character class is a literal
-		p.nextToken()
-		return &ClassLiteral{Char: '{'}, nil
-
-	case TokenDot:
-		// '.' inside a character class is a literal
-		p.nextToken()
-		return &ClassLiteral{Char: '.'}, nil
-
-	case TokenStar:
-		p.nextToken()
-		return &ClassLiteral{Char: '*'}, nil
-
-	case TokenPlus:
-		p.nextToken()
-		return &ClassLiteral{Char: '+'}, nil
-
-	case TokenQuestion:
-		p.nextToken()
-		return &ClassLiteral{Char: '?'}, nil
-
-	case TokenCaret:
-		p.nextToken()
-		return &ClassLiteral{Char: '^'}, nil
-
-	case TokenDollar:
-		p.nextToken()
-		return &ClassLiteral{Char: '$'}, nil
-
-	case TokenPipe:
-		p.nextToken()
-		return &ClassLiteral{Char: '|'}, nil
-
-	case TokenLParen:
-		p.nextToken()
-		return &ClassLiteral{Char: '('}, nil
-
-	case TokenRParen:
-		p.nextToken()
-		return &ClassLiteral{Char: ')'}, nil
-
-	case TokenComma:
-		p.nextToken()
-		return &ClassLiteral{Char: ','}, nil
-
-	case TokenDigit:
-		val := p.curToken.Value
-		p.nextToken()
-		if len(val) == 1 {
-			return &ClassLiteral{Char: rune(val[0])}, nil
-		}
-		// Multi-digit number in char class — take first digit as literal
-		r, _ := utf8.DecodeRuneInString(val)
-		return &ClassLiteral{Char: r}, nil
-
-	case TokenHyphen:
-		p.nextToken()
-		return &ClassLiteral{Char: '-'}, nil
-
-	case TokenColon:
-		p.nextToken()
-		return &ClassLiteral{Char: ':'}, nil
-
-	case TokenEquals:
-		p.nextToken()
-		return &ClassLiteral{Char: '='}, nil
-
-	case TokenLess:
-		p.nextToken()
-		return &ClassLiteral{Char: '<'}, nil
-
-	case TokenGreater:
-		p.nextToken()
-		return &ClassLiteral{Char: '>'}, nil
-
-	case TokenExclaim:
-		p.nextToken()
-		return &ClassLiteral{Char: '!'}, nil
-
-	default:
-		return nil, fmt.Errorf("unexpected token in character class: %s (type %d)", p.curToken.Value, p.curToken.Type)
-	}
-}
-
-// parseClassEscape parses escape sequences within character classes
-func (p *Parser) parseClassEscape(val string) (ClassAtom, error) {
-	if len(val) < 2 {
-		return nil, fmt.Errorf("invalid escape")
-	}
-
-	ch := val[1]
-
-	switch ch {
-	case 'b':
-		// In character class, \b is backspace
-		return &ClassLiteral{Char: '\b'}, nil
-	case 'd', 'D', 'w', 'W', 's', 'S':
-		// Character class escapes
-		neg := ch == 'D' || ch == 'W' || ch == 'S'
-		switch ch {
-		case 'd', 'D':
-			return &ClassEscape{Kind: ClassEscapeDigit, Negated: neg}, nil
-		case 'w', 'W':
-			return &ClassEscape{Kind: ClassEscapeWord, Negated: neg}, nil
-		case 's', 'S':
-			return &ClassEscape{Kind: ClassEscapeSpace, Negated: neg}, nil
-		}
-		return nil, fmt.Errorf("invalid class escape: %s", val)
-	case 'p', 'P':
-		// Unicode property
-		start := strings.IndexByte(val, '{')
-		end := strings.IndexByte(val, '}')
-		if start == -1 || end == -1 {
-			return nil, fmt.Errorf("invalid unicode property escape: %s", val)
-		}
-		prop := val[start+1 : end]
-		neg := ch == 'P'
-		return &ClassEscape{Kind: ClassEscapeUnicodeProperty, Property: prop, Negated: neg}, nil
-	default:
-		if ch == 'u' && len(val) >= 3 && val[2] == '{' {
-			if _, err := validateCodePointEscape(val); err != nil {
-				return nil, err
-			}
-		}
-		r, err := decodeEscape(val)
+	if !p.eat('\\') {
+		r, err := p.nextRune()
 		if err != nil {
 			return nil, err
 		}
 		return &ClassLiteral{Char: r}, nil
 	}
-}
-
-// validateCodePointEscape checks that a \u{...} escape is non-empty and denotes
-// a code point in [0, 0x10FFFF]; ECMA-262 makes an empty or out-of-range escape
-// a SyntaxError. It returns the decoded rune on success.
-func validateCodePointEscape(val string) (rune, error) {
-	open := strings.IndexByte(val, '{')
-	end := strings.IndexByte(val, '}')
-	if open == -1 || end == -1 || end < open {
-		return 0, fmt.Errorf("invalid unicode code point escape: %s", val)
+	if p.eof() {
+		return nil, fmt.Errorf(`\ at end of pattern`)
 	}
-	hex := val[open+1 : end]
-	if len(hex) == 0 {
-		return 0, fmt.Errorf("empty unicode code point escape")
+	switch c := p.peek(0); c {
+	case 'b':
+		p.pos++
+		return &ClassLiteral{Char: '\b'}, nil
+	case '-':
+		if p.unicodeMode {
+			p.pos++
+			return &ClassLiteral{Char: '-'}, nil
+		}
+	case 'd', 'D', 'w', 'W', 's', 'S':
+		p.pos++
+		return classEscapeAtom(c), nil
+	case 'p', 'P':
+		if p.unicodeMode {
+			prop, err := p.parsePropertyExpression()
+			if err != nil {
+				return nil, err
+			}
+			return &ClassEscape{Kind: ClassEscapeUnicodeProperty, Property: prop, Negated: c == 'P'}, nil
+		}
 	}
-	cp, err := strconv.ParseInt(hex, 16, 64)
-	if err != nil || cp > 0x10FFFF {
-		return 0, fmt.Errorf("unicode code point escape out of range: %s", val)
-	}
-	return rune(cp), nil
-}
-
-// parseUnicodeProperty parses \p{...} or \P{...}
-func (p *Parser) parseUnicodeProperty(val string) (Expression, error) {
-	// Extract property name from \p{name} or \P{name}
-	start := strings.IndexByte(val, '{')
-	end := strings.IndexByte(val, '}')
-	if start == -1 || end == -1 {
-		return nil, fmt.Errorf("invalid unicode property escape: %s", val)
-	}
-
-	prop := val[start+1 : end]
-	negated := val[1] == 'P'
-
-	return &UnicodeProperty{Property: prop, Negated: negated}, nil
-}
-
-// parseBackreference parses \n backreferences
-func (p *Parser) parseBackreference(val string) (Expression, error) {
-	numStr := val[1:]
-	num, err := strconv.Atoi(numStr)
+	r, err := p.parseCharacterEscape(true)
 	if err != nil {
-		return nil, fmt.Errorf("invalid backreference: %s", val)
+		return nil, err
 	}
+	return &ClassLiteral{Char: r}, nil
+}
 
-	br := &Backreference{Index: num}
-	p.backreferences = append(p.backreferences, backrefInfo{
-		index:  num,
-		digits: numStr,
-		node:   br,
-	})
+func classEscapeAtom(c byte) ClassAtom {
+	neg := c == 'D' || c == 'W' || c == 'S'
+	switch c {
+	case 'd', 'D':
+		return &ClassEscape{Kind: ClassEscapeDigit, Negated: neg}
+	case 'w', 'W':
+		return &ClassEscape{Kind: ClassEscapeWord, Negated: neg}
+	default:
+		return &ClassEscape{Kind: ClassEscapeSpace, Negated: neg}
+	}
+}
 
-	return br, nil
+// parseClassSetExpression parses the contents of a class in UnicodeSets mode
+// (ClassSetExpression), after [ or [^.
+//
+// Only a ClassUnion of characters, ranges and class escapes is supported:
+// nested classes, the set operations && and --, and \q{...} string literals
+// are rejected as unsupported rather than read with u-mode meaning, which
+// differs. The rest of the v-mode class syntax is enforced: the characters
+// ( ) [ ] { } / - \ | must be escaped, a doubled punctuator such as !! is
+// reserved, and \ may also escape & - ! # % , : ; < = > @ ` ~.
+func (p *Parser) parseClassSetExpression(start int, negated bool) (Expression, error) {
+	var atoms []ClassAtom
+	for {
+		if p.eof() {
+			return nil, fmt.Errorf("unterminated character class at offset %d", start)
+		}
+		if p.eat(']') {
+			break
+		}
+		if p.at("&&") || p.at("--") {
+			return nil, fmt.Errorf("unsupported v-mode class syntax at offset %d: set operations (&& and --) are not implemented", p.pos)
+		}
+		first, err := p.parseClassSetOperand()
+		if err != nil {
+			return nil, err
+		}
+		if p.at("&&") || p.at("--") {
+			return nil, fmt.Errorf("unsupported v-mode class syntax at offset %d: set operations (&& and --) are not implemented", p.pos)
+		}
+		if p.peek(0) != '-' || p.eof() {
+			atoms = append(atoms, first)
+			continue
+		}
+		// ClassSetRange :: ClassSetCharacter - ClassSetCharacter
+		p.pos++
+		last, err := p.parseClassSetOperand()
+		if err != nil {
+			return nil, err
+		}
+		lo, ok1 := first.(*ClassLiteral)
+		hi, ok2 := last.(*ClassLiteral)
+		if !ok1 || !ok2 {
+			return nil, fmt.Errorf("invalid character class at offset %d: a class escape cannot be a range endpoint", start)
+		}
+		if lo.Char > hi.Char {
+			return nil, fmt.Errorf("range out of order in character class: %c-%c", lo.Char, hi.Char)
+		}
+		atoms = append(atoms, &ClassRange{Start: lo.Char, End: hi.Char})
+	}
+	return &CharacterClass{Negated: negated, Atoms: atoms}, nil
+}
+
+// parseClassSetOperand parses a ClassSetCharacter or a CharacterClassEscape
+// in UnicodeSets mode.
+func (p *Parser) parseClassSetOperand() (ClassAtom, error) {
+	c := p.peek(0)
+	if c != '\\' {
+		if c == '[' {
+			return nil, fmt.Errorf("unsupported v-mode class syntax at offset %d: nested classes are not implemented", p.pos)
+		}
+		if isClassSetSyntaxCharacter(c) {
+			return nil, fmt.Errorf("invalid character %q in character class at offset %d: it must be escaped with the v flag", c, p.pos)
+		}
+		if isClassSetReservedDoublePunctuator(c) && p.peek(1) == c && p.pos+1 < len(p.src) {
+			return nil, fmt.Errorf("invalid set operation %q in character class at offset %d", p.src[p.pos:p.pos+2], p.pos)
+		}
+		r, err := p.nextRune()
+		if err != nil {
+			return nil, err
+		}
+		return &ClassLiteral{Char: r}, nil
+	}
+	p.pos++ // '\'
+	if p.eof() {
+		return nil, fmt.Errorf(`\ at end of pattern`)
+	}
+	switch e := p.peek(0); {
+	case e == 'b':
+		p.pos++
+		return &ClassLiteral{Char: '\b'}, nil
+	case e == 'q':
+		return nil, fmt.Errorf(`unsupported v-mode class syntax at offset %d: \q{...} string literals are not implemented`, p.pos-1)
+	case strings.IndexByte("dDwWsS", e) >= 0:
+		p.pos++
+		return classEscapeAtom(e), nil
+	case e == 'p' || e == 'P':
+		prop, err := p.parsePropertyExpression()
+		if err != nil {
+			return nil, err
+		}
+		return &ClassEscape{Kind: ClassEscapeUnicodeProperty, Property: prop, Negated: e == 'P'}, nil
+	case isClassSetReservedPunctuator(e):
+		p.pos++
+		return &ClassLiteral{Char: rune(e)}, nil
+	}
+	r, err := p.parseCharacterEscape(true)
+	if err != nil {
+		return nil, err
+	}
+	return &ClassLiteral{Char: r}, nil
+}
+
+// isClassSetSyntaxCharacter: ( ) [ ] { } / - \ |
+func isClassSetSyntaxCharacter(c byte) bool {
+	return strings.IndexByte("()[]{}/-\\|", c) >= 0
+}
+
+// isClassSetReservedDoublePunctuator reports whether c doubled is a
+// ClassSetReservedDoublePunctuator: one of & ! # $ % * + , . : ; < = > ? @ ^
+// backquote ~ written twice.
+func isClassSetReservedDoublePunctuator(c byte) bool {
+	return strings.IndexByte("&!#$%*+,.:;<=>?@^`~", c) >= 0
+}
+
+// isClassSetReservedPunctuator: & - ! # % , : ; < = > @ ` ~
+func isClassSetReservedPunctuator(c byte) bool {
+	return strings.IndexByte("&-!#%,:;<=>@`~", c) >= 0
+}
+
+func isASCIILetter(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
 }
 
 // legacyOctalRunes decodes a run of decimal digits from a numeric escape that is
@@ -1085,88 +1148,4 @@ func legacyOctalRunes(digits string) []rune {
 		out = append(out, rune(digits[i]))
 	}
 	return out
-}
-
-// parseNamedBackreference parses \k<name>
-func (p *Parser) parseNamedBackreference(val string) (Expression, error) {
-	// Extract name from \k<name>
-	start := strings.IndexByte(val, '<')
-	end := strings.IndexByte(val, '>')
-	if start == -1 || end == -1 {
-		return nil, fmt.Errorf("invalid named backreference: %s", val)
-	}
-
-	name := val[start+1 : end]
-	br := &Backreference{}
-	p.backreferences = append(p.backreferences, backrefInfo{
-		name: name,
-		node: br,
-	})
-
-	return br, nil
-}
-
-// parseQuantifier parses *, +, ? quantifiers
-func (p *Parser) parseQuantifier(body Expression) Expression {
-	greedy := p.curToken.isGreedy()
-
-	switch p.curToken.Type {
-	case TokenStar:
-		p.nextToken()
-		return &Quantifier{Min: 0, Max: -1, Greedy: greedy, Body: body}
-	case TokenPlus:
-		p.nextToken()
-		return &Quantifier{Min: 1, Max: -1, Greedy: greedy, Body: body}
-	case TokenQuestion:
-		p.nextToken()
-		return &Quantifier{Min: 0, Max: 1, Greedy: greedy, Body: body}
-	}
-
-	return body
-}
-
-// parseBracedQuantifier parses {n}, {n,}, {n,m} quantifiers
-func (p *Parser) parseBracedQuantifier(body Expression) (*Quantifier, error) {
-	if p.curToken.Type != TokenLBrace {
-		return nil, fmt.Errorf("expected {")
-	}
-	p.nextToken()
-
-	if p.curToken.Type != TokenDigit {
-		return nil, fmt.Errorf("expected number in quantifier")
-	}
-
-	min, err := strconv.Atoi(p.curToken.Value)
-	if err != nil {
-		return nil, err
-	}
-	p.nextToken()
-
-	max := min
-
-	if p.curToken.Type == TokenComma {
-		p.nextToken()
-		if p.curToken.Type == TokenDigit {
-			max, err = strconv.Atoi(p.curToken.Value)
-			if err != nil {
-				return nil, err
-			}
-			p.nextToken()
-		} else {
-			max = -1 // unlimited
-		}
-	}
-
-	if p.curToken.Type != TokenRBrace {
-		return nil, fmt.Errorf("expected } in quantifier")
-	}
-
-	// Note: the {n,m} out-of-order (m < n) check is an early error applied by the
-	// caller after a grammatically-successful parse, because it must fire in all
-	// modes — unlike a *malformed* {..}, which Annex B re-reads as a literal.
-
-	greedy := p.curToken.isGreedy()
-	p.nextToken()
-
-	return &Quantifier{Min: min, Max: max, Greedy: greedy, Body: body}, nil
 }

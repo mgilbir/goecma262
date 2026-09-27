@@ -123,11 +123,20 @@ func TestTC39CharEscape_UnicodeCyrillic(t *testing.T) {
 	}
 }
 
-// TC39: ES2015 – \u{...} code point escapes require Unicode mode
+// TC39: ES2015 – \u{...} code point escapes require Unicode mode. Without it
+// the escape is a SyntaxError in strict syntax, while Annex B reads \u as the
+// letter u followed by the literal text {1F600}.
 func TestTC39UnicodeCodePointEscape_RequiresUnicodeFlag(t *testing.T) {
-	_, err := ecma262.Compile(`\u{1F600}`, flags.Flags(0))
+	_, err := ecma262.Compile(`\u{1F600}`, flags.Flags(0), ecma262.WithSyntax(ecma262.SyntaxStrict))
 	if err == nil {
 		t.Fatal("expected error without unicode flag for \\u{...} escape")
+	}
+	re, err := ecma262.Compile(`\u{1F600}`, flags.Flags(0))
+	if err != nil {
+		t.Fatalf("Annex B should accept \\u{1F600}: %v", err)
+	}
+	if !re.MatchString("u{1F600}") || re.MatchString("\U0001F600") {
+		t.Error(`Annex B \u{1F600} should match the text "u{1F600}", not U+1F600`)
 	}
 }
 

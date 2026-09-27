@@ -153,7 +153,7 @@ such as `a{2,1}` is a syntax error in *every* mode.
 | `m` | Multiline - `^` and `$` match start/end of lines |
 | `s` | DotAll - `.` matches newline characters |
 | `u` | Unicode - enable Unicode features (required for `\p{...}` and `\u{...}`) |
-| `v` | UnicodeSets - extended Unicode features (cannot use with `u`) |
+| `v` | UnicodeSets - Unicode mode with the v-mode class syntax (cannot use with `u`); see Known limitations for the class features not implemented |
 | `y` | Sticky - match only at exactly the `lastIndex` position |
 | `d` | HasIndices - parsed and accepted, but a no-op: match indices are always available via the `*Index` methods (see Known Limitations) |
 
@@ -247,6 +247,8 @@ suite and maintain the skip list is covered in
 2. **HasIndices flag** (`d`) - Parsed and accepted, but it has no effect: match indices are always available through the `*Index` methods (`FindStringSubmatchIndex`, `FindAllStringSubmatchIndex`, etc.), which return `[start, end)` byte-offset pairs per group (`-1` for a non-participating group). Named-group indices (JavaScript's `indices.groups`) are obtained by combining `SubexpIndex(name)` with those pairs.
 3. **Compile-time limits** - Patterns nested more than 200 levels deep, with a single quantifier bound above 10,000 (`a{10001}`), or compiling to more than 200,000 instructions are rejected at compile time.
 4. **Case folding** - Case-insensitive matching uses Unicode simple case folding under the `u` flag, and the legacy `Canonicalize` (uppercase-based, with the "don't map non-ASCII to ASCII" guard) otherwise — matching JavaScript in both modes. A handful of full-mapping edge cases (e.g. `ß`↔`SS`) are not folded, as in most engines.
+5. **`v`-mode classes** - Within a character class the `v` flag's syntax is enforced (`(`, `)`, `[`, `]`, `{`, `}`, `/`, `-`, `\`, `|` must be escaped, doubled punctuators such as `!!` are reserved), but only unions of characters, ranges and class escapes are implemented. Nested classes, the set operations `&&` and `--`, and `\q{...}` string literals are rejected with an "unsupported v-mode class syntax" error rather than being read with another meaning.
+6. **UTF-16 code units** - Input is UTF-8, so a pattern can only match whole code points. Without `u`/`v`, JavaScript matches UTF-16 code units: a lone surrogate escape (`\uD83D`) or a class containing one half of a surrogate pair matches part of an astral character there, and never matches here.
 
 ## Contributing
 

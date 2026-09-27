@@ -32,7 +32,8 @@ func TestNegativeCorpus_SyntaxErrors(t *testing.T) {
 		{"empty code point escape", `\u{}`, flags.Unicode},
 		{"code point escape overflow", `\u{110000}`, flags.Unicode},
 		{"empty code point escape in class", `[\u{}]`, flags.Unicode},
-		{"code point escape without u flag", `\u{41}`, flags.Flags(0)},
+		// Without u, \u{41} is an error only in strict syntax (see
+		// TestAudit_StrictModeRejects); Annex B reads it as u repeated 41 times.
 
 		// Unicode property escapes (C7/C19)
 		{"unknown property", `\p{TotallyBogus}`, flags.Unicode},
@@ -41,7 +42,11 @@ func TestNegativeCorpus_SyntaxErrors(t *testing.T) {
 
 		// Named groups
 		{"duplicate name same alternative", `(?<a>x)(?<a>y)`, flags.Unicode},
-		{"unknown named backreference", `\k<missing>`, flags.Flags(0)},
+		// Without named groups Annex B reads \k as the letter k, so a dangling
+		// \k<name> is an error with u, in strict syntax (TestAudit_StrictModeRejects),
+		// or next to a named group.
+		{"unknown named backreference (u)", `\k<missing>`, flags.Unicode},
+		{"unknown named backreference (named groups)", `(?<a>.)\k<missing>`, flags.Flags(0)},
 		{"invalid group name", `(?<a->x)`, flags.Flags(0)},
 
 		// Flags (C11)
@@ -49,6 +54,9 @@ func TestNegativeCorpus_SyntaxErrors(t *testing.T) {
 
 		// Invalid escape in unicode mode
 		{"invalid identity escape (u)", `\q`, flags.Unicode},
+		// \- is a ClassEscape in Unicode mode, not an IdentityEscape.
+		{"escaped hyphen outside class (u)", `\-`, flags.Unicode},
+		{"escaped hyphen outside class (v)", `a\-b`, flags.UnicodeSets},
 	}
 
 	for _, tc := range cases {
