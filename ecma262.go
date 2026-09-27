@@ -61,13 +61,14 @@ type Regexp struct {
 	names     []string // group names
 
 	// Configuration options
-	ignoreCase bool
-	multiline  bool
-	dotAll     bool
-	unicode    bool
-	global     bool
-	sticky     bool
-	maxSteps   int
+	ignoreCase  bool
+	multiline   bool
+	dotAll      bool
+	unicode     bool // u or v
+	unicodeSets bool // v
+	global      bool
+	sticky      bool
+	maxSteps    int
 
 	// lastIndex is the starting position for the next match when using g or y flags.
 	// It is set by SetLastIndex and used by stateful match operations.
@@ -151,16 +152,17 @@ func Compile(expr string, f flags.Flags, opts ...Option) (*Regexp, error) {
 		flags: f,
 		code:  code,
 		prog: vm.NewProgram(code, f.Has(flags.IgnoreCase), f.Has(flags.Multiline), f.Has(flags.DotAll),
-			f.Has(flags.Unicode) || f.Has(flags.UnicodeSets), false),
-		numGroups:  numGroups,
-		names:      names,
-		ignoreCase: f.Has(flags.IgnoreCase),
-		multiline:  f.Has(flags.Multiline),
-		dotAll:     f.Has(flags.DotAll),
-		unicode:    f.Has(flags.Unicode) || f.Has(flags.UnicodeSets),
-		global:     f.Has(flags.Global),
-		sticky:     f.Has(flags.Sticky),
-		maxSteps:   0,
+			f.Has(flags.Unicode) || f.Has(flags.UnicodeSets), f.Has(flags.UnicodeSets), false),
+		numGroups:   numGroups,
+		names:       names,
+		ignoreCase:  f.Has(flags.IgnoreCase),
+		multiline:   f.Has(flags.Multiline),
+		dotAll:      f.Has(flags.DotAll),
+		unicode:     f.Has(flags.Unicode) || f.Has(flags.UnicodeSets),
+		unicodeSets: f.Has(flags.UnicodeSets),
+		global:      f.Has(flags.Global),
+		sticky:      f.Has(flags.Sticky),
+		maxSteps:    0,
 	}, nil
 }
 
@@ -899,14 +901,15 @@ func (re *Regexp) doMatchWithError(s string, startPos int) ([]int, error) {
 	}
 
 	v := &vm.VM{
-		Code:       re.code,
-		Program:    re.prog,
-		NumGroups:  re.numGroups,
-		IgnoreCase: re.ignoreCase,
-		Multiline:  re.multiline,
-		DotAll:     re.dotAll,
-		Unicode:    re.unicode,
-		MaxSteps:   re.maxSteps,
+		Code:        re.code,
+		Program:     re.prog,
+		NumGroups:   re.numGroups,
+		IgnoreCase:  re.ignoreCase,
+		Multiline:   re.multiline,
+		DotAll:      re.dotAll,
+		Unicode:     re.unicode,
+		UnicodeSets: re.unicodeSets,
+		MaxSteps:    re.maxSteps,
 	}
 
 	// Sticky flag: only attempt match at startPos (anchored)

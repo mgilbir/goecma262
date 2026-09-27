@@ -290,6 +290,7 @@ func TestOptimisedMatchesReferenceCorpus(t *testing.T) {
 		{`(?<!.*x)(.)`, "g"}, {`(?=(.*))(.)`, "y"}, {`.+?(.)(.)`, "y"},
 		{`[a-z]*(\1)`, "g"}, {`(.)*\1`, "g"}, {`.*(.)€`, "y"}, {`(?<=(.)é.*)`, "y"},
 		{`(?:k|x)+`, "giu"}, {`[r-t]*`, "giu"}, {`k*?$`, "giu"},
+		{`\w*`, "giu"}, {`(?:\w|x)+`, "giu"}, {`(?:\W|x)+`, "giu"}, {`\p{Lu}*`, "giu"}, {`\P{Ll}*`, "giv"},
 	}
 	for _, pc := range patterns {
 		p, err := compilePair(pc.pattern, pc.flags)

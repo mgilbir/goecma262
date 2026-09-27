@@ -210,10 +210,16 @@ type VM struct {
 	IgnoreCase bool
 	Multiline  bool
 	DotAll     bool
-	Unicode    bool
-	MaxSteps   int // 0 means DefaultMaxSteps + DefaultStepsPerByte*len(Input)
-	MaxMemory  int // bytes; 0 means DefaultMaxMemory + DefaultMemoryPerByte*len(Input)
-	Err        error
+	Unicode    bool // u or v: case folding is simple case folding
+	// UnicodeSets is the v flag (Unicode must also be set). It changes one
+	// thing here: case-insensitively, a negated property escape \P{p} matches
+	// the characters none of whose case variants has p (the complement of
+	// the case-folded set), where under u alone it matches those with a case
+	// variant that lacks p.
+	UnicodeSets bool
+	MaxSteps    int // 0 means DefaultMaxSteps + DefaultStepsPerByte*len(Input)
+	MaxMemory   int // bytes; 0 means DefaultMaxMemory + DefaultMemoryPerByte*len(Input)
+	Err         error
 
 	// Backward runs the engine right-to-left: character instructions consume the
 	// rune ending at pos (pos decreases), and group save ops record the group's
@@ -334,9 +340,9 @@ func (vm *VM) matchOne(inst *Instruction, r rune) bool {
 	case OpNonDigit:
 		return !isECMADigit(r)
 	case OpWord:
-		return isWordChar(r)
+		return vm.isWordChar(r)
 	case OpNonWord:
-		return !isWordChar(r)
+		return !vm.isWordChar(r)
 	case OpSpace:
 		return isSpace(r)
 	case OpNonSpace:
@@ -347,18 +353,16 @@ func (vm *VM) matchOne(inst *Instruction, r rune) bool {
 			atomMatch := false
 			switch atom.Kind {
 			case ClassAtomRange:
-				atomMatch = vm.matchInRange(r, atom.Range.Start, atom.Range.End)
+				atomMatch = vm.matchInRange(r, atom.Range.Start, atom.Range.End) != atom.Negated
 			case ClassAtomDigit:
-				atomMatch = isECMADigit(r)
+				atomMatch = isECMADigit(r) != atom.Negated
 			case ClassAtomWord:
-				atomMatch = isWordChar(r)
+				atomMatch = vm.isWordChar(r) != atom.Negated
 			case ClassAtomSpace:
-				atomMatch = isSpace(r)
+				atomMatch = isSpace(r) != atom.Negated
 			case ClassAtomUnicodeProp:
-				atomMatch = matchUnicodeProperty(r, atom.Prop)
-			}
-			if atom.Negated {
-				atomMatch = !atomMatch
+				// Under case folding \P is not the complement of \p's match.
+				atomMatch = vm.matchProperty(r, atom.Prop, atom.Negated)
 			}
 			if atomMatch {
 				matched = true
@@ -367,11 +371,36 @@ func (vm *VM) matchOne(inst *Instruction, r rune) bool {
 		}
 		return matched != inst.Negate
 	case OpUnicodeProp:
-		return matchUnicodeProperty(r, inst.Prop)
+		return vm.matchProperty(r, inst.Prop, false)
 	case OpNotUnicodeProp:
-		return !matchUnicodeProperty(r, inst.Prop)
+		return vm.matchProperty(r, inst.Prop, true)
 	}
 	return false
+}
+
+// matchProperty reports whether r matches \p{prop}, or \P{prop} if negated.
+//
+// Case-insensitively in Unicode mode, a class matches r when some member of
+// it has the same simple case folding as r, i.e. when some case variant of r
+// (a member of r's SimpleFold orbit, including r) is in the class. \p{prop}
+// therefore matches when a case variant has prop. Under u, \P{prop} is the
+// complement of prop's set, matched the same way: some case variant lacks
+// prop. Under v, the property's set is case-folded first and \P{prop} is the
+// complement of that: no case variant has prop.
+func (vm *VM) matchProperty(r rune, prop string, negated bool) bool {
+	if !vm.IgnoreCase || !vm.Unicode {
+		return matchUnicodeProperty(r, prop) != negated
+	}
+	want := !negated || vm.UnicodeSets // what a case variant must have
+	f := r
+	for {
+		if matchUnicodeProperty(f, prop) == want {
+			return !negated || !vm.UnicodeSets
+		}
+		if f = unicode.SimpleFold(f); f == r {
+			return negated && vm.UnicodeSets
+		}
+	}
 }
 
 // Match executes the VM against the input string starting at pos, as a single
@@ -433,11 +462,11 @@ func (vm *VM) MatchAt(input string, pos int) (bool, int, []int) {
 // prepare binds the VM to input and its program, and computes the budget.
 func (vm *VM) prepare(input string) {
 	vm.Input = input
-	if !vm.prog.matches(vm.Code, vm.IgnoreCase, vm.Multiline, vm.DotAll, vm.Unicode, vm.Backward) {
-		if vm.Program.matches(vm.Code, vm.IgnoreCase, vm.Multiline, vm.DotAll, vm.Unicode, vm.Backward) {
+	if !vm.prog.matches(vm.Code, vm.IgnoreCase, vm.Multiline, vm.DotAll, vm.Unicode, vm.UnicodeSets, vm.Backward) {
+		if vm.Program.matches(vm.Code, vm.IgnoreCase, vm.Multiline, vm.DotAll, vm.Unicode, vm.UnicodeSets, vm.Backward) {
 			vm.prog = vm.Program
 		} else {
-			vm.prog = NewProgram(vm.Code, vm.IgnoreCase, vm.Multiline, vm.DotAll, vm.Unicode, vm.Backward)
+			vm.prog = NewProgram(vm.Code, vm.IgnoreCase, vm.Multiline, vm.DotAll, vm.Unicode, vm.UnicodeSets, vm.Backward)
 		}
 	}
 	if !vm.memoValid || vm.memoData != unsafe.StringData(input) || vm.memoLen != len(input) || vm.memoProg != vm.prog {
@@ -688,14 +717,14 @@ func (vm *VM) run(st *runState, pc, pos int) (bool, int) {
 				}
 
 			case OpWordBound:
-				if wordCharBeforePos(vm.Input, pos) != wordCharAtPos(vm.Input, pos) {
+				if vm.wordCharBefore(pos) != vm.wordCharAt(pos) {
 					pc++
 				} else {
 					ok = false
 				}
 
 			case OpNonWordBound:
-				if wordCharBeforePos(vm.Input, pos) == wordCharAtPos(vm.Input, pos) {
+				if vm.wordCharBefore(pos) == vm.wordCharAt(pos) {
 					pc++
 				} else {
 					ok = false
@@ -1034,29 +1063,65 @@ func isWordChar(r rune) bool {
 		r == '_'
 }
 
-// wordCharBeforePos returns true if the character before pos is a word char.
+// wordFoldExtras are the characters outside [A-Za-z0-9_] whose simple case
+// folding is in it (U+017F LATIN SMALL LETTER LONG S and U+212A KELVIN SIGN).
+var wordFoldExtras = func() []rune {
+	var out []rune
+	for c := rune(0); c < utf8.RuneSelf; c++ {
+		if !isWordChar(c) {
+			continue
+		}
+		for f := unicode.SimpleFold(c); f != c; f = unicode.SimpleFold(f) {
+			if !isWordChar(f) {
+				out = append(out, f)
+			}
+		}
+	}
+	return out
+}()
+
+// isWordChar reports whether r is in ECMA-262 WordCharacters: [A-Za-z0-9_],
+// plus, case-insensitively in Unicode mode, the characters that case-fold into
+// it. That set is closed under case folding, so it is matched as is by \w and
+// complemented as is by \W.
+func (vm *VM) isWordChar(r rune) bool {
+	if isWordChar(r) {
+		return true
+	}
+	if r < utf8.RuneSelf || !vm.IgnoreCase || !vm.Unicode {
+		return false
+	}
+	for _, x := range wordFoldExtras {
+		if r == x {
+			return true
+		}
+	}
+	return false
+}
+
+// wordCharBefore reports whether the character before pos is a word character.
 // Handles multi-byte UTF-8 correctly using DecodeLastRuneInString.
-func wordCharBeforePos(s string, pos int) bool {
+func (vm *VM) wordCharBefore(pos int) bool {
 	if pos <= 0 {
 		return false
 	}
-	r, _ := utf8.DecodeLastRuneInString(s[:pos])
+	r, _ := utf8.DecodeLastRuneInString(vm.Input[:pos])
 	if r == utf8.RuneError {
 		return false
 	}
-	return isWordChar(r)
+	return vm.isWordChar(r)
 }
 
-// wordCharAtPos returns true if the character at pos is a word char.
-func wordCharAtPos(s string, pos int) bool {
-	if pos >= len(s) {
+// wordCharAt reports whether the character at pos is a word character.
+func (vm *VM) wordCharAt(pos int) bool {
+	if pos >= len(vm.Input) {
 		return false
 	}
-	r, _ := utf8.DecodeRuneInString(s[pos:])
+	r, _ := utf8.DecodeRuneInString(vm.Input[pos:])
 	if r == utf8.RuneError {
 		return false
 	}
-	return isWordChar(r)
+	return vm.isWordChar(r)
 }
 
 func isSpace(r rune) bool {

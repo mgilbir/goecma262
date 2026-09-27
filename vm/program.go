@@ -13,15 +13,15 @@ import "unsafe"
 // (including capture groups) are identical to executing the instructions
 // naively; only the number of steps and the memory used differ.
 type Program struct {
-	code                                   []Instruction
-	ignoreCase, multiline, dotAll, unicode bool
-	backward                               bool // direction of the top-level program
-	exact                                  bool // memo keys must include capture groups
-	anchored                               bool // top level begins with a non-multiline ^
-	dir                                    []bool
-	first                                  []*firstSet  // indexed by pc; set for split targets and loop exits
-	loops                                  []greedyLoop // indexed by pc; ok for recognised loops
-	leafCache                              map[int]*[4]uint64
+	code                                                []Instruction
+	ignoreCase, multiline, dotAll, unicode, unicodeSets bool
+	backward                                            bool // direction of the top-level program
+	exact                                               bool // memo keys must include capture groups
+	anchored                                            bool // top level begins with a non-multiline ^
+	dir                                                 []bool
+	first                                               []*firstSet  // indexed by pc; set for split targets and loop exits
+	loops                                               []greedyLoop // indexed by pc; ok for recognised loops
+	leafCache                                           map[int]*[4]uint64
 }
 
 // firstSet over-approximates what an execution starting at some pc can do
@@ -59,15 +59,16 @@ const firstSetNodeLimit = 64
 
 // NewProgram analyses code for the given flags. backward is the direction the
 // top-level program runs in (false for every program the compiler emits).
-func NewProgram(code []Instruction, ignoreCase, multiline, dotAll, unicode, backward bool) *Program {
+func NewProgram(code []Instruction, ignoreCase, multiline, dotAll, unicode, unicodeSets, backward bool) *Program {
 	p := &Program{
-		code:       code,
-		ignoreCase: ignoreCase,
-		multiline:  multiline,
-		dotAll:     dotAll,
-		unicode:    unicode,
-		backward:   backward,
-		leafCache:  make(map[int]*[4]uint64),
+		code:        code,
+		ignoreCase:  ignoreCase,
+		multiline:   multiline,
+		dotAll:      dotAll,
+		unicode:     unicode,
+		unicodeSets: unicodeSets,
+		backward:    backward,
+		leafCache:   make(map[int]*[4]uint64),
 	}
 	p.first = make([]*firstSet, len(code))
 	p.loops = make([]greedyLoop, len(code))
@@ -111,11 +112,11 @@ func NewProgram(code []Instruction, ignoreCase, multiline, dotAll, unicode, back
 }
 
 // matches reports whether p was built for exactly this configuration.
-func (p *Program) matches(code []Instruction, ignoreCase, multiline, dotAll, unicode, backward bool) bool {
+func (p *Program) matches(code []Instruction, ignoreCase, multiline, dotAll, unicode, unicodeSets, backward bool) bool {
 	return p != nil && len(p.code) == len(code) &&
 		(len(code) == 0 || unsafe.SliceData(p.code) == unsafe.SliceData(code)) &&
 		p.ignoreCase == ignoreCase && p.multiline == multiline && p.dotAll == dotAll &&
-		p.unicode == unicode && p.backward == backward
+		p.unicode == unicode && p.unicodeSets == unicodeSets && p.backward == backward
 }
 
 // isSingleRune reports whether op consumes exactly one rune when it succeeds.
@@ -265,12 +266,15 @@ func (p *Program) greedyLoopAt(pc int) (body, exit int, ok bool) {
 
 // asciiOnly reports whether a single-rune instruction can only ever match
 // ASCII runes, mirroring the matching code in vm.go exactly: under IgnoreCase
-// ASCII letters fold to non-ASCII runes (e.g. k and KELVIN SIGN), and negated
-// forms match non-ASCII by definition.
+// ASCII letters fold to non-ASCII runes (e.g. k and KELVIN SIGN), which \w
+// then matches in Unicode mode, and negated forms match non-ASCII by
+// definition.
 func (p *Program) asciiOnly(inst *Instruction) bool {
 	switch inst.Op {
-	case OpDigit, OpWord:
+	case OpDigit:
 		return true
+	case OpWord:
+		return !p.ignoreCase || !p.unicode
 	case OpChar:
 		return inst.Char < 0x80 && !p.ignoreCase
 	case OpClass:
@@ -322,7 +326,7 @@ func (p *Program) leafBytes(pc int) *[4]uint64 {
 // asciiSetSlow returns the ASCII runes the single-rune instruction accepts, by
 // evaluating the matcher on each of them.
 func (p *Program) asciiSetSlow(inst *Instruction) (lo, hi uint64) {
-	m := &VM{IgnoreCase: p.ignoreCase, Multiline: p.multiline, DotAll: p.dotAll, Unicode: p.unicode}
+	m := &VM{IgnoreCase: p.ignoreCase, Multiline: p.multiline, DotAll: p.dotAll, Unicode: p.unicode, UnicodeSets: p.unicodeSets}
 	for b := 0; b < 0x80; b++ {
 		if m.matchOne(inst, rune(b)) {
 			if b < 64 {

@@ -163,7 +163,14 @@ analysis and runs the plain algorithm as the reference.
 Case-insensitive matching uses Unicode simple case folding under `u`/`v`,
 and the legacy Canonicalize algorithm (`vm.canonicalizeLegacy`,
 uppercase-based, with the "don't map non-ASCII to ASCII" guard) otherwise —
-matching JavaScript in both modes. `\p{...}` lookups resolve general
+matching JavaScript in both modes. A class, class escape or property escape
+matches a character when some case variant of it (a member of its
+`unicode.SimpleFold` orbit) is in the set, so under `iu` `\w` also matches
+`ſ` and the Kelvin sign (which fold into `[A-Za-z0-9_]`, and which `\b`
+therefore treats as word characters) and `\p{Lu}` matches `a`. The one
+difference between `u` and `v` there is `\P{...}`: under `u` it matches when
+some case variant lacks the property, under `v` when none has it.
+`\p{...}` lookups resolve general
 categories, `Script=`/`Script_Extensions=`, and binary properties against
 Go's `unicode` tables, cached in a `sync.Map` keyed by property expression;
 unknown property names are compile errors ("invalid unicode property
