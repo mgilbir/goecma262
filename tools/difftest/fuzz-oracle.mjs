@@ -91,13 +91,15 @@ function hasSurrogateSplitMatch(re, input, allMatches) {
 function splitsResult(re, op, input, rendered) {
   if (/[uv]/.test(re.flags)) return false;
   const halfPair = (str) => /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(str);
+  // The d flag gives each match its indices; the case may already have it.
+  const withIndices = () => new RegExp(re.source, re.flags.includes("d") ? re.flags : re.flags + "d");
   const bad = (m) => m.indices.some((g) => g !== undefined && (splitsPair(input, g[0]) || splitsPair(input, g[1])));
   if (op === "x") {
-    const m = new RegExp(re.source, re.flags + "d").exec(input);
+    const m = withIndices().exec(input);
     return m !== null && bad(m);
   }
   if (op === "a") {
-    return [...input.matchAll(new RegExp(re.source, re.flags + "d"))].some(bad);
+    return [...input.matchAll(withIndices())].some(bad);
   }
   if (op === "r") return halfPair(decode(rendered.slice(2)));
   return rendered.split(" ").slice(2).some((part) => part !== "-" && halfPair(decode(part)));
