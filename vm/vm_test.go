@@ -294,7 +294,9 @@ func TestOptimisedMatchesReferenceCorpus(t *testing.T) {
 		{`(?:k|x)+`, "giu"}, {`[r-t]*`, "giu"}, {`k*?$`, "giu"},
 		{`(?m:^)a`, "g"}, {`(?m:^).`, "gy"}, {`(?i:k)+`, "g"}, {`(?-i:k)+`, "gi"}, {`(?:x|(?i:k))+`, "gu"}, {`(?:x|(?-i:k))+`, "giu"}, {`(?-s:.)*`, "gs"}, {`(?s:.)*`, "g"},
 		{`(?i:[r-t])*x`, "gu"}, {`a(?m:$)`, "g"}, {`(?<=(?i:k))\w`, "gu"},
-		{`\w*`, "giu"}, {`(?:\w|x)+`, "giu"}, {`(?:\W|x)+`, "giu"}, {`\p{Lu}*`, "giu"}, {`\P{Ll}*`, "giv"},
+		{`\w*`, "giu"},
+		// Loops whose body can match empty (the empty check).
+		{`(a*)*`, "g"}, {`(?:a*?)*`, "g"}, {`(?:(a)|b|)*\1`, "g"}, {`(?:\b)*?.`, "g"}, {`(?<=(a|)*)(.)`, "g"}, {`((?=.)|.)+?`, "gy"}, {`(?:\w|x)+`, "giu"}, {`(?:\W|x)+`, "giu"}, {`\p{Lu}*`, "giu"}, {`\P{Ll}*`, "giv"},
 	}
 	for _, pc := range patterns {
 		p, err := compilePair(pc.pattern, pc.flags)

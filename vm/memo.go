@@ -3,11 +3,12 @@ package vm
 import "encoding/binary"
 
 // The failure memo records which OpSplit states have already been visited in
-// the current search, so a revisit takes the split's B branch instead of
-// re-exploring branch A (see the OpSplit case in run).
+// the current search, so a revisit, which is always of a state that failed,
+// fails without exploring it again (see the OpSplit case in run).
 //
 // A state is (pc, pos) plus, when the program has backreferences or an
-// empty-matching loop (Program.exact), the full capture vector. Capture vectors
+// empty-matching loop (Program.exact), the full capture vector with the loop
+// registers. Capture vectors
 // are interned to small ids, and the positions visited for each (pc, id) are
 // kept in a paged bitset, so marking costs one bit per visited position rather
 // than one allocated string per visit.

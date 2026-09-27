@@ -94,6 +94,11 @@ const (
 
 	// Group reset for quantifier body repeats (ES2022 group-reset semantics)
 	OpResetGroups // Reset groups[A..B] (inclusive, 1-indexed) to -1
+
+	// The empty check of an optional loop iteration (ECMA-262 RepeatMatcher):
+	// A is a register, a slot past the capture slots.
+	OpLoopEnter // Record the position where the iteration starts in register A
+	OpLoopCheck // Fail if the iteration ended where it started; else clear register A
 )
 
 // Instruction represents a single VM instruction
@@ -230,6 +235,10 @@ func (i Instruction) String() string {
 		return fmt.Sprintf("not-unicode-prop %s", i.Prop)
 	case OpResetGroups:
 		return fmt.Sprintf("reset-groups %d..%d", i.A, i.B)
+	case OpLoopEnter:
+		return fmt.Sprintf("loop-enter r%d", i.A)
+	case OpLoopCheck:
+		return fmt.Sprintf("loop-check r%d", i.A)
 	default:
 		return fmt.Sprintf("unknown(%d)", i.Op)
 	}
@@ -475,7 +484,7 @@ func (vm *VM) MatchAt(input string, pos int) (bool, int, []int) {
 	}
 
 	st := &vm.main
-	st.init((vm.NumGroups+1)*2, nil)
+	st.init(max((vm.NumGroups+1)*2, vm.prog.slots), nil)
 	st.base, st.choiceBase = 0, 0
 	st.endPC = -1
 	st.backward = vm.Backward
@@ -496,7 +505,7 @@ func (vm *VM) MatchAt(input string, pos int) (bool, int, []int) {
 	if !matched {
 		return false, 0, nil
 	}
-	groups := make([]int, len(st.groups))
+	groups := make([]int, (vm.NumGroups+1)*2)
 	copy(groups, st.groups)
 	return true, end, groups
 }
@@ -825,20 +834,21 @@ func (vm *VM) run(st *runState, pc, pos int) (bool, int) {
 				}
 
 				// The outcome of matching from a given state is a function of
-				// that state, so once a split state has been visited its branch
-				// A needs no second exploration: a revisit takes the exit B.
-				// The state includes the captures when the program has
-				// backreferences (which make outcomes depend on them) or
-				// empty-matching loops (where a revisit can be a cycle, not a
-				// completed failure); keying on (pos, pc) alone there wrongly
-				// prunes branches reachable with different captures, e.g.
-				// (?:(a)|a)(?:b|c)\1 on "ab".
+				// that state, and a state is never revisited while it is still
+				// being explored: every path back to a split either consumes
+				// input or passes an empty check (OpLoopCheck) that fails it.
+				// So a revisited split state is one whose branches have all
+				// failed, and it fails again. The state includes the captures
+				// and loop registers when the program has backreferences or
+				// empty-matching loops, whose outcome depends on them; keying on
+				// (pos, pc) alone there wrongly prunes branches reachable with
+				// different captures, e.g. (?:(a)|a)(?:b|c)\1 on "ab".
 				visited, mok := vm.memoVisit(st, pc, pos)
 				if !mok {
 					return false, 0
 				}
 				if visited {
-					pc = inst.B
+					ok = false
 					break
 				}
 				// A branch that cannot start at this input is not explored (or
@@ -892,11 +902,31 @@ func (vm *VM) run(st *runState, pc, pos int) (bool, int) {
 				}
 				if positive {
 					// Propagate captures from the body back into outer groups.
-					for i, v := range sub.groups {
+					for i, v := range sub.groups[:(vm.NumGroups+1)*2] {
 						if v >= 0 && !vm.setGroup(st, i, v) {
 							return false, 0
 						}
 					}
+				}
+				pc++
+
+			case OpLoopEnter:
+				if !vm.setGroup(st, inst.A, pos) {
+					return false, 0
+				}
+				pc++
+
+			case OpLoopCheck:
+				// RepeatMatcher step 2.b: an optional iteration that matched
+				// the empty string fails. Clearing the register afterwards
+				// keeps states outside the iteration independent of where
+				// it started.
+				if st.groups[inst.A] == pos {
+					ok = false
+					break
+				}
+				if !vm.setGroup(st, inst.A, -1) {
+					return false, 0
 				}
 				pc++
 

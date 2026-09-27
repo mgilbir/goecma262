@@ -86,8 +86,9 @@ Details worth knowing before touching the VM:
   string — whereas a linear budget still stops every super-linear search.
 - **Failed split states are memoized.** The failure memo records visited
   split states, so revisiting one — the shape of classic catastrophic
-  patterns like `(a+)+$` — takes the split's exit instead of re-exploring
-  branch A. See "Bounded execution" below for how states are keyed.
+  patterns like `(a+)+$` — fails at once instead of exploring its branches
+  again. See "Bounded execution" below for how states are keyed, and why a
+  revisited state has always already failed.
 - **Iteration helpers share one cursor implementation.** `findAllMatches`
   in the root package is the single source of truth for how `FindAll*`,
   `ReplaceAll*`, and `Split` advance past matches (including the
@@ -148,10 +149,23 @@ a match, never its result:
   paged bitsets (one bit per state) and, because a failed state fails from
   any start position, it carries over from one start position to the next —
   which makes unanchored searches such as `[a-z]+$` linear rather than
-  quadratic. Otherwise the capture vector is part of the key (interned to a
-  small id), and the memo is per attempt: backreferences make outcomes depend
-  on captures, and in an empty-matching loop a revisit can be a cycle rather
-  than a completed failure, where taking the exit is what terminates it.
+  quadratic. Otherwise the capture vector, with the loop registers below, is
+  part of the key (interned to a small id), and the memo is per attempt:
+  backreferences make outcomes depend on captures, and empty checks on the
+  registers.
+- **Empty checks.** ECMA-262's RepeatMatcher fails an iteration beyond a
+  quantifier's minimum that matches the empty string, and clears the
+  captures inside the quantified atom at the start of every iteration. For
+  a body that can match empty (`compiler.nullable`), each optional
+  iteration is bracketed by `OpLoopEnter`, which stores the start position
+  in a register (an extra slot after the captures, trailed like them), and
+  `OpLoopCheck`, which fails if the body ended there and otherwise clears the
+  register, so that states between iterations do not differ by where the last
+  one began. Bodies that cannot match empty — including every single-rune
+  loop the scan above handles — get neither. Because every path back to a
+  split either consumes input or passes an empty check, a split state is
+  never revisited while it is still being explored: a revisited state has
+  failed, and fails again.
 
 `TestOptimisedMatchesReference` (with a fuzz target) checks all of this
 differentially: `vm.SetOptimize(false)`, available to tests, disables the

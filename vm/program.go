@@ -18,6 +18,7 @@ type Program struct {
 	backward                                            bool // direction of the top-level program
 	exact                                               bool // memo keys must include capture groups
 	anchored                                            bool // top level begins with a non-multiline ^
+	slots                                               int  // group vector length the loop registers need
 	dir                                                 []bool
 	first                                               []*firstSet  // indexed by pc; set for split targets and loop exits
 	loops                                               []greedyLoop // indexed by pc; ok for recognised loops
@@ -72,13 +73,20 @@ func NewProgram(code []Instruction, ignoreCase, multiline, dotAll, unicode, unic
 	}
 	p.first = make([]*firstSet, len(code))
 	p.loops = make([]greedyLoop, len(code))
+	for _, inst := range code {
+		if inst.Op == OpLoopEnter || inst.Op == OpLoopCheck {
+			p.slots = max(p.slots, inst.A+1)
+		}
+	}
 	if !optimize {
 		p.exact = true
 		p.leafCache = nil
 		return p
 	}
 	p.computeDirections()
-	p.exact = hasBackref(code) || hasEpsilonCycle(code)
+	// An empty check reads a loop register, so its outcome depends on more
+	// than (pc, pos) as well.
+	p.exact = hasBackref(code) || hasEpsilonCycle(code) || p.slots > 0
 	p.anchored = !backward && len(code) > 1 &&
 		code[0].Op == OpSaveStart && code[0].A == 0 && code[1].Op == OpStartLine && !p.multilineAt(&code[1])
 
@@ -209,10 +217,10 @@ func epsilonSuccs(code []Instruction, pc int, out []int) []int {
 }
 
 // hasEpsilonCycle reports whether control can return to an instruction
-// without consuming input (a quantifier whose body can match empty). Only then
-// can a state be revisited while it is still being explored, which is the one
-// case where the failure memo's "already visited" answer changes results
-// rather than merely pruning a subtree known to fail.
+// without consuming input (a quantifier whose body can match empty). Such a
+// loop has an empty check (OpLoopCheck), whose outcome depends on a register,
+// and its captures are cleared per iteration, so its states are keyed on the
+// whole capture vector.
 func hasEpsilonCycle(code []Instruction) bool {
 	const (
 		white = iota
@@ -522,6 +530,7 @@ func (p *Program) computeFirst(start int, w *frontierWalker) *firstSet {
 		case inst.Op == OpSplit:
 			w.stack = append(w.stack, inst.B, inst.A)
 		case inst.Op == OpSaveStart, inst.Op == OpSaveEnd, inst.Op == OpResetGroups,
+			inst.Op == OpLoopEnter, inst.Op == OpLoopCheck,
 			inst.Op == OpStartLine, inst.Op == OpEndLine,
 			inst.Op == OpWordBound, inst.Op == OpNonWordBound:
 			w.stack = append(w.stack, pc+1)
