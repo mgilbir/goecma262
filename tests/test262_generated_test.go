@@ -4,7 +4,9 @@
 package ecma262_test
 
 import (
+	"encoding/json"
 	"os"
+	"reflect"
 	"testing"
 
 	"github.com/mgilbir/goecma262"
@@ -66312,7 +66314,16 @@ var test262GeneratedCases = []struct {
 	{"without-dotall.js#a7", "test/built-ins/RegExp/dotall/without-dotall.js", "^.$", "", "\f", "match", "true", 0, 0, 0, ""},
 	{"without-dotall.js#a8", "test/built-ins/RegExp/dotall/without-dotall.js", "^.$", "", "\u180e", "match", "true", 0, 0, 0, ""},
 	{"without-dotall.js#a9", "test/built-ins/RegExp/dotall/without-dotall.js", "^.$", "", "𐌀", "match", "false", 0, 0, 0, ""},
+	{"alternations.js#c1", "test/built-ins/RegExp/lookBehind/alternations.js", ".*(?<=(..|...|....))(.*)", "", "xabcd", "captures", "[\"xabcd\",\"cd\",\"\"]", 0, 0, 0, ""},
+	{"alternations.js#c2", "test/built-ins/RegExp/lookBehind/alternations.js", ".*(?<=(xx|...|....))(.*)", "", "xabcd", "captures", "[\"xabcd\",\"bcd\",\"\"]", 0, 0, 0, ""},
+	{"alternations.js#c3", "test/built-ins/RegExp/lookBehind/alternations.js", ".*(?<=(xx|...))(.*)", "", "xxabcd", "captures", "[\"xxabcd\",\"bcd\",\"\"]", 0, 0, 0, ""},
+	{"alternations.js#c4", "test/built-ins/RegExp/lookBehind/alternations.js", ".*(?<=(xx|xxx))(.*)", "", "xxabcd", "captures", "[\"xxabcd\",\"xx\",\"abcd\"]", 0, 0, 0, ""},
 	{"back-references-to-captures.js#1", "test/built-ins/RegExp/lookBehind/back-references-to-captures.js", "(?<=\\1(\\w+))c", "", "ababdc", "match", "false", 0, 0, 0, ""},
+	{"back-references-to-captures.js#c1", "test/built-ins/RegExp/lookBehind/back-references-to-captures.js", "(?<=\\1(\\w))d", "i", "abcCd", "captures", "[\"d\",\"C\"]", 0, 0, 0, ""},
+	{"back-references-to-captures.js#c2", "test/built-ins/RegExp/lookBehind/back-references-to-captures.js", "(?<=\\1([abx]))d", "", "abxxd", "captures", "[\"d\",\"x\"]", 0, 0, 0, ""},
+	{"back-references-to-captures.js#c3", "test/built-ins/RegExp/lookBehind/back-references-to-captures.js", "(?<=\\1(\\w+))c", "", "ababc", "captures", "[\"c\",\"ab\"]", 0, 0, 0, ""},
+	{"back-references-to-captures.js#c4", "test/built-ins/RegExp/lookBehind/back-references-to-captures.js", "(?<=\\1(\\w+))c", "", "ababbc", "captures", "[\"c\",\"b\"]", 0, 0, 0, ""},
+	{"back-references-to-captures.js#c5", "test/built-ins/RegExp/lookBehind/back-references-to-captures.js", "(?<=(\\w+)\\1)c", "", "ababc", "captures", "[\"c\",\"abab\"]", 0, 0, 0, ""},
 	{"back-references.js#1", "test/built-ins/RegExp/lookBehind/back-references.js", "(?<=(.))(\\w+)(?=\\1)", "", "  .foo\"  ", "match", "false", 0, 0, 0, ""},
 	{"back-references.js#2", "test/built-ins/RegExp/lookBehind/back-references.js", "(.)(?<=\\1\\1\\1)", "", "ab", "match", "false", 0, 0, 0, ""},
 	{"back-references.js#3", "test/built-ins/RegExp/lookBehind/back-references.js", "(.)(?<=\\1\\1\\1)", "", "abb", "match", "false", 0, 0, 0, ""},
@@ -66322,11 +66333,44 @@ var test262GeneratedCases = []struct {
 	{"back-references.js#7", "test/built-ins/RegExp/lookBehind/back-references.js", "(..)(?<=\\1\\1\\1)", "", "abab", "match", "false", 0, 0, 0, ""},
 	{"back-references.js#8", "test/built-ins/RegExp/lookBehind/back-references.js", "(..)(?<=\\1\\1\\1)", "", "fabxbab", "match", "false", 0, 0, 0, ""},
 	{"back-references.js#9", "test/built-ins/RegExp/lookBehind/back-references.js", "(..)(?<=\\1\\1\\1)", "", "faxabab", "match", "false", 0, 0, 0, ""},
+	{"back-references.js#c1", "test/built-ins/RegExp/lookBehind/back-references.js", "(.)(?<=(\\1\\1))", "", "abb", "captures", "[\"b\",\"b\",\"bb\"]", 0, 0, 0, ""},
+	{"back-references.js#c2", "test/built-ins/RegExp/lookBehind/back-references.js", "(.)(?<=(\\1\\1))", "i", "abB", "captures", "[\"B\",\"B\",\"bB\"]", 0, 0, 0, ""},
+	{"back-references.js#c3", "test/built-ins/RegExp/lookBehind/back-references.js", "((\\w)\\w)(?<=\\1\\2\\1)", "i", "aabAaBa", "captures", "[\"aB\",\"aB\",\"a\"]", 0, 0, 0, ""},
+	{"back-references.js#c4", "test/built-ins/RegExp/lookBehind/back-references.js", "(\\w(\\w))(?<=\\1\\2\\1)", "i", "aabAaBa", "captures", "[\"Ba\",\"Ba\",\"a\"]", 0, 0, 0, ""},
+	{"back-references.js#c5", "test/built-ins/RegExp/lookBehind/back-references.js", "(?=(\\w))(?<=(\\1)).", "i", "abaBbAa", "captures", "[\"b\",\"b\",\"B\"]", 0, 0, 0, ""},
+	{"back-references.js#c6", "test/built-ins/RegExp/lookBehind/back-references.js", "(?<=(.))(\\w+)(?=\\1)", "", "  'foo'  ", "captures", "[\"foo\",\"'\",\"foo\"]", 0, 0, 0, ""},
+	{"back-references.js#c7", "test/built-ins/RegExp/lookBehind/back-references.js", "(?<=(.))(\\w+)(?=\\1)", "", "  \"foo\"  ", "captures", "[\"foo\",\"\\\"\",\"foo\"]", 0, 0, 0, ""},
+	{"back-references.js#c8", "test/built-ins/RegExp/lookBehind/back-references.js", "(.)(?<=\\1\\1\\1)", "", "abbb", "captures", "[\"b\",\"b\"]", 0, 0, 0, ""},
+	{"back-references.js#c9", "test/built-ins/RegExp/lookBehind/back-references.js", "(..)(?<=\\1\\1\\1)", "", "fababab", "captures", "[\"ab\",\"ab\"]", 0, 0, 0, ""},
+	{"captures-negative.js#c1", "test/built-ins/RegExp/lookBehind/captures-negative.js", "(?<!(^|[ab]))\\w{2}", "", "abcdef", "captures", "[\"de\",null]", 0, 0, 0, ""},
+	{"captures.js#c1", "test/built-ins/RegExp/lookBehind/captures.js", "(?<=(c))def", "", "abcdef", "captures", "[\"def\",\"c\"]", 0, 0, 0, ""},
+	{"captures.js#c2", "test/built-ins/RegExp/lookBehind/captures.js", "(?<=(\\w{2}))def", "", "abcdef", "captures", "[\"def\",\"bc\"]", 0, 0, 0, ""},
+	{"captures.js#c3", "test/built-ins/RegExp/lookBehind/captures.js", "(?<=(\\w(\\w)))def", "", "abcdef", "captures", "[\"def\",\"bc\",\"c\"]", 0, 0, 0, ""},
+	{"captures.js#c4", "test/built-ins/RegExp/lookBehind/captures.js", "(?<=(\\w){3})def", "", "abcdef", "captures", "[\"def\",\"a\"]", 0, 0, 0, ""},
+	{"captures.js#c5", "test/built-ins/RegExp/lookBehind/captures.js", "(?<=(bc)|(cd)).", "", "abcdef", "captures", "[\"d\",\"bc\",null]", 0, 0, 0, ""},
+	{"captures.js#c6", "test/built-ins/RegExp/lookBehind/captures.js", "(?<=([ab]{1,2})\\D|(abc))\\w", "", "abcdef", "captures", "[\"c\",\"a\",null]", 0, 0, 0, ""},
+	{"captures.js#c7", "test/built-ins/RegExp/lookBehind/captures.js", "\\D(?<=([ab]+))(\\w)", "", "abcdef", "captures", "[\"ab\",\"a\",\"b\"]", 0, 0, 0, ""},
 	{"do-not-backtrack.js#1", "test/built-ins/RegExp/lookBehind/do-not-backtrack.js", "(?<=([abc]+)).\\1", "", "abcdbc", "match", "false", 0, 0, 0, ""},
+	{"greedy-loop.js#c1", "test/built-ins/RegExp/lookBehind/greedy-loop.js", "(?<=(b+))c", "", "abbbbbbc", "captures", "[\"c\",\"bbbbbb\"]", 0, 0, 0, ""},
+	{"greedy-loop.js#c2", "test/built-ins/RegExp/lookBehind/greedy-loop.js", "(?<=(b\\d+))c", "", "ab1234c", "captures", "[\"c\",\"b1234\"]", 0, 0, 0, ""},
+	{"greedy-loop.js#c3", "test/built-ins/RegExp/lookBehind/greedy-loop.js", "(?<=((?:b\\d{2})+))c", "", "ab12b23b34c", "captures", "[\"c\",\"b12b23b34\"]", 0, 0, 0, ""},
 	{"misc.js#1", "test/built-ins/RegExp/lookBehind/misc.js", "(?<=$abc)def", "", "abcdef", "match", "false", 0, 0, 0, ""},
 	{"misc.js#2", "test/built-ins/RegExp/lookBehind/misc.js", "^f.o(?<=foo)$", "", "fno", "match", "false", 0, 0, 0, ""},
 	{"misc.js#3", "test/built-ins/RegExp/lookBehind/misc.js", "^foo(?<!foo)$", "", "foo", "match", "false", 0, 0, 0, ""},
 	{"misc.js#4", "test/built-ins/RegExp/lookBehind/misc.js", "^f.o(?<!foo)$", "", "foo", "match", "false", 0, 0, 0, ""},
+	{"misc.js#c1", "test/built-ins/RegExp/lookBehind/misc.js", "^foo(?<=foo)$", "", "foo", "captures", "[\"foo\"]", 0, 0, 0, ""},
+	{"misc.js#c2", "test/built-ins/RegExp/lookBehind/misc.js", "^f.o(?<=foo)$", "", "foo", "captures", "[\"foo\"]", 0, 0, 0, ""},
+	{"misc.js#c3", "test/built-ins/RegExp/lookBehind/misc.js", "^f.o(?<!foo)$", "", "fno", "captures", "[\"fno\"]", 0, 0, 0, ""},
+	{"misc.js#c4", "test/built-ins/RegExp/lookBehind/misc.js", "^foooo(?<=fo+)$", "", "foooo", "captures", "[\"foooo\"]", 0, 0, 0, ""},
+	{"misc.js#c5", "test/built-ins/RegExp/lookBehind/misc.js", "^foooo(?<=fo*)$", "", "foooo", "captures", "[\"foooo\"]", 0, 0, 0, ""},
+	{"misc.js#c6", "test/built-ins/RegExp/lookBehind/misc.js", "(abc\\1)", "", "abc", "captures", "[\"abc\",\"abc\"]", 0, 0, 0, ""},
+	{"misc.js#c7", "test/built-ins/RegExp/lookBehind/misc.js", "(abc\\1)", "", "abcሴ", "captures", "[\"abc\",\"abc\"]", 0, 0, 0, ""},
+	{"misc.js#c8", "test/built-ins/RegExp/lookBehind/misc.js", "(abc\\1)", "i", "abc", "captures", "[\"abc\",\"abc\"]", 0, 0, 0, ""},
+	{"misc.js#c9", "test/built-ins/RegExp/lookBehind/misc.js", "(abc\\1)", "i", "abcሴ", "captures", "[\"abc\",\"abc\"]", 0, 0, 0, ""},
+	{"mutual-recursive.js#c1", "test/built-ins/RegExp/lookBehind/mutual-recursive.js", "(?<=a(.\\2)b(\\1)).{4}", "", "aabcacbc", "captures", "[\"cacb\",\"a\",\"\"]", 0, 0, 0, ""},
+	{"mutual-recursive.js#c2", "test/built-ins/RegExp/lookBehind/mutual-recursive.js", "(?<=a(\\2)b(..\\1))b", "", "aacbacb", "captures", "[\"b\",\"ac\",\"ac\"]", 0, 0, 0, ""},
+	{"mutual-recursive.js#c3", "test/built-ins/RegExp/lookBehind/mutual-recursive.js", "(?<=(?:\\1b)(aa)).", "", "aabaax", "captures", "[\"x\",\"aa\"]", 0, 0, 0, ""},
+	{"mutual-recursive.js#c4", "test/built-ins/RegExp/lookBehind/mutual-recursive.js", "(?<=(?:\\1|b)(aa)).", "", "aaaax", "captures", "[\"x\",\"aa\"]", 0, 0, 0, ""},
 	{"negative.js#1", "test/built-ins/RegExp/lookBehind/negative.js", "(?<!abc)def", "", "abcdef", "match", "false", 0, 0, 0, ""},
 	{"negative.js#2", "test/built-ins/RegExp/lookBehind/negative.js", "(?<!a.c)def", "", "abcdef", "match", "false", 0, 0, 0, ""},
 	{"negative.js#3", "test/built-ins/RegExp/lookBehind/negative.js", "(?<!a\\wc)def", "", "abcdef", "match", "false", 0, 0, 0, ""},
@@ -66334,26 +66378,76 @@ var test262GeneratedCases = []struct {
 	{"negative.js#5", "test/built-ins/RegExp/lookBehind/negative.js", "(?<!a[a-z]{2})def", "", "abcdef", "match", "false", 0, 0, 0, ""},
 	{"negative.js#6", "test/built-ins/RegExp/lookBehind/negative.js", "(?<!a{1}b{1})cde", "", "abcdef", "match", "false", 0, 0, 0, ""},
 	{"negative.js#7", "test/built-ins/RegExp/lookBehind/negative.js", "(?<!a{1}[a-z]{2})def", "", "abcdef", "match", "false", 0, 0, 0, ""},
+	{"negative.js#c1", "test/built-ins/RegExp/lookBehind/negative.js", "(?<!abc)\\w\\w\\w", "", "abcdef", "captures", "[\"abc\"]", 0, 0, 0, ""},
+	{"negative.js#c2", "test/built-ins/RegExp/lookBehind/negative.js", "(?<!a.c)\\w\\w\\w", "", "abcdef", "captures", "[\"abc\"]", 0, 0, 0, ""},
+	{"negative.js#c3", "test/built-ins/RegExp/lookBehind/negative.js", "(?<!a\\wc)\\w\\w\\w", "", "abcdef", "captures", "[\"abc\"]", 0, 0, 0, ""},
+	{"negative.js#c4", "test/built-ins/RegExp/lookBehind/negative.js", "(?<!a[a-z])\\w\\w\\w", "", "abcdef", "captures", "[\"abc\"]", 0, 0, 0, ""},
+	{"negative.js#c5", "test/built-ins/RegExp/lookBehind/negative.js", "(?<!a[a-z]{2})\\w\\w\\w", "", "abcdef", "captures", "[\"abc\"]", 0, 0, 0, ""},
 	{"nested-lookaround.js#1", "test/built-ins/RegExp/lookBehind/nested-lookaround.js", "(?<=a(?=([bc]{2}(?<!a*))d)\\w{3})\\w\\w", "", "abcdef", "match", "false", 0, 0, 0, ""},
+	{"nested-lookaround.js#c1", "test/built-ins/RegExp/lookBehind/nested-lookaround.js", "(?<=ab(?=c)\\wd)\\w\\w", "", "abcdef", "captures", "[\"ef\"]", 0, 0, 0, ""},
+	{"nested-lookaround.js#c2", "test/built-ins/RegExp/lookBehind/nested-lookaround.js", "(?<=a(?=([^a]{2})d)\\w{3})\\w\\w", "", "abcdef", "captures", "[\"ef\",\"bc\"]", 0, 0, 0, ""},
+	{"nested-lookaround.js#c3", "test/built-ins/RegExp/lookBehind/nested-lookaround.js", "(?<=a(?=([bc]{2}(?<!a{2}))d)\\w{3})\\w\\w", "", "abcdef", "captures", "[\"ef\",\"bc\"]", 0, 0, 0, ""},
+	{"nested-lookaround.js#c4", "test/built-ins/RegExp/lookBehind/nested-lookaround.js", "^faaao?(?<=^f[oa]+(?=o))", "", "faaao", "captures", "[\"faaa\"]", 0, 0, 0, ""},
 	{"simple-fixed-length.js#1", "test/built-ins/RegExp/lookBehind/simple-fixed-length.js", "^.(?<=a)", "", "b", "match", "false", 0, 0, 0, ""},
 	{"simple-fixed-length.js#2", "test/built-ins/RegExp/lookBehind/simple-fixed-length.js", "^f\\w\\w(?<=\\woo)", "", "boo", "match", "false", 0, 0, 0, ""},
 	{"simple-fixed-length.js#3", "test/built-ins/RegExp/lookBehind/simple-fixed-length.js", "^f\\w\\w(?<=\\woo)", "", "fao", "match", "false", 0, 0, 0, ""},
 	{"simple-fixed-length.js#4", "test/built-ins/RegExp/lookBehind/simple-fixed-length.js", "^f\\w\\w(?<=\\woo)", "", "foa", "match", "false", 0, 0, 0, ""},
+	{"simple-fixed-length.js#c1", "test/built-ins/RegExp/lookBehind/simple-fixed-length.js", "^.(?<=a)", "", "a", "captures", "[\"a\"]", 0, 0, 0, ""},
+	{"simple-fixed-length.js#c10", "test/built-ins/RegExp/lookBehind/simple-fixed-length.js", "(?<=a{1})\\w\\w\\w", "", "abcdef", "captures", "[\"bcd\"]", 0, 0, 0, ""},
+	{"simple-fixed-length.js#c11", "test/built-ins/RegExp/lookBehind/simple-fixed-length.js", "(?<=a{1}b{1})\\w\\w\\w", "", "abcdef", "captures", "[\"cde\"]", 0, 0, 0, ""},
+	{"simple-fixed-length.js#c12", "test/built-ins/RegExp/lookBehind/simple-fixed-length.js", "(?<=a{1}[a-z]{2})\\w\\w\\w", "", "abcdef", "captures", "[\"def\"]", 0, 0, 0, ""},
+	{"simple-fixed-length.js#c2", "test/built-ins/RegExp/lookBehind/simple-fixed-length.js", "^f..(?<=.oo)", "", "foo1", "captures", "[\"foo\"]", 0, 0, 0, ""},
+	{"simple-fixed-length.js#c3", "test/built-ins/RegExp/lookBehind/simple-fixed-length.js", "^f\\w\\w(?<=\\woo)", "", "foo2", "captures", "[\"foo\"]", 0, 0, 0, ""},
+	{"simple-fixed-length.js#c4", "test/built-ins/RegExp/lookBehind/simple-fixed-length.js", "(?<=abc)\\w\\w\\w", "", "abcdef", "captures", "[\"def\"]", 0, 0, 0, ""},
+	{"simple-fixed-length.js#c5", "test/built-ins/RegExp/lookBehind/simple-fixed-length.js", "(?<=a.c)\\w\\w\\w", "", "abcdef", "captures", "[\"def\"]", 0, 0, 0, ""},
+	{"simple-fixed-length.js#c6", "test/built-ins/RegExp/lookBehind/simple-fixed-length.js", "(?<=a\\wc)\\w\\w\\w", "", "abcdef", "captures", "[\"def\"]", 0, 0, 0, ""},
+	{"simple-fixed-length.js#c7", "test/built-ins/RegExp/lookBehind/simple-fixed-length.js", "(?<=a[a-z])\\w\\w\\w", "", "abcdef", "captures", "[\"cde\"]", 0, 0, 0, ""},
+	{"simple-fixed-length.js#c8", "test/built-ins/RegExp/lookBehind/simple-fixed-length.js", "(?<=a[a-z][a-z])\\w\\w\\w", "", "abcdef", "captures", "[\"def\"]", 0, 0, 0, ""},
+	{"simple-fixed-length.js#c9", "test/built-ins/RegExp/lookBehind/simple-fixed-length.js", "(?<=a[a-z]{2})\\w\\w\\w", "", "abcdef", "captures", "[\"def\"]", 0, 0, 0, ""},
 	{"sliced-strings.js#1", "test/built-ins/RegExp/lookBehind/sliced-strings.js", "(?=(abcdefghijklmn))(?<=\\1)a", "i", "abcdefghijklmn", "match", "false", 0, 0, 0, ""},
 	{"sliced-strings.js#2", "test/built-ins/RegExp/lookBehind/sliced-strings.js", "(?=(abcdefghijklmn))(?<=\\1)a", "", "abcdefghijklmn", "match", "false", 0, 0, 0, ""},
 	{"sliced-strings.js#3", "test/built-ins/RegExp/lookBehind/sliced-strings.js", "(?=(abcdefg))(?<=\\1)", "", "bcdefgabcdefg", "match", "false", 0, 0, 0, ""},
 	{"start-of-line.js#1", "test/built-ins/RegExp/lookBehind/start-of-line.js", "(?<=^[^a-c]{3})def", "", "abcdef", "match", "false", 0, 0, 0, ""},
 	{"start-of-line.js#2", "test/built-ins/RegExp/lookBehind/start-of-line.js", "\"^foooo(?<=^o+)$", "", "foooo", "match", "false", 0, 0, 0, ""},
 	{"start-of-line.js#3", "test/built-ins/RegExp/lookBehind/start-of-line.js", "\"^foooo(?<=^o*)$", "", "foooo", "match", "false", 0, 0, 0, ""},
+	{"start-of-line.js#c1", "test/built-ins/RegExp/lookBehind/start-of-line.js", "(?<=^abc)def", "", "abcdef", "captures", "[\"def\"]", 0, 0, 0, ""},
+	{"start-of-line.js#c10", "test/built-ins/RegExp/lookBehind/start-of-line.js", "^(f)oo(?<=^\\1o+)$", "i", "foo", "captures", "[\"foo\",\"f\"]", 0, 0, 0, ""},
+	{"start-of-line.js#c11", "test/built-ins/RegExp/lookBehind/start-of-line.js", "^(f)oo(?<=^\\1o+).$", "i", "fooሴ", "captures", "[\"fooሴ\",\"f\"]", 0, 0, 0, ""},
+	{"start-of-line.js#c12", "test/built-ins/RegExp/lookBehind/start-of-line.js", "(?<=^\\w+)def", "", "abcdefdef", "captures", "[\"def\"]", 0, 0, 0, ""},
+	{"start-of-line.js#c2", "test/built-ins/RegExp/lookBehind/start-of-line.js", "(?<=^[a-c]{3})def", "", "abcdef", "captures", "[\"def\"]", 0, 0, 0, ""},
+	{"start-of-line.js#c3", "test/built-ins/RegExp/lookBehind/start-of-line.js", "(?<=^[a-c]{3})def", "m", "xyz\nabcdef", "captures", "[\"def\"]", 0, 0, 0, ""},
+	{"start-of-line.js#c7", "test/built-ins/RegExp/lookBehind/start-of-line.js", "^foo(?<=^fo+)$", "", "foo", "captures", "[\"foo\"]", 0, 0, 0, ""},
+	{"start-of-line.js#c8", "test/built-ins/RegExp/lookBehind/start-of-line.js", "^foooo(?<=^fo*)", "", "foooo", "captures", "[\"foooo\"]", 0, 0, 0, ""},
+	{"start-of-line.js#c9", "test/built-ins/RegExp/lookBehind/start-of-line.js", "^(f)oo(?<=^\\1o+)$", "", "foo", "captures", "[\"foo\",\"f\"]", 0, 0, 0, ""},
+	{"sticky.js#c1", "test/built-ins/RegExp/lookBehind/sticky.js", "(?<=^(\\w+))def", "g", "abcdefdef", "captures", "[\"def\",\"abc\"]", 0, 0, 0, ""},
+	{"sticky.js#c3", "test/built-ins/RegExp/lookBehind/sticky.js", "\\Bdef", "g", "abcdefdef", "captures", "[\"def\"]", 0, 0, 0, ""},
+	{"variable-length.js#c1", "test/built-ins/RegExp/lookBehind/variable-length.js", "(?<=[a|b|c]*)[^a|b|c]{3}", "", "abcdef", "captures", "[\"def\"]", 0, 0, 0, ""},
+	{"variable-length.js#c2", "test/built-ins/RegExp/lookBehind/variable-length.js", "(?<=\\w*)[^a|b|c]{3}", "", "abcdef", "captures", "[\"def\"]", 0, 0, 0, ""},
 	{"word-boundary.js#1", "test/built-ins/RegExp/lookBehind/word-boundary.js", "(?<=\\b)[d-f]{3}", "", "abcdef", "match", "false", 0, 0, 0, ""},
+	{"word-boundary.js#c1", "test/built-ins/RegExp/lookBehind/word-boundary.js", "(?<=\\b)[d-f]{3}", "", "abc def", "captures", "[\"def\"]", 0, 0, 0, ""},
+	{"word-boundary.js#c2", "test/built-ins/RegExp/lookBehind/word-boundary.js", "(?<=\\B)\\w{3}", "", "ab cdef", "captures", "[\"def\"]", 0, 0, 0, ""},
+	{"word-boundary.js#c3", "test/built-ins/RegExp/lookBehind/word-boundary.js", "(?<=\\B)(?<=c(?<=\\w))\\w{3}", "", "ab cdef", "captures", "[\"def\"]", 0, 0, 0, ""},
+	{"lookahead-quantifier-match-groups.js#c1", "test/built-ins/RegExp/lookahead-quantifier-match-groups.js", "(?:(?=(abc)))a", "", "abc", "captures", "[\"a\",\"abc\"]", 0, 0, 0, ""},
+	{"lookahead-quantifier-match-groups.js#c2", "test/built-ins/RegExp/lookahead-quantifier-match-groups.js", "(?:(?=(abc)))?a", "", "abc", "captures", "[\"a\",null]", 0, 0, 0, ""},
+	{"lookahead-quantifier-match-groups.js#c3", "test/built-ins/RegExp/lookahead-quantifier-match-groups.js", "(?:(?=(abc))){1,1}a", "", "abc", "captures", "[\"a\",\"abc\"]", 0, 0, 0, ""},
+	{"lookahead-quantifier-match-groups.js#c4", "test/built-ins/RegExp/lookahead-quantifier-match-groups.js", "(?:(?=(abc))){0,1}a", "", "abc", "captures", "[\"a\",null]", 0, 0, 0, ""},
 	{"indices-array-matched.js#2", "test/built-ins/RegExp/match-indices/indices-array-matched.js", "b(c)", "d", "abcd", "submatch", "bc", 0, 0, 0, ""},
-	{"duplicate-names-exec.js#1", "test/built-ins/RegExp/named-groups/duplicate-names-exec.js", "(?:(?:(?<x>a)|(?<x>b))\\k<x>){2}", "", "aabb", "submatch", "b", 2, 0, 0, ""},
 	{"duplicate-names-exec.js#2", "test/built-ins/RegExp/named-groups/duplicate-names-exec.js", "(?:(?:(?<x>a)|(?<x>b))\\k<x>){2}", "", "abab", "match", "false", 0, 0, 0, ""},
 	{"duplicate-names-exec.js#3", "test/built-ins/RegExp/named-groups/duplicate-names-exec.js", "(?:(?<x>a)|(?<x>b))\\k<x>", "", "abab", "match", "false", 0, 0, 0, ""},
 	{"duplicate-names-exec.js#4", "test/built-ins/RegExp/named-groups/duplicate-names-exec.js", "(?:(?<x>a)|(?<x>b))\\k<x>", "", "cdef", "match", "false", 0, 0, 0, ""},
 	{"duplicate-names-exec.js#5", "test/built-ins/RegExp/named-groups/duplicate-names-exec.js", "^(?:(?<a>x)|(?<a>y)|z)\\k<a>$", "", "zz", "match", "false", 0, 0, 0, ""},
 	{"duplicate-names-exec.js#6", "test/built-ins/RegExp/named-groups/duplicate-names-exec.js", "^(?:(?<a>x)|(?<a>y)|z){2}\\k<a>$", "", "xzx", "match", "false", 0, 0, 0, ""},
 	{"duplicate-names-exec.js#7", "test/built-ins/RegExp/named-groups/duplicate-names-exec.js", "^(?:(?<a>x)|(?<a>y)|z){2}\\k<a>$", "", "yzy", "match", "false", 0, 0, 0, ""},
+	{"duplicate-names-exec.js#c1", "test/built-ins/RegExp/named-groups/duplicate-names-exec.js", "(?<x>a)|(?<x>b)", "", "bab", "captures", "[\"b\",null,\"b\"]", 0, 0, 0, ""},
+	{"duplicate-names-exec.js#c10", "test/built-ins/RegExp/named-groups/duplicate-names-exec.js", "^(?:(?<a>x)|(?<a>y)|z){2}\\k<a>$", "", "yz", "captures", "[\"yz\",null,null]", 0, 0, 0, ""},
+	{"duplicate-names-exec.js#c2", "test/built-ins/RegExp/named-groups/duplicate-names-exec.js", "(?<x>b)|(?<x>a)", "", "bab", "captures", "[\"b\",\"b\",null]", 0, 0, 0, ""},
+	{"duplicate-names-exec.js#c3", "test/built-ins/RegExp/named-groups/duplicate-names-exec.js", "(?:(?<x>a)|(?<x>b))\\k<x>", "", "aa", "captures", "[\"aa\",\"a\",null]", 0, 0, 0, ""},
+	{"duplicate-names-exec.js#c4", "test/built-ins/RegExp/named-groups/duplicate-names-exec.js", "(?:(?<x>a)|(?<x>b))\\k<x>", "", "bb", "captures", "[\"bb\",null,\"b\"]", 0, 0, 0, ""},
+	{"duplicate-names-exec.js#c5", "test/built-ins/RegExp/named-groups/duplicate-names-exec.js", "(?:(?:(?<x>a)|(?<x>b))\\k<x>){2}", "", "aabb", "captures", "[\"aabb\",null,\"b\"]", 0, 0, 0, ""},
+	{"duplicate-names-exec.js#c6", "test/built-ins/RegExp/named-groups/duplicate-names-exec.js", "^(?:(?<a>x)|(?<a>y)|z)\\k<a>$", "", "xx", "captures", "[\"xx\",\"x\",null]", 0, 0, 0, ""},
+	{"duplicate-names-exec.js#c7", "test/built-ins/RegExp/named-groups/duplicate-names-exec.js", "^(?:(?<a>x)|(?<a>y)|z)\\k<a>$", "", "z", "captures", "[\"z\",null,null]", 0, 0, 0, ""},
+	{"duplicate-names-exec.js#c8", "test/built-ins/RegExp/named-groups/duplicate-names-exec.js", "(?<a>x)|(?:zy\\k<a>)", "", "zy", "captures", "[\"zy\",null]", 0, 0, 0, ""},
+	{"duplicate-names-exec.js#c9", "test/built-ins/RegExp/named-groups/duplicate-names-exec.js", "^(?:(?<a>x)|(?<a>y)|z){2}\\k<a>$", "", "xz", "captures", "[\"xz\",null,null]", 0, 0, 0, ""},
 	{"duplicate-names-match.js#1", "test/built-ins/RegExp/named-groups/duplicate-names-match.js", "(?:(?:(?<x>a)|(?<x>b))\\k<x>){2}", "", "aabb", "submatch", "b", 2, 0, 0, ""},
 	{"duplicate-names-match.js#2", "test/built-ins/RegExp/named-groups/duplicate-names-match.js", "(?:(?:(?<x>a)|(?<x>b))\\k<x>){2}", "", "abab", "match", "false", 0, 0, 0, ""},
 	{"duplicate-names-match.js#3", "test/built-ins/RegExp/named-groups/duplicate-names-match.js", "(?:(?<x>a)|(?<x>b))\\k<x>", "", "abab", "match", "false", 0, 0, 0, ""},
@@ -66361,6 +66455,16 @@ var test262GeneratedCases = []struct {
 	{"duplicate-names-match.js#5", "test/built-ins/RegExp/named-groups/duplicate-names-match.js", "^(?:(?<a>x)|(?<a>y)|z)\\k<a>$", "", "zz", "match", "false", 0, 0, 0, ""},
 	{"duplicate-names-match.js#6", "test/built-ins/RegExp/named-groups/duplicate-names-match.js", "^(?:(?<a>x)|(?<a>y)|z){2}\\k<a>$", "", "xzx", "match", "false", 0, 0, 0, ""},
 	{"duplicate-names-match.js#7", "test/built-ins/RegExp/named-groups/duplicate-names-match.js", "^(?:(?<a>x)|(?<a>y)|z){2}\\k<a>$", "", "yzy", "match", "false", 0, 0, 0, ""},
+	{"duplicate-names-match.js#c1", "test/built-ins/RegExp/named-groups/duplicate-names-match.js", "(?<x>a)|(?<x>b)", "", "bab", "captures", "[\"b\",null,\"b\"]", 0, 0, 0, ""},
+	{"duplicate-names-match.js#c10", "test/built-ins/RegExp/named-groups/duplicate-names-match.js", "^(?:(?<a>x)|(?<a>y)|z){2}\\k<a>$", "", "yz", "captures", "[\"yz\",null,null]", 0, 0, 0, ""},
+	{"duplicate-names-match.js#c2", "test/built-ins/RegExp/named-groups/duplicate-names-match.js", "(?<x>b)|(?<x>a)", "", "bab", "captures", "[\"b\",\"b\",null]", 0, 0, 0, ""},
+	{"duplicate-names-match.js#c3", "test/built-ins/RegExp/named-groups/duplicate-names-match.js", "(?:(?<x>a)|(?<x>b))\\k<x>", "", "aa", "captures", "[\"aa\",\"a\",null]", 0, 0, 0, ""},
+	{"duplicate-names-match.js#c4", "test/built-ins/RegExp/named-groups/duplicate-names-match.js", "(?:(?<x>a)|(?<x>b))\\k<x>", "", "bb", "captures", "[\"bb\",null,\"b\"]", 0, 0, 0, ""},
+	{"duplicate-names-match.js#c5", "test/built-ins/RegExp/named-groups/duplicate-names-match.js", "(?:(?:(?<x>a)|(?<x>b))\\k<x>){2}", "", "aabb", "captures", "[\"aabb\",null,\"b\"]", 0, 0, 0, ""},
+	{"duplicate-names-match.js#c6", "test/built-ins/RegExp/named-groups/duplicate-names-match.js", "^(?:(?<a>x)|(?<a>y)|z)\\k<a>$", "", "xx", "captures", "[\"xx\",\"x\",null]", 0, 0, 0, ""},
+	{"duplicate-names-match.js#c7", "test/built-ins/RegExp/named-groups/duplicate-names-match.js", "^(?:(?<a>x)|(?<a>y)|z)\\k<a>$", "", "z", "captures", "[\"z\",null,null]", 0, 0, 0, ""},
+	{"duplicate-names-match.js#c8", "test/built-ins/RegExp/named-groups/duplicate-names-match.js", "(?<a>x)|(?:zy\\k<a>)", "", "zy", "captures", "[\"zy\",null]", 0, 0, 0, ""},
+	{"duplicate-names-match.js#c9", "test/built-ins/RegExp/named-groups/duplicate-names-match.js", "^(?:(?<a>x)|(?<a>y)|z){2}\\k<a>$", "", "xz", "captures", "[\"xz\",null,null]", 0, 0, 0, ""},
 	{"duplicate-names-replace.js#1", "test/built-ins/RegExp/named-groups/duplicate-names-replace.js", "(?<x>a)|(?<x>b)", "", "ab", "replace", "[a]b", 0, 0, 0, "[$<x>]"},
 	{"duplicate-names-replace.js#2", "test/built-ins/RegExp/named-groups/duplicate-names-replace.js", "(?<x>a)|(?<x>b)", "", "ba", "replace", "[b]a", 0, 0, 0, "[$<x>]"},
 	{"duplicate-names-replace.js#3", "test/built-ins/RegExp/named-groups/duplicate-names-replace.js", "(?<x>a)|(?<x>b)", "", "ab", "replace", "[a][a][]b", 0, 0, 0, "[$<x>][$1][$2]"},
@@ -66675,6 +66779,8 @@ var test262GeneratedCases = []struct {
 	{"regexp-builtin-exec-v-u-flag.js#4", "test/built-ins/RegExp/prototype/exec/regexp-builtin-exec-v-u-flag.js", "\\p{ASCII}", "v", "𠮷a𠮷b𠮷", "submatch", "a", 0, 0, 0, ""},
 	{"regexp-builtin-exec-v-u-flag.js#6", "test/built-ins/RegExp/prototype/exec/regexp-builtin-exec-v-u-flag.js", "(\\p{Script=Han})(.)", "v", "𠮷a𠮷b𠮷", "submatch", "𠮷", 1, 0, 0, ""},
 	{"regexp-builtin-exec-v-u-flag.js#7", "test/built-ins/RegExp/prototype/exec/regexp-builtin-exec-v-u-flag.js", "\\p{ASCII}", "u", "𠮷a𠮷b𠮷", "submatch", "a", 0, 0, 0, ""},
+	{"regexp-builtin-exec-v-u-flag.js#c10", "test/built-ins/RegExp/prototype/exec/regexp-builtin-exec-v-u-flag.js", "\\P{ASCII}", "u", "a𠮷b\U0010ffffc", "captures", "[\"𠮷\"]", 0, 0, 0, ""},
+	{"regexp-builtin-exec-v-u-flag.js#c11", "test/built-ins/RegExp/prototype/exec/regexp-builtin-exec-v-u-flag.js", "\\P{ASCII}", "v", "a𠮷b\U0010ffffc", "captures", "[\"𠮷\"]", 0, 0, 0, ""},
 	{"success-g-lastindex-no-access.js#2", "test/built-ins/RegExp/prototype/exec/success-g-lastindex-no-access.js", ".", "g", "abc", "submatch", "a", 0, 0, 0, ""},
 	{"success-lastindex-access.js#2", "test/built-ins/RegExp/prototype/exec/success-lastindex-access.js", ".", "", "abc", "submatch", "a", 0, 0, 0, ""},
 	{"u-lastindex-adv.js#1", "test/built-ins/RegExp/prototype/exec/u-lastindex-adv.js", "\\udf06", "u", "𝌆", "match", "false", 0, 0, 0, ""},
@@ -67526,6 +67632,27 @@ func TestTest262Generated(t *testing.T) {
 				want := tc.expect == "true"
 				if got != want {
 					t.Fatalf("%s: /%s/%s.MatchString(%q) = %v, want %v", tc.file, tc.pattern, tc.flags, tc.input, got, want)
+				}
+			case "captures":
+				// expect is a JSON array of the whole match and each group,
+				// null for a group that did not participate.
+				var want []*string
+				if err := json.Unmarshal([]byte(tc.expect), &want); err != nil {
+					t.Fatalf("bad expectation %s: %v", tc.expect, err)
+				}
+				idx := re.FindStringSubmatchIndex(tc.input)
+				var got []*string
+				for i := 0; i+1 < len(idx); i += 2 {
+					if idx[i] < 0 {
+						got = append(got, nil)
+						continue
+					}
+					s := tc.input[idx[i]:idx[i+1]]
+					got = append(got, &s)
+				}
+				if !reflect.DeepEqual(got, want) {
+					g, _ := json.Marshal(got)
+					t.Fatalf("%s: /%s/%s exec(%q) = %s, want %s", tc.file, tc.pattern, tc.flags, tc.input, g, tc.expect)
 				}
 			case "find":
 				got := re.FindString(tc.input)

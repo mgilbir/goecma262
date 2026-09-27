@@ -234,7 +234,7 @@ go test ./...
 ```
 
 The implementation is tested against the official ECMAScript
-[Test262](https://github.com/tc39/test262) suite: **all 67,469 extracted
+[Test262](https://github.com/tc39/test262) suite: **all 67,573 extracted
 match cases and 1,019 syntax cases (patterns that must, or must not,
 compile) pass or are explicitly skipped**. The 33 permanent skips need a real
 JavaScript runtime (e.g. a JS function as replacement argument), exceed

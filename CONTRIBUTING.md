@@ -49,9 +49,10 @@ and assertions, and records two kinds of case:
 
 - **Match cases** (`tests/test262_generated_test.go`): a `test`, `exec`,
   `match`, `replace` or `split` call paired with the assertion on its result —
-  `assert.sameValue`, or `assert(...)` on a `test` call (the test's
+  `assert.sameValue`; `assert(...)` on a `test` call (the test's
   expectation is then the result Node produced, since Node passed the
-  assertion).
+  assertion); or `assert.compareArray` on a whole `exec` or non-global
+  `match` result, which also checks which groups are undefined.
 - **Syntax cases** (`tests/test262_syntax_generated_test.go`): patterns that
   must be SyntaxErrors — those the `RegExp` constructor rejects inside
   `assert.throws(SyntaxError, …)`, and the regular expression literal of each

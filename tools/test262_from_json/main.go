@@ -24,6 +24,8 @@ type jsonCase struct {
 	LastIndex   any     `json:"lastIndex"` // may be number, string, or object (coerced to int)
 	ReplaceWith *string `json:"replaceWith"`
 	SplitLimit  *int    `json:"splitLimit"`
+	// ExpectedCaptures is a whole exec result, null for an undefined group.
+	ExpectedCaptures []*string `json:"expectedCaptures"`
 }
 
 // jsonSyntax is a pattern that must (Valid) or must not compile.
@@ -202,6 +204,26 @@ func coerceLastIndex(v any) int {
 
 func convertCase(c jsonCase) (goCase, bool) {
 	li := coerceLastIndex(c.LastIndex)
+	if c.ExpectedCaptures != nil {
+		// FindStringSubmatchIndex searches from 0, which is what exec does
+		// only when lastIndex is 0.
+		if li != 0 {
+			return goCase{}, false
+		}
+		expect, err := json.Marshal(c.ExpectedCaptures)
+		if err != nil {
+			return goCase{}, false
+		}
+		return goCase{
+			Name:    c.Name,
+			File:    c.File,
+			Pattern: c.Pattern,
+			Flags:   c.Flags,
+			Input:   c.Input,
+			Kind:    "captures",
+			Expect:  string(expect),
+		}, true
+	}
 	switch c.Method {
 	case "test":
 		b, ok := c.Expected.(bool)
@@ -384,7 +406,7 @@ func writeGo(outPath, commit string, cases []goCase) error {
 	if err := writeString("package ecma262_test\n\n"); err != nil {
 		return err
 	}
-	if err := writeString("import (\n\t\"os\"\n\t\"testing\"\n\n\t\"github.com/mgilbir/goecma262\"\n\t\"github.com/mgilbir/goecma262/flags\"\n)\n\n"); err != nil {
+	if err := writeString("import (\n\t\"encoding/json\"\n\t\"os\"\n\t\"reflect\"\n\t\"testing\"\n\n\t\"github.com/mgilbir/goecma262\"\n\t\"github.com/mgilbir/goecma262/flags\"\n)\n\n"); err != nil {
 		return err
 	}
 
@@ -473,6 +495,27 @@ func writeGo(outPath, commit string, cases []goCase) error {
 				want := tc.expect == "true"
 				if got != want {
 					t.Fatalf("%s: /%s/%s.MatchString(%q) = %v, want %v", tc.file, tc.pattern, tc.flags, tc.input, got, want)
+				}
+			case "captures":
+				// expect is a JSON array of the whole match and each group,
+				// null for a group that did not participate.
+				var want []*string
+				if err := json.Unmarshal([]byte(tc.expect), &want); err != nil {
+					t.Fatalf("bad expectation %s: %v", tc.expect, err)
+				}
+				idx := re.FindStringSubmatchIndex(tc.input)
+				var got []*string
+				for i := 0; i+1 < len(idx); i += 2 {
+					if idx[i] < 0 {
+						got = append(got, nil)
+						continue
+					}
+					s := tc.input[idx[i]:idx[i+1]]
+					got = append(got, &s)
+				}
+				if !reflect.DeepEqual(got, want) {
+					g, _ := json.Marshal(got)
+					t.Fatalf("%s: /%s/%s exec(%q) = %s, want %s", tc.file, tc.pattern, tc.flags, tc.input, g, tc.expect)
 				}
 			case "find":
 				got := re.FindString(tc.input)

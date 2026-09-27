@@ -247,6 +247,7 @@ function runFile(relPath, content, harnessFiles) {
   const syntaxErrors = [];
   let assertIndex = 0;
   let truthyIndex = 0;
+  let arrayIndex = 0;
   let callsAtLastAssert = 0; // calls.length after the latest assertion
 
   const context = {
@@ -332,9 +333,41 @@ function runFile(relPath, content, harnessFiles) {
     });
   }
 
+  // recordArray handles assert.compareArray(actual, expected) where actual is
+  // the result array of the latest exec or non-global match: the test then
+  // expects the whole match, with undefined for groups that did not
+  // participate. Names use #c.
+  function recordArray(actual, expected) {
+    arrayIndex++;
+    const fresh = calls.length > callsAtLastAssert;
+    callsAtLastAssert = calls.length;
+    if (!fresh || !Array.isArray(expected) || !Array.isArray(actual)) return;
+    const call = calls[calls.length - 1];
+    if (!Object.is(call.result, actual)) return;
+    if (call.method !== "exec" && !(call.method === "string_match" && !call.flags.includes("g"))) return;
+    if (!expected.every((e) => e === undefined || typeof e === "string")) return;
+    calls.pop();
+    callsAtLastAssert = calls.length;
+    results.push({
+      file: relPath,
+      name: `${path.basename(relPath)}#c${arrayIndex}`,
+      method: call.method,
+      pattern: call.pattern,
+      flags: call.flags,
+      input: call.input,
+      expected: null,
+      expectedCaptures: expected.map((e) => (e === undefined ? null : e)),
+      matchIndex: null,
+      lastIndex: coerceLastIndexForJSON(call.extra.lastIndex),
+      replaceWith: null,
+      splitLimit: null,
+    });
+  }
+
   ctx.__recordCall = recordCall;
   ctx.__recordAssert = recordAssert;
   ctx.__recordTruthy = recordTruthy;
+  ctx.__recordArray = recordArray;
   ctx.__recordSyntaxError = (pattern, flags) => syntaxErrors.push({ pattern, flags });
   ctx.__callCount = () => calls.length;
   ctx.__dropCallsFrom = (n) => {
@@ -430,6 +463,13 @@ function runFile(relPath, content, harnessFiles) {
         }
       };
     }
+    if (globalThis.assert && typeof globalThis.assert.compareArray === "function") {
+      const origCompareArray = globalThis.assert.compareArray;
+      globalThis.assert.compareArray = function(actual, expected, message) {
+        globalThis.__recordArray(actual, expected);
+        try { return origCompareArray(actual, expected, message); } catch (e) { return undefined; }
+      };
+    }
     if (globalThis.assert && typeof globalThis.assert.sameValue === "function") {
       const origSameValue = globalThis.assert.sameValue;
       globalThis.assert.sameValue = function(actual, expected) {
@@ -457,7 +497,7 @@ function runFile(relPath, content, harnessFiles) {
     // Ignore test failures, we only care about captured calls.
   }
 
-  return { ok: true, results, asserts: assertIndex + truthyIndex, syntaxErrors };
+  return { ok: true, results, asserts: assertIndex + truthyIndex + arrayIndex, syntaxErrors };
 }
 
   function findMatchingCall(calls, actual) {
