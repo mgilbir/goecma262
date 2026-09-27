@@ -114,6 +114,58 @@ export function hasEndAnchorAstralMiss(pattern, flags, input) {
   return false;
 }
 
+/**
+ * Wraps every top-level character class, property escape and class escape
+ * (\d \D \w \W \s \S) of a pattern in a non-capturing group, which by the
+ * specification changes nothing: [c] and (?:[c]) match exactly the same
+ * strings, with the same captures. Used by hasModifierClassLeak in the oracle.
+ * Returns null for a pattern it cannot tokenize (an unterminated class or
+ * property escape); such a pattern is a syntax error anyway.
+ */
+export function wrapClasses(pattern) {
+  let out = "";
+  for (let i = 0; i < pattern.length; ) {
+    const c = pattern[i];
+    if (c === "\\") {
+      const n = pattern[i + 1];
+      if ((n === "p" || n === "P") && pattern[i + 2] === "{") {
+        const end = pattern.indexOf("}", i);
+        if (end < 0) return null;
+        out += "(?:" + pattern.slice(i, end + 1) + ")";
+        i = end + 1;
+      } else if (n !== undefined && "dDwWsS".includes(n)) {
+        out += "(?:\\" + n + ")";
+        i += 2;
+      } else {
+        out += pattern.slice(i, i + 2);
+        i += 2;
+      }
+      continue;
+    }
+    if (c === "[") {
+      // Under v classes nest; an escape inside one is never structural.
+      let depth = 0;
+      let j = i;
+      for (; j < pattern.length; j++) {
+        if (pattern[j] === "\\") {
+          j++;
+        } else if (pattern[j] === "[") {
+          depth++;
+        } else if (pattern[j] === "]" && --depth === 0) {
+          break;
+        }
+      }
+      if (j >= pattern.length) return null;
+      out += "(?:" + pattern.slice(i, j + 1) + ")";
+      i = j + 1;
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return out;
+}
+
 /** Deterministic LCG, so a fuzz failure is reproducible from its seed. */
 export function rng(seed) {
   let s = seed >>> 0;

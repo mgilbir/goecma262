@@ -431,7 +431,7 @@ func main() {
 			skips[exp[0]]++
 			continue
 		}
-		if strings.ContainsRune("!~%&@", rune(exp[0])) {
+		if strings.ContainsRune("!~%&@*", rune(exp[0])) {
 			skips[exp[0]]++
 			continue
 		}

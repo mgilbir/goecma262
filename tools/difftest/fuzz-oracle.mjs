@@ -22,13 +22,14 @@
 //                                          halves of a surrogate pair (see
 //                                          splitsResult)
 //           "T"                            oracle-side failure (not a spec behaviour)
-// A leading "!", "~", "%", "&" or "@" marks a known V8 defect the comparison skips.
+// A leading "!", "~", "%", "&", "@" or "*" marks a known V8 defect the comparison skips.
 
 import readline from "node:readline";
 import {
   hasSingleCharQuotedString,
   hasModifierWithWordEscape,
   hasEndAnchorAstralMiss,
+  wrapClasses,
 } from "./corpus.mjs";
 
 /** base64 of UTF-16LE code units -> string, preserving lone surrogates. */
@@ -162,6 +163,40 @@ function hasDotAllInconsistency(re, op, input, extra) {
   }
 }
 
+/**
+ * A sixth V8 defect, detected by catching V8 contradicting itself.
+ *
+ * Under v, a modifier group that changes i leaks that setting into character
+ * classes after it, which V8 then builds with the group's i instead of their
+ * own - in both directions:
+ *
+ *   /(?i:x)[A-Z]/v.exec("xc")       // matches in V8; [A-Z] is not under i
+ *   /(?i:x)(?:[A-Z])/v.exec("xc")   // null, as it should be
+ *   /(?-i:x)[^A-Z]/vi.exec("xc")    // matches in V8; [^A-Z] is under i
+ *
+ * Which classes are hit does not follow the syntax in any simple way
+ * ((?i:x)[c] leaks, (?i:x)[\q{c}] and (?i:x)(?:[c]) do not), so rather than
+ * guess, this reruns the case with every class wrapped in (?:...) - which by
+ * the specification changes nothing - and flags it when V8's two answers
+ * differ. Like hasDotAllInconsistency, it can only fire where V8 is provably
+ * self-inconsistent. It runs only under v with a modifier group that sets or
+ * clears i, the one place the leak has been seen; u is unaffected.
+ */
+function hasModifierClassLeak(re, op, input, extra) {
+  if (!re.flags.includes("v")) return false;
+  // A modifier group whose flags, on either side of the dash, include i.
+  if (!/\(\?(?=[ims-]*i)[ims]*(?:-[ims]*)?:/.test(re.source)) return false;
+  const wrapped = wrapClasses(re.source);
+  if (wrapped === null || wrapped === re.source) return false;
+  try {
+    const plain = new RegExp(re.source, re.flags);
+    const other = new RegExp(wrapped, re.flags);
+    return runOp(plain, op, input, extra) !== runOp(other, op, input, extra);
+  } catch {
+    return false;
+  }
+}
+
 const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 
 /**
@@ -216,7 +251,9 @@ rl.on("line", (line) => {
             ? "&"
             : hasDotAllInconsistency(re, op, input, extra)
               ? "@"
-              : "";
+              : hasModifierClassLeak(re, op, input, extra)
+                ? "*"
+                : "";
 
     const rendered = runOp(re, op, input, extra);
     emit(mark + (splitsResult(re, op, input, rendered) ? "U" : rendered));
