@@ -183,6 +183,19 @@ the cursor directly.
 **Offsets are bytes.** All positions (`lastIndex`, `*Index` results) are byte
 offsets into the Go string, not UTF-16 code-unit indices as in JavaScript.
 
+**Characters above U+FFFF.** Without `u` or `v`, JavaScript matches UTF-16
+code units, and so does this engine: `😀` is two characters to such a
+pattern, its high and low surrogate. `/^..$/` matches `"😀"`, `/^.$/` does
+not, and `/\uD83D/` matches its first half. With `u` or `v` a character is a
+code point. A result that begins or ends between the two halves has no Go
+form (a Go string cannot hold half a pair, and the position between them is
+no byte offset), so the `Err` methods return `ErrSurrogateSplit` for it; the
+others report no match, `FindAll*` and `Split` stop there, and `ReplaceAll*`
+return the input unchanged. Results that can be expressed are returned in
+full: `/x*/g` finds three empty matches in `"😀"`, and replacing them with
+`""` gives `"😀"` back. `lastIndex` may fall between the halves, at the
+character's first byte plus 2 (see `SetLastIndex`).
+
 **Bounded matching (ReDoS protection).** Matching backtracks on an explicit,
 heap-allocated stack, so no input can overflow the goroutine stack. Every
 match operation runs under an execution budget of steps and backtracking
@@ -215,7 +228,7 @@ if errors.Is(err, ecma262.ErrStepLimit) {
 returns typed errors (`InvalidFlagError`, `DuplicateFlagError`,
 `IncompatibleFlagsError`). An exceeded execution budget is `ErrStepLimit`
 (the same value as `vm.ErrStepLimit`; the memory form wraps it), comparable
-with `errors.Is`.
+with `errors.Is`. A result with no Go form (see above) is `ErrSurrogateSplit`.
 
 ## Architecture
 

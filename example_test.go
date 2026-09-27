@@ -186,6 +186,20 @@ func ExampleRegexp_FindString_classSets() {
 	// true
 }
 
+// Without u or v, a character above U+FFFF is two UTF-16 code units, as in
+// JavaScript. A result that splits it has no Go form.
+func ExampleErrSurrogateSplit() {
+	fmt.Println(ecma262.MustCompile(`^..$`, flags.Flags(0)).MatchString("😀"))
+	fmt.Println(ecma262.MustCompile(`^.$`, flags.Unicode).MatchString("😀"))
+
+	_, err := ecma262.MustCompile(`\uD83D`, flags.Flags(0)).FindStringIndexErr("😀")
+	fmt.Println(errors.Is(err, ecma262.ErrSurrogateSplit))
+	// Output:
+	// true
+	// true
+	// true
+}
+
 func ExampleWithSyntax() {
 	// By default the compiler accepts the Annex B web-compatibility syntax,
 	// so patterns that work in browsers work here. Strict mode rejects it.

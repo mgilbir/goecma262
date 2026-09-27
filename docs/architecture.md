@@ -24,7 +24,7 @@ static analysis that keeps common patterns linear-time.
 ```mermaid
 flowchart LR
     subgraph Compile["Compile(expr, flags, opts) — once per pattern"]
-        SRC["pattern string"] --> PARSE["parser.Parser<br/>recursive descent over code points<br/>Annex B or strict syntax"]
+        SRC["pattern string"] --> PARSE["parser.Parser<br/>recursive descent over code points<br/>(UTF-16 code units without u/v)<br/>Annex B or strict syntax"]
         PARSE --> AST["AST (parser.Pattern)"]
         AST --> COMP["compiler.Compile<br/>lookbehind bodies reversed"]
         COMP --> CODE["[]vm.Instruction<br/>+ numGroups + group names"]
@@ -33,7 +33,7 @@ flowchart LR
     subgraph Match["each match call — fresh VM instance"]
         PROG --> VM["vm.VM.MatchAt(input, pos)<br/>shared budget and failure memo<br/>across successive start positions"]
         VM -->|"matched"| GROUPS["capture groups<br/>[]int byte-offset pairs"]
-        VM -->|"no match"| NEXT["advance one rune,<br/>retry (unless sticky)"]
+        VM -->|"no match"| NEXT["advance one character,<br/>retry (unless sticky)"]
         VM -->|"budget exhausted"| ERR["vm.ErrStepLimit<br/>(Err methods and package-level<br/>Match/MatchString return it;<br/>other methods report no match)"]
     end
     FLAGS["flags.Flags (i g m s u v y d)"] --> Compile
@@ -65,7 +65,7 @@ stateDiagram-v2
     Exec --> Matched: OpMatch reached
     Exec --> StepLimit: steps or backtracking memory<br/>over budget
     Matched --> [*]: groups returned
-    NoMatch --> [*]: caller advances one rune and rescans
+    NoMatch --> [*]: caller advances one character and rescans
     StepLimit --> [*]: vm.Err = ErrStepLimit
 ```
 
@@ -91,10 +91,27 @@ Details worth knowing before touching the VM:
 - **Iteration helpers share one cursor implementation.** `findAllMatches`
   in the root package is the single source of truth for how `FindAll*` and
   `ReplaceAll*` advance past matches (including the zero-width-match
-  rune-step rule), so their behaviors cannot drift apart. `Split` is the
+  one-character step), so their behaviors cannot drift apart. `Split` is the
   exception: it follows ECMA-262's `@@split` position loop instead, where an
   empty match never splits at the start of the input, at its end, or where
   the previous match ended.
+- **Without `u`/`v`, a character is a UTF-16 code unit.** The parser
+  expands a character above U+FFFF in the pattern into its surrogate pair
+  (except in a group name, where the spec joins the pair again), and
+  `VM.readRune` reads one in the input as two surrogates. The position
+  between them has no byte offset, so it is represented as the offset of the
+  character's first byte plus 2 (`midOffset`): inside the character's
+  four-byte UTF-8 sequence, never a boundary, so positions stay ordered ints
+  and the memo, marks and budget need no change. `vm.BetweenSurrogates`
+  recognises it and `vm.NextPosition` steps onto it. Everything that reads the
+  input — the greedy-loop retreat, `^`/`$`, `\b`, backreferences — goes
+  through `readRune`, whose only new work is for a four-byte lead or a
+  continuation byte, and only without `u`/`v`. The
+  root package checks each result it hands out (`indicesOK`, `textsOK`, the
+  replacement `splicer`) and reports one with no Go form as
+  `ErrSurrogateSplit`. The first-byte sets need no change: a surrogate is
+  non-ASCII, and every instruction that can match non-ASCII already admits
+  every byte from 0x80 up.
 
 ## Lookarounds and right-to-left lookbehind
 

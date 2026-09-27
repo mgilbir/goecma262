@@ -9,14 +9,16 @@
 // It speaks the line protocol of tools/difftest/fuzz-oracle.mjs, where every
 // string travels as base64 of its UTF-16 code units.
 //
-// Three differences are inherent to a Go API and are counted, not reported:
+// Positions are byte offsets here and UTF-16 indices in JavaScript, and are
+// converted. A result with a position between the two halves of a surrogate
+// pair (possible without u or v) has no byte offset; the engine reports it as
+// ErrSurrogateSplit and the oracle as "U", and those must agree like any other
+// answer.
+//
+// Two differences are inherent to a Go API and are counted, not reported:
 //
 //   - A pattern, input or replacement containing a lone surrogate has no
 //     UTF-8 form, so it cannot be expressed as a Go string at all.
-//   - Positions are byte offsets here and UTF-16 indices in JavaScript. They
-//     are converted, but a JavaScript result that begins or ends between the
-//     two halves of a surrogate pair (possible without u or v) has no byte
-//     offset.
 //   - A case this engine abandons because it exceeded its step budget has no
 //     answer to compare. Such cases are screened out before node sees them,
 //     since node has no budget and a catastrophic pattern would hang it.
@@ -36,6 +38,7 @@ package main
 import (
 	"bufio"
 	"encoding/base64"
+	"errors"
 	"flag"
 	"fmt"
 	"math/rand"
@@ -404,6 +407,9 @@ func main() {
 	screened := 0
 	for _, c := range cases {
 		out, err := run(c)
+		if errors.Is(err, ecma262.ErrSurrogateSplit) {
+			out, err = "U", nil
+		}
 		if err != nil {
 			screened++
 			continue
@@ -418,7 +424,7 @@ func main() {
 	skips := map[byte]int{}
 	var failures []string
 	byKind := map[string]int{}
-	noForm := 0
+	noGoForm := 0 // agreed answers that were "U"
 	for i, c := range cases {
 		exp := theirs[i]
 		if exp == "T" || exp == oracleHung {
@@ -435,10 +441,9 @@ func main() {
 			continue
 		}
 		if strings.TrimRight(got, " ") == strings.TrimRight(exp, " ") {
-			continue
-		}
-		if !representable(c, exp) {
-			noForm++
+			if got == "U" {
+				noGoForm++
+			}
 			continue
 		}
 		kind := classify(c, got, exp)
@@ -446,8 +451,8 @@ func main() {
 		failures = append(failures, fmt.Sprintf("[%s] %s\n    node: %s\n    ours: %s", kind, c, render(exp), render(got)))
 	}
 
-	fmt.Printf("%d cases compared; %d unrepresentable (lone surrogate), %d screened (step budget), %d node results split a surrogate pair\n",
-		len(cases), unrepresentable, screened, noForm)
+	fmt.Printf("%d cases compared (%d agreeing that the result has no Go form); %d unrepresentable (lone surrogate), %d screened (step budget)\n",
+		len(cases), noGoForm, unrepresentable, screened)
 	if len(skips) > 0 {
 		fmt.Printf("skipped (V8 defects by oracle mark; S = split outside the Go contract; H = node hung; T = node threw): %v\n", fmtSkips(skips))
 	}
@@ -482,55 +487,6 @@ func fmtSkips(m map[byte]int) string {
 	}
 	sort.Strings(parts)
 	return strings.Join(parts, " ")
-}
-
-// representable reports whether an oracle answer can be expressed with byte
-// offsets into a Go string: no string in it contains half a surrogate pair,
-// and no match begins between the two halves of one in the input.
-func representable(c testCase, resp string) bool {
-	fs := strings.Fields(resp)
-	var strs []string
-	var indices []string
-	switch fs[0] {
-	case "M":
-		indices = append(indices, fs[1])
-		strs = fs[3:]
-	case "A":
-		for _, seg := range strings.Split(strings.Join(fs[2:], " "), "|") {
-			sf := strings.Fields(seg)
-			if len(sf) >= 2 {
-				indices = append(indices, sf[0])
-				strs = append(strs, sf[2:]...)
-			}
-		}
-	case "R":
-		strs = fs[1:]
-	case "S":
-		strs = fs[2:]
-	}
-	for _, f := range strs {
-		if f == "-" {
-			continue
-		}
-		u, err := decodeUnits(f)
-		if err != nil {
-			return false
-		}
-		if _, ok := unitsToString(u); !ok {
-			return false
-		}
-	}
-	units := utf16.Encode([]rune(c.input))
-	for _, f := range indices {
-		i, err := strconv.Atoi(f)
-		if err != nil {
-			return false
-		}
-		if i > 0 && i < len(units) && units[i-1] >= 0xD800 && units[i-1] <= 0xDBFF && units[i] >= 0xDC00 && units[i] <= 0xDFFF {
-			return false
-		}
-	}
-	return true
 }
 
 // render decodes base64 fields in a response for display.

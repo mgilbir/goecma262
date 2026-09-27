@@ -192,9 +192,9 @@ func (p pair) compare(t *testing.T, input string, lastIndex int) bool {
 }
 
 var (
-	genAtoms  = []string{"a", "b", "A", ".", "[ab]", "[^a]", "[a-c]", `\d`, `\w`, `\s`, `\W`, "é", `\n`, "[é-ë]", `\p{L}`, "(?:)", "x", `\b`, `\B`, "^", "$", "k", "[r-t]"}
+	genAtoms  = []string{"a", "b", "A", ".", "[ab]", "[^a]", "[a-c]", `\d`, `\w`, `\s`, `\W`, "é", `\n`, "[é-ë]", `\p{L}`, "(?:)", "x", `\b`, `\B`, "^", "$", "k", "[r-t]", `\uD83D`, `\uDE00`, "😀"}
 	genQuants = []string{"*", "+", "?", "{0,2}", "{1,3}", "{2}", "{1,}", "*?", "+?", "??", "{0,2}?", "{2,}?"}
-	genInputs = []string{"a", "a", "b", "A", "\n", " ", "1", "é", "x", "\xe2\x82", "\xff", "ab", "€", "\u212a", "ſ", "k"}
+	genInputs = []string{"a", "a", "b", "A", "\n", " ", "1", "é", "x", "\xe2\x82", "\xff", "ab", "€", "\u212a", "ſ", "k", "😀", "\xf0\x9f\x98"}
 	genFlags  = []string{"", "i", "m", "s", "u", "im", "y", "g", "iu", "ms", "gy", "gu"}
 )
 
@@ -279,10 +279,11 @@ func TestOptimisedMatchesReference(t *testing.T) {
 }
 
 // TestOptimisedMatchesReferenceCorpus pins cases around the greedy loop's
-// give-back path: invalid UTF-8, a start inside a multi-byte rune, and
-// right-to-left loops in lookbehinds.
+// give-back path: invalid UTF-8, a start inside a multi-byte rune, right-to-left
+// loops in lookbehinds, and, without u, loops that give back one surrogate of
+// a character above U+FFFF at a time.
 func TestOptimisedMatchesReferenceCorpus(t *testing.T) {
-	inputs := []string{"", "a", "aé€b", "a\xe2\x82a", "\xe2\x82\xac\xe2\x82", "€€x", "\xff\xfe€", "ab\nab", "é\xffé", "€€€\xe2\x82é", "kK\u212aſs"}
+	inputs := []string{"", "a", "aé€b", "a\xe2\x82a", "\xe2\x82\xac\xe2\x82", "€€x", "\xff\xfe€", "ab\nab", "é\xffé", "€€€\xe2\x82é", "kK\u212aſs", "😀🨀a", "a😀\xf0\x9f\x98😀"}
 	patterns := []struct{ pattern, flags string }{
 		{`.*(.)`, "y"}, {`(.+)(.)$`, "y"}, {`.*?(.)$`, "y"}, {`(.*)(.)`, "g"},
 		{`(?<=(.+))(.)`, "y"}, {`(?<=(.*)(.))`, "g"}, {`(?<=^.*)(.)`, "gs"},
@@ -290,6 +291,8 @@ func TestOptimisedMatchesReferenceCorpus(t *testing.T) {
 		{`(?<!.*x)(.)`, "g"}, {`(?=(.*))(.)`, "y"}, {`.+?(.)(.)`, "y"},
 		{`[a-z]*(\1)`, "g"}, {`(.)*\1`, "g"}, {`.*(.)€`, "y"}, {`(?<=(.)é.*)`, "y"},
 		{`(?:k|x)+`, "giu"}, {`[r-t]*`, "giu"}, {`k*?$`, "giu"},
+		{`.*\uDE00(.)`, "y"}, {`[^a]*(\uD83D)`, "g"}, {`(?<=\uD83D.*)(.)`, "g"}, {`(?<=(.)\uDE00)`, "g"},
+		{`\S+?(\uDE00)`, "y"}, {`(.)(.)\2`, "g"}, {`[\uD800-\uDBFF]*.`, "g"}, {`.*(.)`, "gu"},
 	}
 	for _, pc := range patterns {
 		p, err := compilePair(pc.pattern, pc.flags)
@@ -312,6 +315,7 @@ func FuzzOptimisedMatchesReference(f *testing.F) {
 	f.Add(`((?:)*?)[a-z]+`, "g", "xaAa", 0)
 	f.Add(`(a*)*b`, "", "aaac", 0)
 	f.Add(`^[a-z]+$`, "m", "ab\ncd", 0)
+	f.Add(`.*\uDE00(.)`, "y", "😀🨀a", 2)
 	f.Fuzz(func(t *testing.T, pattern, fl, input string, lastIndex int) {
 		if len(pattern) > 64 || len(input) > 64 {
 			return

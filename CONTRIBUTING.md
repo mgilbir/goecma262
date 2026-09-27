@@ -116,7 +116,9 @@ go run ./tools/difftest -cases /tmp/corpus.txt     # the structured corpus
 it. The oracle (`fuzz-oracle.mjs`) and the corpus (`corpus.mjs`) are shared
 with [ktecma262](https://github.com/mgilbir/ktecma262), including the
 detectors for known V8 defects, which are skipped and counted rather than
-reported. A failure prints the exact pattern, flags and input, so it can be
+reported. This copy of the oracle also answers `U` for a result with a
+position between the two halves of a surrogate pair, which goecma262 reports
+as `ErrSurrogateSplit`; the two must agree like any other answer. A failure prints the exact pattern, flags and input, so it can be
 turned into a regression test directly.
 
 ## Regenerating the emoji data

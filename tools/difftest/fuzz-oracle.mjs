@@ -18,6 +18,9 @@
 //           "A <count> [<match> | ...]"    all matches, each rendered as above
 //           "R <b64 result>"               replace result
 //           "S <count> <b64 part> ..."     split result ("-" for an undefined part)
+//           "U"                            a result with a position between the
+//                                          halves of a surrogate pair (see
+//                                          splitsResult)
 //           "T"                            oracle-side failure (not a spec behaviour)
 // A leading "!", "~", "%", "&" or "@" marks a known V8 defect the comparison skips.
 
@@ -73,6 +76,31 @@ function hasSurrogateSplitMatch(re, input, allMatches) {
     if (splitsPair(input, m.index)) return true;
   }
   return false;
+}
+
+/**
+ * True when, without u or v, the operation's result has no Go form, being
+ * where goecma262 returns ErrSurrogateSplit. By op:
+ *
+ *   x, a  the start or end of the match or of any group, for any match, lies
+ *         between the two halves of a surrogate pair, where a byte offset
+ *         cannot (FindStringSubmatchIndexErr, FindAllStringSubmatchIndexErr)
+ *   r     the result string holds half of a pair (ReplaceAllStringErr)
+ *   s     some part holds half of a pair (SplitErr)
+ */
+function splitsResult(re, op, input, rendered) {
+  if (/[uv]/.test(re.flags)) return false;
+  const halfPair = (str) => /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(str);
+  const bad = (m) => m.indices.some((g) => g !== undefined && (splitsPair(input, g[0]) || splitsPair(input, g[1])));
+  if (op === "x") {
+    const m = new RegExp(re.source, re.flags + "d").exec(input);
+    return m !== null && bad(m);
+  }
+  if (op === "a") {
+    return [...input.matchAll(new RegExp(re.source, re.flags + "d"))].some(bad);
+  }
+  if (op === "r") return halfPair(decode(rendered.slice(2)));
+  return rendered.split(" ").slice(2).some((part) => part !== "-" && halfPair(decode(part)));
 }
 
 /** One operation's result, rendered. Factored out so it can be run twice - see hasDotAllInconsistency. */
@@ -188,7 +216,8 @@ rl.on("line", (line) => {
               ? "@"
               : "";
 
-    emit(mark + runOp(re, op, input, extra));
+    const rendered = runOp(re, op, input, extra);
+    emit(mark + (splitsResult(re, op, input, rendered) ? "U" : rendered));
   } catch {
     emit("T");
   }

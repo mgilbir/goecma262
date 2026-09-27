@@ -349,26 +349,126 @@ func (st *runState) init(n int, from []int) {
 	st.gidOK = false
 }
 
+// Without the u or v flag, ECMA-262 matches a string as a sequence of UTF-16
+// code units, so a character above U+FFFF is two characters to the pattern:
+// its high surrogate, then its low surrogate. The VM reads it the same way
+// (see readRune). The position between the two halves has no byte offset of
+// its own; it is represented by the offset of the character's first byte plus
+// midOffset, which lies inside the character's four-byte UTF-8 sequence and so
+// is never a character boundary. Positions therefore stay ordered, and every
+// position the VM records is still a single int.
+const midOffset = 2
+
+// astralAt returns the character above U+FFFF whose four-byte UTF-8 sequence
+// starts at s[i], if one does.
+func astralAt(s string, i int) (rune, bool) {
+	if i < 0 || i+4 > len(s) || s[i] < 0xF0 {
+		return 0, false
+	}
+	r, size := utf8.DecodeRuneInString(s[i:])
+	return r, size == 4
+}
+
+// BetweenSurrogates reports whether pos is the position between the two UTF-16
+// halves of a character above U+FFFF in s: the offset of the character's first
+// byte plus 2. Only matching without the u or v flag produces such positions.
+func BetweenSurrogates(s string, pos int) bool {
+	_, ok := astralAt(s, pos-midOffset)
+	return ok
+}
+
+// NextPosition returns the position one character after pos in s, as
+// ECMA-262's AdvanceStringIndex does: one code point in Unicode mode, one
+// UTF-16 code unit otherwise, where the position after a high surrogate is
+// the one BetweenSurrogates reports. At or past the end of s it returns pos+1.
+func NextPosition(s string, pos int, unicode bool) int {
+	if pos >= len(s) || s[pos] < utf8.RuneSelf {
+		return pos + 1
+	}
+	return nextPositionSlow(s, pos, unicode)
+}
+
+func nextPositionSlow(s string, pos int, unicode bool) int {
+	if !unicode {
+		_, next := unitAt(s, pos)
+		return next
+	}
+	_, size := utf8.DecodeRuneInString(s[pos:])
+	return pos + size
+}
+
+func highSurrogate(r rune) rune { return 0xD800 + (r-0x10000)>>10 }
+func lowSurrogate(r rune) rune  { return 0xDC00 + (r-0x10000)&0x3FF }
+
 // readRune returns the rune to consume at pos and the position after consuming
 // it in the given direction: forward reads the rune at pos and advances,
 // backward reads the rune ending at pos and retreats. ok is false at the
-// boundary (end of input forward, start of input backward).
+// boundary (end of input forward, start of input backward). Outside Unicode
+// mode a character above U+FFFF is read as two surrogate code units, with the
+// position between them as described at midOffset.
 func (vm *VM) readRune(pos int, backward bool) (r rune, next int, ok bool) {
 	if backward {
 		if pos <= 0 {
 			return 0, pos, false
 		}
+		if c := vm.Input[pos-1]; c < utf8.RuneSelf {
+			return rune(c), pos - 1, true
+		}
+		// Only a four-byte character has code units of its own: pos is
+		// between its halves when its lead byte is two back.
+		if !vm.Unicode && pos >= 2 && vm.Input[pos-2] >= 0xF0 {
+			r, next = unitBefore(vm.Input, pos)
+			return r, next, true
+		}
 		r, size := utf8.DecodeLastRuneInString(vm.Input[:pos])
+		if size == 4 && !vm.Unicode {
+			return lowSurrogate(r), pos - (4 - midOffset), true
+		}
 		return r, pos - size, true
 	}
 	if pos >= len(vm.Input) {
 		return 0, pos, false
 	}
-	if c := vm.Input[pos]; c < utf8.RuneSelf {
+	c := vm.Input[pos]
+	if c < utf8.RuneSelf {
 		return rune(c), pos + 1, true
+	}
+	// Only a four-byte lead, or a continuation byte (between the halves of
+	// one), starts a code unit that is not the whole character.
+	if !vm.Unicode && (c < 0xC0 || c >= 0xF0) {
+		r, next = unitAt(vm.Input, pos)
+		return r, next, true
 	}
 	r, size := utf8.DecodeRuneInString(vm.Input[pos:])
 	return r, pos + size, true
+}
+
+// unitAt reads the UTF-16 code unit at pos < len(s), whose byte is not ASCII,
+// and returns it with the position after it.
+func unitAt(s string, pos int) (rune, int) {
+	if s[pos] < 0xC0 {
+		// A continuation byte: pos may be between the halves of a pair.
+		if a, ok := astralAt(s, pos-midOffset); ok {
+			return lowSurrogate(a), pos + (4 - midOffset)
+		}
+	}
+	r, size := utf8.DecodeRuneInString(s[pos:])
+	if size == 4 {
+		return highSurrogate(r), pos + midOffset
+	}
+	return r, pos + size
+}
+
+// unitBefore reads the character ending at pos, whose byte two back is a
+// four-byte lead: the high surrogate if pos is between its halves, and
+// otherwise (the sequence is not valid UTF-8) what DecodeLastRuneInString
+// reads, which a valid four-byte sequence cannot be.
+func unitBefore(s string, pos int) (rune, int) {
+	if a, ok := astralAt(s, pos-midOffset); ok {
+		return highSurrogate(a), pos - midOffset
+	}
+	r, size := utf8.DecodeLastRuneInString(s[:pos])
+	return r, pos - size
 }
 
 // matchOne reports whether a single-rune instruction accepts r.
@@ -641,19 +741,18 @@ func (vm *VM) canStart(pc, pos int, backward bool) bool {
 }
 
 // retreat returns the loop position one rune before cur on the path a greedy
-// single-rune loop took from start, in the loop's direction. Decoding in the
+// single-rune loop took from start, in the loop's direction. Reading in the
 // opposite direction reproduces that path except where start fell inside a
 // multi-byte sequence, in which case the loop advanced byte by byte.
 func (vm *VM) retreat(start, cur int, backward bool) int {
+	_, p, _ := vm.readRune(cur, !backward)
 	if !backward {
-		_, size := utf8.DecodeLastRuneInString(vm.Input[:cur])
-		if p := cur - size; p >= start {
+		if p >= start {
 			return p
 		}
 		return cur - 1
 	}
-	_, size := utf8.DecodeRuneInString(vm.Input[cur:])
-	if p := cur + size; p <= start {
+	if p <= start {
 		return p
 	}
 	return cur + 1
@@ -754,7 +853,7 @@ func (vm *VM) run(st *runState, pc, pos int) (bool, int) {
 			case OpStartLine:
 				if pos == 0 {
 					pc++
-				} else if prevR, _ := utf8.DecodeLastRuneInString(vm.Input[:pos]); vm.multiline(inst) && isLineTerminator(prevR) {
+				} else if prevR, _, _ := vm.readRune(pos, true); vm.multiline(inst) && isLineTerminator(prevR) {
 					pc++
 				} else {
 					ok = false
@@ -763,7 +862,7 @@ func (vm *VM) run(st *runState, pc, pos int) (bool, int) {
 			case OpEndLine:
 				if pos >= len(vm.Input) {
 					pc++
-				} else if r, _ := utf8.DecodeRuneInString(vm.Input[pos:]); vm.multiline(inst) && isLineTerminator(r) {
+				} else if r, _, _ := vm.readRune(pos, false); vm.multiline(inst) && isLineTerminator(r) {
 					pc++
 				} else {
 					ok = false
@@ -983,70 +1082,70 @@ func (vm *VM) matchBackref(inst *Instruction, groups []int, pos int, backward bo
 		return pos, true
 	}
 
-	refText := vm.Input[start:end]
 	ic := vm.ignoreCase(inst)
-	if backward {
-		// Match the referenced text ending at pos, consuming backward.
-		if ic {
-			ok, consumed := vm.matchStringIgnoreCaseBackward(vm.Input[:pos], refText)
-			return pos - consumed, ok
+	if !ic && (vm.Unicode || !BetweenSurrogates(vm.Input, start) && !BetweenSurrogates(vm.Input, end) && !BetweenSurrogates(vm.Input, pos)) {
+		// Equal bytes are equal characters, since every edge falls on a whole
+		// character.
+		refText := vm.Input[start:end]
+		if backward {
+			// Match the referenced text ending at pos, consuming backward.
+			if pos < len(refText) || vm.Input[pos-len(refText):pos] != refText {
+				return pos, false
+			}
+			return pos - len(refText), true
 		}
-		if pos < len(refText) || vm.Input[pos-len(refText):pos] != refText {
+		if pos+len(refText) > len(vm.Input) || vm.Input[pos:pos+len(refText)] != refText {
 			return pos, false
 		}
-		return pos - len(refText), true
+		return pos + len(refText), true
 	}
-	if ic {
-		ok, consumed := vm.matchStringIgnoreCaseAt(vm.Input[pos:], refText)
-		return pos + consumed, ok
-	}
-	if pos+len(refText) > len(vm.Input) || vm.Input[pos:pos+len(refText)] != refText {
-		return pos, false
-	}
-	return pos + len(refText), true
+	return vm.matchRef(ic, start, end, pos, backward)
 }
 
-// matchStringIgnoreCaseBackward matches ref against the end of sBefore
-// (= vm.Input[:pos]) case-insensitively, consuming from the end, and returns
-// how many bytes of sBefore were consumed.
-func (vm *VM) matchStringIgnoreCaseBackward(sBefore, ref string) (bool, int) {
-	si, ri := len(sBefore), len(ref)
-	consumed := 0
-	for ri > 0 {
-		if si <= 0 {
-			return false, 0
+// matchRef matches the input between start and end (a capture's text) at pos
+// in the given direction, one character at a time as readRune reads them (so
+// by code unit outside Unicode mode, where a capture can begin or end between
+// the halves of a surrogate pair), and returns the position after it.
+func (vm *VM) matchRef(ic bool, start, end, pos int, backward bool) (int, bool) {
+	in := vm.Input
+	if backward {
+		for i := end; i > start; {
+			if pos <= 0 {
+				return pos, false
+			}
+			rr, sr := rune(in[i-1]), rune(in[pos-1])
+			ni, np := i-1, pos-1
+			if rr >= utf8.RuneSelf {
+				rr, ni, _ = vm.readRune(i, true)
+			}
+			if sr >= utf8.RuneSelf {
+				sr, np, _ = vm.readRune(pos, true)
+			}
+			if !vm.matchChar(ic, sr, rr) {
+				return pos, false
+			}
+			i, pos = ni, np
 		}
-		sr, sSize := utf8.DecodeLastRuneInString(sBefore[:si])
-		rr, rSize := utf8.DecodeLastRuneInString(ref[:ri])
-		if !vm.matchChar(true, sr, rr) {
-			return false, 0
-		}
-		si -= sSize
-		consumed += sSize
-		ri -= rSize
+		return pos, true
 	}
-	return true, consumed
-}
-
-// matchStringIgnoreCaseAt compares a prefix of s against ref and returns
-// whether it matches and how many bytes were consumed in s.
-func (vm *VM) matchStringIgnoreCaseAt(s, ref string) (bool, int) {
-	si, ri := 0, 0
-	consumed := 0
-	for ri < len(ref) {
-		if si >= len(s) {
-			return false, 0
+	for i := start; i < end; {
+		if pos >= len(in) {
+			return pos, false
 		}
-		sr, sSize := utf8.DecodeRuneInString(s[si:])
-		rr, rSize := utf8.DecodeRuneInString(ref[ri:])
-		if !vm.matchChar(true, sr, rr) {
-			return false, 0
+		rr, sr := rune(in[i]), rune(in[pos])
+		ni, np := i+1, pos+1
+		if rr >= utf8.RuneSelf {
+			rr, ni, _ = vm.readRune(i, false)
 		}
-		si += sSize
-		consumed += sSize
-		ri += rSize
+		if sr >= utf8.RuneSelf {
+			sr, np, _ = vm.readRune(pos, false)
+		}
+		if !vm.matchChar(ic, sr, rr) {
+			return pos, false
+		}
+		i, pos = ni, np
 	}
-	return true, consumed
+	return pos, true
 }
 
 func (vm *VM) matchChar(ic bool, input, pattern rune) bool {
@@ -1134,13 +1233,9 @@ func isWordChar(r rune) bool {
 }
 
 // wordCharBefore reports whether the character before pos is a word char.
-// Handles multi-byte UTF-8 correctly using DecodeLastRuneInString.
 func (vm *VM) wordCharBefore(ic bool, pos int) bool {
-	if pos <= 0 {
-		return false
-	}
-	r, _ := utf8.DecodeLastRuneInString(vm.Input[:pos])
-	if r == utf8.RuneError {
+	r, _, ok := vm.readRune(pos, true)
+	if !ok || r == utf8.RuneError {
 		return false
 	}
 	return vm.wordChar(ic, r)
@@ -1148,11 +1243,8 @@ func (vm *VM) wordCharBefore(ic bool, pos int) bool {
 
 // wordCharAt reports whether the character at pos is a word char.
 func (vm *VM) wordCharAt(ic bool, pos int) bool {
-	if pos >= len(vm.Input) {
-		return false
-	}
-	r, _ := utf8.DecodeRuneInString(vm.Input[pos:])
-	if r == utf8.RuneError {
+	r, _, ok := vm.readRune(pos, false)
+	if !ok || r == utf8.RuneError {
 		return false
 	}
 	return vm.wordChar(ic, r)

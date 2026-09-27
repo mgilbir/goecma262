@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"unicode"
+	"unicode/utf16"
 	"unicode/utf8"
 
 	"github.com/mgilbir/goecma262/vm"
@@ -81,6 +82,9 @@ func (p *Parser) Parse() (pat *Pattern, err error) {
 		p.fail("invalid UTF-8 in pattern")
 	}
 	p.src = []rune(p.pattern)
+	if !p.unicodeMode {
+		p.src = codeUnits(p.src)
+	}
 	p.precount()
 
 	body := p.parseDisjunction()
@@ -114,6 +118,32 @@ func (p *Parser) Parse() (pat *Pattern, err error) {
 		NumGroups: p.groupCount,
 		Flags:     p.flags,
 	}, nil
+}
+
+// codeUnits returns src with every character above U+FFFF replaced by its
+// UTF-16 surrogate pair. Without the u or v flag a pattern is a sequence of
+// code units, so /😀{2}/ repeats only the low surrogate and /[😀]/ is a class
+// of two code units, as in JavaScript.
+func codeUnits(src []rune) []rune {
+	n := len(src)
+	for _, r := range src {
+		if r > 0xFFFF {
+			n++
+		}
+	}
+	if n == len(src) {
+		return src
+	}
+	out := make([]rune, 0, n)
+	for _, r := range src {
+		if r > 0xFFFF {
+			hi, lo := utf16.EncodeRune(r)
+			out = append(out, hi, lo)
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
 }
 
 // ------------------------------------------------------------------ scanning
@@ -562,6 +592,16 @@ func (p *Parser) parseGroupName() string {
 		} else {
 			cp = p.peek()
 			p.pos++
+			// Outside Unicode mode the pattern is code units (see codeUnits),
+			// but a literal surrogate pair in a name is one code point:
+			// RegExpIdentifierStart[~UnicodeMode] :: UnicodeLeadSurrogate
+			// UnicodeTrailSurrogate.
+			if utf16.IsSurrogate(cp) && !p.atEnd() {
+				if r := utf16.DecodeRune(cp, p.peek()); r != utf8.RuneError {
+					cp = r
+					p.pos++
+				}
+			}
 		}
 		if first && !isIdentifierStart(cp) || !first && !isIdentifierPart(cp) {
 			p.fail("invalid capture group name")
