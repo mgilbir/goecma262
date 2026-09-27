@@ -29,6 +29,9 @@
 // the last being the unsplit remainder) where JavaScript truncates, and it
 // does not interleave captures into the result.
 //
+// An oracle-side failure ("T", the oracle script itself throwing) fails the
+// run: it is never a spec behaviour, and it leaves the case uncompared.
+//
 // Known V8 defects, which the oracle marks with a prefix character, are
 // skipped and counted; see fuzz-oracle.mjs and corpus.mjs for each one. So is
 // a case node does not answer within -stall: V8 has no step budget, so a
@@ -141,7 +144,9 @@ var (
 		"", "", "", "", "*", "+", "?", "*?", "+?", "??",
 		"{2}", "{1,2}", "{0,2}", "{2,}", "{1,3}?",
 	}
-	flagSets = []string{"", "", "i", "m", "s", "u", "iu", "ms", "im", "is", "su", "imsu", "v", "vi", "vs"}
+	// d changes no match, only what a result reports; it is here so the
+	// oracle's use of match indices is exercised with it already set.
+	flagSets = []string{"", "", "i", "m", "s", "u", "iu", "ms", "im", "is", "su", "imsu", "v", "vi", "vs", "d", "du", "dv"}
 	// Class-set fragments, only meaningful under the v flag.
 	classSetAtoms = []string{
 		"[[a][b]]", "[a--b]", "[[a-z]--[aeiou]]", "[a&&b]", "[[a-c]&&[b-d]]",
@@ -427,8 +432,16 @@ func main() {
 	noGoForm := 0 // agreed answers that were "U"
 	for i, c := range cases {
 		exp := theirs[i]
-		if exp == "T" || exp == oracleHung {
+		if exp == oracleHung {
 			skips[exp[0]]++
+			continue
+		}
+		if exp == "T" {
+			// The oracle script itself failed: never a spec behaviour, and a
+			// case it cannot answer is a case not compared, so it fails the
+			// run rather than being skipped.
+			byKind["oracle threw"]++
+			failures = append(failures, fmt.Sprintf("[oracle threw] %s", c))
 			continue
 		}
 		if strings.ContainsRune("!~%&@*", rune(exp[0])) {
@@ -454,7 +467,7 @@ func main() {
 	fmt.Printf("%d cases compared (%d agreeing that the result has no Go form); %d unrepresentable (lone surrogate), %d screened (step budget)\n",
 		len(cases), noGoForm, unrepresentable, screened)
 	if len(skips) > 0 {
-		fmt.Printf("skipped (V8 defects by oracle mark; S = split outside the Go contract; H = node hung; T = node threw): %v\n", fmtSkips(skips))
+		fmt.Printf("skipped (V8 defects by oracle mark; S = split outside the Go contract; H = node hung): %v\n", fmtSkips(skips))
 	}
 	if len(failures) == 0 {
 		fmt.Println("OK: every case agrees with node")
