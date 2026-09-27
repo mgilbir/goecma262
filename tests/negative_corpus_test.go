@@ -42,6 +42,10 @@ func TestNegativeCorpus_SyntaxErrors(t *testing.T) {
 		{"duplicate name same alternative", `(?<a>x)(?<a>y)`, flags.Unicode},
 		{"unknown named backreference (named groups)", `\k<missing>(?<a>x)`, flags.Flags(0)},
 		{"unknown named backreference (u)", `\k<missing>`, flags.Unicode},
+		{"unknown named backreference (named group before)", `(?<a>.)\k<missing>`, flags.Flags(0)},
+		// \- is a ClassEscape in Unicode mode, not an IdentityEscape.
+		{"escaped hyphen outside class (u)", `\-`, flags.Unicode},
+		{"escaped hyphen outside class (v)", `a\-b`, flags.UnicodeSets},
 		{"invalid group name", `(?<a->x)`, flags.Flags(0)},
 
 		// Flags (C11)
