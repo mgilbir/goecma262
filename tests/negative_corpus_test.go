@@ -32,7 +32,6 @@ func TestNegativeCorpus_SyntaxErrors(t *testing.T) {
 		{"empty code point escape", `\u{}`, flags.Unicode},
 		{"code point escape overflow", `\u{110000}`, flags.Unicode},
 		{"empty code point escape in class", `[\u{}]`, flags.Unicode},
-		{"code point escape without u flag", `\u{41}`, flags.Flags(0)},
 
 		// Unicode property escapes (C7/C19)
 		{"unknown property", `\p{TotallyBogus}`, flags.Unicode},
@@ -41,7 +40,8 @@ func TestNegativeCorpus_SyntaxErrors(t *testing.T) {
 
 		// Named groups
 		{"duplicate name same alternative", `(?<a>x)(?<a>y)`, flags.Unicode},
-		{"unknown named backreference", `\k<missing>`, flags.Flags(0)},
+		{"unknown named backreference (named groups)", `\k<missing>(?<a>x)`, flags.Flags(0)},
+		{"unknown named backreference (u)", `\k<missing>`, flags.Unicode},
 		{"invalid group name", `(?<a->x)`, flags.Flags(0)},
 
 		// Flags (C11)
@@ -55,6 +55,19 @@ func TestNegativeCorpus_SyntaxErrors(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := ecma262.Compile(tc.pattern, tc.flags); err == nil {
 				t.Errorf("expected compile error for %q (flags %v)", tc.pattern, tc.flags)
+			}
+		})
+	}
+
+	// Errors in strict ECMA-262 that Annex B accepts (see ValidCounterparts).
+	strict := []struct{ name, pattern string }{
+		{"code point escape without u flag", `\u{41}`},
+		{"unknown named backreference", `\k<missing>`},
+	}
+	for _, tc := range strict {
+		t.Run(tc.name+" (strict)", func(t *testing.T) {
+			if _, err := ecma262.Compile(tc.pattern, flags.Flags(0), ecma262.WithSyntax(ecma262.SyntaxStrict)); err == nil {
+				t.Errorf("expected compile error for %q in strict mode", tc.pattern)
 			}
 		})
 	}
@@ -75,6 +88,10 @@ func TestNegativeCorpus_ValidCounterparts(t *testing.T) {
 		{"duplicate name across alternatives", `(?<a>x)|(?<a>y)`, flags.Unicode},
 		{"general category Lo", `\p{Lo}`, flags.Unicode},
 		{"script property", `\p{Script=Han}`, flags.Unicode},
+		// Annex B: without u, \u{41} is "u" 41 times, and \k is the letter k
+		// when the pattern has no named group.
+		{"braces after \\u without u (Annex B)", `\u{41}`, flags.Flags(0)},
+		{"\\k without named groups (Annex B)", `\k<missing>`, flags.Flags(0)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

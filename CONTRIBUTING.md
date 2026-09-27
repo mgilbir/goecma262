@@ -114,6 +114,23 @@ detectors for known V8 defects, which are skipped and counted rather than
 reported. A failure prints the exact pattern, flags and input, so it can be
 turned into a regression test directly.
 
+## Regenerating the properties of strings
+
+The members of `\p{RGI_Emoji}` and the other properties of strings live in
+the generated `vm/emoji_strings.go`. When Go's `unicode.Version` changes,
+regenerate it from the matching Unicode version's emoji files, fetched from the
+numbered directory rather than `/Public/emoji/latest`, which runs ahead of Go
+and of the JavaScript engines:
+
+```bash
+V=17.0.0   # go doc unicode.Version
+curl -fsSO https://www.unicode.org/Public/$V/emoji/emoji-sequences.txt
+curl -fsSO https://www.unicode.org/Public/$V/emoji/emoji-zwj-sequences.txt
+go run ./tools/genemoji -seq emoji-sequences.txt -zwj emoji-zwj-sequences.txt
+```
+
+The generator refuses files whose declared version does not match.
+
 ## Refreshing the README benchmark numbers
 
 The README quotes `go test ./tests/ -bench . -benchmem` output. If your

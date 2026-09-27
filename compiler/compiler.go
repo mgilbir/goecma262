@@ -21,6 +21,11 @@ type Compiler struct {
 	depth     int // current nesting depth
 	numGroups int // capture groups in the pattern
 	numMarks  int // iteration-start mark slots allocated so far
+
+	ignoreCase bool
+	// classSets memoizes evaluated v-mode classes, which a counted quantifier
+	// compiles once per copy.
+	classSets map[*parser.ClassSetExpression]classSetValue
 }
 
 // Compile compiles a regex pattern AST to VM instructions.
@@ -29,8 +34,9 @@ type Compiler struct {
 // a group more than once even inside a counted quantifier.
 func Compile(pattern *parser.Pattern) ([]vm.Instruction, int, error) {
 	c := &Compiler{
-		code:      make([]vm.Instruction, 0),
-		numGroups: pattern.NumGroups,
+		code:       make([]vm.Instruction, 0),
+		numGroups:  pattern.NumGroups,
+		ignoreCase: pattern.Flags.IgnoreCase,
 	}
 
 	// Emit save instructions for group 0 (full match)
@@ -81,6 +87,8 @@ func (c *Compiler) compileNode(node parser.Node) error {
 		return c.compileLiteral(n)
 	case *parser.CharacterClass:
 		return c.compileCharacterClass(n)
+	case *parser.ClassSetExpression:
+		return c.compileClassSet(n)
 	case *parser.Dot:
 		c.emit(vm.Instruction{Op: vm.OpAny})
 		return nil
@@ -130,8 +138,16 @@ func (c *Compiler) compileNode(node parser.Node) error {
 }
 
 func (c *Compiler) compileDisjunction(d *parser.Disjunction) error {
-	if len(d.Alternatives) == 1 {
-		return c.compileNode(d.Alternatives[0])
+	return c.emitAlternation(len(d.Alternatives), func(i int) error {
+		return c.compileNode(d.Alternatives[i])
+	})
+}
+
+// emitAlternation emits n alternatives, tried in order, where emitAlt(i)
+// emits the code of alternative i.
+func (c *Compiler) emitAlternation(n int, emitAlt func(i int) error) error {
+	if n == 1 {
+		return emitAlt(0)
 	}
 
 	// Correct NFA structure for alternation (a|b|c|...):
@@ -148,10 +164,10 @@ func (c *Compiler) compileDisjunction(d *parser.Disjunction) error {
 	// Each split's B must point to the NEXT split, not the next body.
 	// This ensures the engine tries each alternative in order.
 
-	splitIdxs := make([]int, 0, len(d.Alternatives)-1)
-	jumpIdxs := make([]int, 0, len(d.Alternatives)-1)
+	splitIdxs := make([]int, 0, n-1)
+	jumpIdxs := make([]int, 0, n-1)
 
-	for i := 0; i < len(d.Alternatives)-1; i++ {
+	for i := 0; i < n-1; i++ {
 		// Emit split: A=body (patched below), B=next split (patched below)
 		splitIdx := c.emit(vm.Instruction{Op: vm.OpSplit, A: 0, B: 0})
 		splitIdxs = append(splitIdxs, splitIdx)
@@ -160,7 +176,7 @@ func (c *Compiler) compileDisjunction(d *parser.Disjunction) error {
 		c.code[splitIdx].A = len(c.code)
 
 		// Compile this alternative
-		err := c.compileNode(d.Alternatives[i])
+		err := emitAlt(i)
 		if err != nil {
 			return err
 		}
@@ -181,7 +197,7 @@ func (c *Compiler) compileDisjunction(d *parser.Disjunction) error {
 	lastAltStart := len(c.code)
 
 	// Last alternative (no split, no jump needed)
-	err := c.compileNode(d.Alternatives[len(d.Alternatives)-1])
+	err := emitAlt(n - 1)
 	if err != nil {
 		return err
 	}
@@ -431,9 +447,12 @@ func canMatchEmpty(e parser.Expression) bool {
 	case *parser.NonCapturingGroup:
 		return canMatchEmpty(n.Body)
 	case *parser.Backreference:
-		// A reference to an unset or empty group matches empty; an Annex B
-		// fallback is literal characters.
-		return n.Fallback == nil
+		// A reference to an unset or empty group matches empty.
+		return true
+	case *parser.ClassSetExpression:
+		// A class set may hold the empty string (as [\q{}] does); deciding
+		// whether it does would mean evaluating the set, so assume it can.
+		return true
 	default:
 		// Anchors and lookarounds are zero-width.
 		return true
@@ -461,14 +480,6 @@ func (c *Compiler) compileNamedGroup(g *parser.NamedGroup) error {
 }
 
 func (c *Compiler) compileBackreference(b *parser.Backreference) error {
-	// An Annex B numeric escape that did not resolve to a real group compiles to
-	// literal characters (a legacy octal escape and/or literal digits).
-	if b.Fallback != nil {
-		for _, r := range b.Fallback {
-			c.emit(vm.Instruction{Op: vm.OpChar, Char: r})
-		}
-		return nil
-	}
 	c.emit(vm.Instruction{Op: vm.OpBackref, A: b.Index, AltA: b.AltIndices})
 	return nil
 }
@@ -601,6 +612,8 @@ func reverseExpr(e parser.Expression) parser.Expression {
 		return &parser.NamedGroup{Index: n.Index, Name: n.Name, Body: reverseExpr(n.Body)}
 	case *parser.NonCapturingGroup:
 		return &parser.NonCapturingGroup{Body: reverseExpr(n.Body)}
+	case *parser.ClassSetExpression:
+		return reverseClassSet(n)
 	default:
 		return e
 	}

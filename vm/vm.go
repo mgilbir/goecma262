@@ -64,7 +64,9 @@ const (
 	OpNonSpace // Match \S
 
 	// Character classes
-	OpClass // Match character class with escapes
+	OpClass      // Match character class with escapes
+	OpClassSet   // Match the v-mode class set in Set
+	OpRuneSwitch // Match one rune and jump by it (see RuneSwitch)
 
 	// Anchors
 	OpStartLine    // Match ^
@@ -111,6 +113,8 @@ type Instruction struct {
 	Prop   string      // For unicode properties
 	Class  []ClassAtom // For OpClass
 	Negate bool        // For OpClass
+	Set    *CharSet    // For OpClassSet
+	Switch *RuneSwitch // For OpRuneSwitch
 	AltA   []int       // Alternative group indices (for duplicate named groups in \k<name>)
 }
 
@@ -162,6 +166,10 @@ func (i Instruction) String() string {
 		return "non-space"
 	case OpClass:
 		return "class"
+	case OpClassSet:
+		return "class-set"
+	case OpRuneSwitch:
+		return fmt.Sprintf("rune-switch %d", len(i.Switch.Keys))
 	case OpStartLine:
 		return "start-line"
 	case OpEndLine:
@@ -375,6 +383,11 @@ func (vm *VM) matchOne(inst *Instruction, r rune) bool {
 			}
 		}
 		return matched != inst.Negate
+	case OpClassSet:
+		return vm.matchCharSet(inst.Set, r)
+	case OpRuneSwitch:
+		_, ok := inst.Switch.target(vm.switchKey(r))
+		return ok
 	case OpUnicodeProp:
 		return matchUnicodeProperty(r, inst.Prop)
 	case OpNotUnicodeProp:
@@ -685,11 +698,24 @@ func (vm *VM) run(st *runState, pc, pos int) (bool, int) {
 				return true, pos
 
 			case OpChar, OpAny, OpDigit, OpNonDigit, OpWord, OpNonWord, OpSpace, OpNonSpace,
-				OpClass, OpUnicodeProp, OpNotUnicodeProp:
+				OpClass, OpClassSet, OpUnicodeProp, OpNotUnicodeProp:
 				r, next, rok := vm.readRune(pos, back)
 				if rok && vm.matchOne(inst, r) {
 					pos = next
 					pc++
+				} else {
+					ok = false
+				}
+
+			case OpRuneSwitch:
+				r, next, rok := vm.readRune(pos, back)
+				target, found := 0, false
+				if rok {
+					target, found = inst.Switch.target(vm.switchKey(r))
+				}
+				if found {
+					pos = next
+					pc = target
 				} else {
 					ok = false
 				}

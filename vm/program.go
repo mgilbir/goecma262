@@ -143,7 +143,7 @@ func (p *Program) matches(code []Instruction, ignoreCase, multiline, dotAll, uni
 func isSingleRune(op Opcode) bool {
 	switch op {
 	case OpChar, OpAny, OpDigit, OpNonDigit, OpWord, OpNonWord, OpSpace, OpNonSpace,
-		OpClass, OpUnicodeProp, OpNotUnicodeProp:
+		OpClass, OpClassSet, OpUnicodeProp, OpNotUnicodeProp:
 		return true
 	}
 	return false
@@ -205,7 +205,7 @@ func epsilonSuccs(code []Instruction, pc int, out []int) []int {
 		return append(out, inst.A)
 	case inst.Op == OpSplit:
 		return append(out, inst.A, inst.B)
-	case inst.Op == OpMatch || isSingleRune(inst.Op):
+	case inst.Op == OpMatch || isSingleRune(inst.Op) || inst.Op == OpRuneSwitch:
 		return out
 	case inst.Op == OpCheckProgress:
 		// Every path back to a loop's split passes through its iteration's
@@ -502,7 +502,9 @@ func (p *Program) computeFirst(start int, w *frontierWalker) *firstSet {
 		}
 		inst := &p.code[pc]
 		switch {
-		case isSingleRune(inst.Op):
+		case isSingleRune(inst.Op) || inst.Op == OpRuneSwitch:
+			// A rune switch consumes one rune too, though it continues at a
+			// target of its own rather than at pc+1.
 			leaf := p.leafBytes(pc)
 			for i := range fs.bytes {
 				fs.bytes[i] |= leaf[i]

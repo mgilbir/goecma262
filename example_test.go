@@ -172,6 +172,20 @@ func ExampleRegexp_MatchString_unicodeProperties() {
 	// false
 }
 
+func ExampleRegexp_FindString_classSets() {
+	// With the v flag, classes are sets: they can be subtracted (--),
+	// intersected (&&) and nested, and can hold strings as well as characters.
+	re := ecma262.MustCompile(`[\p{L}--[a-z]]+`, flags.UnicodeSets)
+	fmt.Println(re.FindString("abcÄÖüdef"))
+
+	// A property of strings matches a whole emoji sequence as one element.
+	re = ecma262.MustCompile(`\p{RGI_Emoji}`, flags.UnicodeSets)
+	fmt.Println(re.FindString("hi 👨‍👩‍👧!") == "👨‍👩‍👧")
+	// Output:
+	// ÄÖü
+	// true
+}
+
 func ExampleWithSyntax() {
 	// By default the compiler accepts the Annex B web-compatibility syntax,
 	// so patterns that work in browsers work here. Strict mode rejects it.

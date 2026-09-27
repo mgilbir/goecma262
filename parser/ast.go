@@ -94,7 +94,75 @@ type ClassEscape struct {
 	Negated  bool
 }
 
-func (c *ClassEscape) classAtom() {}
+func (c *ClassEscape) classAtom()    {}
+func (c *ClassEscape) classSetNode() {}
+
+// ClassSetExpression is a v-mode character class, [...] or [^...]
+// (ClassSetExpression in ECMA-262). Unlike CharacterClass it is a set algebra:
+// operands may be nested classes and strings, combined by union, intersection
+// (&&) or subtraction (--). It is also the node for a property of strings
+// outside a class, such as \p{RGI_Emoji}.
+//
+// A negated class never contains strings: the parser rejects one whose
+// contents MayContainStrings.
+type ClassSetExpression struct {
+	Negated bool
+	Body    ClassSetNode
+}
+
+func (c *ClassSetExpression) node()         {}
+func (c *ClassSetExpression) expr()         {}
+func (c *ClassSetExpression) classSetNode() {}
+
+// ClassSetNode is an operand or operation inside a ClassSetExpression: a
+// *ClassSetOperation, *ClassSetCharacter, *ClassSetRange, *ClassEscape,
+// *ClassStrings, or a nested *ClassSetExpression.
+type ClassSetNode interface {
+	classSetNode()
+}
+
+// SetOperationKind is the operator of a ClassSetOperation.
+type SetOperationKind int
+
+const (
+	SetUnion SetOperationKind = iota
+	SetIntersection
+	SetSubtraction // Items[0] minus every later item
+)
+
+// ClassSetOperation combines Items with one operator; ECMA-262 forbids mixing
+// operators at one level. A union may be empty ([]).
+type ClassSetOperation struct {
+	Kind  SetOperationKind
+	Items []ClassSetNode
+}
+
+func (c *ClassSetOperation) classSetNode() {}
+
+// ClassSetCharacter is a single code point in a v-mode class.
+type ClassSetCharacter struct {
+	Char rune
+}
+
+func (c *ClassSetCharacter) classSetNode() {}
+
+// ClassSetRange is an inclusive code point range in a v-mode class.
+type ClassSetRange struct {
+	Start rune
+	End   rune
+}
+
+func (c *ClassSetRange) classSetNode() {}
+
+// ClassStrings is a set of strings: a \q{...} string disjunction, or the
+// members of a property of strings (Property is then its name). A string of
+// one code point denotes that character, and the empty string may be a member.
+type ClassStrings struct {
+	Strings  [][]rune
+	Property string
+}
+
+func (c *ClassStrings) classSetNode() {}
 
 // Dot represents the . metacharacter
 type Dot struct{}
@@ -181,12 +249,6 @@ type Backreference struct {
 	Index      int    // primary group index (1-indexed)
 	Name       string // empty if using numeric index
 	AltIndices []int  // additional group indices for ES2022 duplicate named groups
-
-	// Fallback, when non-nil, means this \n did not resolve to a real group and
-	// (in Annex B mode) is instead a sequence of literal characters — a legacy
-	// octal escape and/or literal digits. The compiler emits these literally
-	// instead of a backreference.
-	Fallback []rune
 }
 
 func (b *Backreference) node() {}

@@ -62,6 +62,7 @@ Runnable, test-asserted examples for every feature below live in
 - ✅ Lookahead `(?=...)`, `(?!...)`
 - ✅ Lookbehind `(?<=...)`, `(?<!...)` — including variable-length, with ECMA-262 right-to-left capture semantics
 - ✅ Unicode property escapes `\p{...}`, `\P{...}` (requires `u`/`v`; all general categories, scripts via `Script=`, common binary properties; unknown names are rejected)
+- ✅ `v`-flag class sets: intersection `[\p{L}&&\p{Script=Greek}]`, subtraction `[\w--\d]`, nested classes `[[a-z][0-9]]`, strings `[\q{abc|xy}]`, and properties of strings such as `\p{RGI_Emoji}` (Unicode 17.0)
 - ✅ Escapes: `\xFF`, `\uFFFF`, `\u{...}` (code points require `u`/`v`), `\cA`, `\n`, `\r`, `\t`, `\f`, `\v`
 - ✅ Annex B web-compatibility syntax by default, strict mode opt-in (see [Syntax mode](#syntax-mode-annex-b-vs-strict))
 
@@ -117,6 +118,17 @@ re = ecma262.MustCompile(`^\p{Script=Greek}+$`, flags.Unicode)
 re.MatchString("αβγ") // true
 ```
 
+With `v`, classes are sets that can be intersected, subtracted and nested,
+and can hold strings as well as characters:
+
+```go
+re := ecma262.MustCompile(`[\p{L}--[a-z]]+`, flags.UnicodeSets)
+re.FindString("abcÄÖüdef") // "ÄÖü"
+
+re = ecma262.MustCompile(`\p{RGI_Emoji}`, flags.UnicodeSets)
+re.FindString("hi 👨‍👩‍👧!") // "👨‍👩‍👧" (one match for the whole family sequence)
+```
+
 ### Flags from a string
 
 ```go
@@ -153,7 +165,7 @@ such as `a{2,1}` is a syntax error in *every* mode.
 | `m` | Multiline - `^` and `$` match start/end of lines |
 | `s` | DotAll - `.` matches newline characters |
 | `u` | Unicode - enable Unicode features (required for `\p{...}` and `\u{...}`) |
-| `v` | UnicodeSets - extended Unicode features (cannot use with `u`) |
+| `v` | UnicodeSets - Unicode mode plus class set operations, `\q{...}` strings, and properties of strings (cannot use with `u`) |
 | `y` | Sticky - match only at exactly the `lastIndex` position |
 | `d` | HasIndices - parsed and accepted, but a no-op: match indices are always available via the `*Index` methods (see Known Limitations) |
 
