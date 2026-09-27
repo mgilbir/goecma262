@@ -6,7 +6,7 @@ For how the engine works internally, see [docs/architecture.md](docs/architectur
 
 ## Development setup
 
-Go 1.23+ is all you need to build and test. Node.js (any recent version, no
+Go 1.23+ is all you need to build and test. Node.js (a recent version, no
 `npm install` required) is needed only if you regenerate the Test262 suite.
 
 ```bash
@@ -28,17 +28,44 @@ pasting unverified snippets into the README.
 
 The implementation is tested against the official ECMAScript
 [Test262](https://github.com/tc39/test262) suite. Test cases are extracted
-from the `test/built-ins/RegExp` subtree and compiled into a committed Go
-test file, so `go test` works without Node or a Test262 checkout:
+from the RegExp tests — `test/built-ins/RegExp`, `test/language/literals/regexp`
+and their Annex B counterparts under `test/annexB` — and compiled into
+committed Go test files, so `go test` works without Node or a Test262
+checkout:
 
 ```mermaid
 flowchart LR
-    T262["tc39/test262 checkout<br/>test/built-ins/RegExp/**"]
+    T262["tc39/test262 checkout<br/>RegExp tests"]
     T262 -->|"node tools/test262_convert/extract.js<br/>--test262 … --out …"| JSON["tests/test262_cases.json<br/>(gitignored, reproducible)"]
-    JSON -->|"go run ./tools/test262_from_json/<br/>-in … -out …"| GEN["tests/test262_generated_test.go<br/>(committed)"]
+    JSON -->|"go run ./tools/test262_from_json/<br/>-in … -out … -syntax-out …"| GEN["tests/test262_generated_test.go<br/>tests/test262_syntax_generated_test.go<br/>(committed)"]
     SKIP["tests/test262_skip_test.go<br/>hand-maintained skip list<br/>never regenerated"] --> RUN
-    GEN --> RUN["go test ./tests/ -run TestTest262Generated"]
+    GEN --> RUN["go test ./tests/ -run TestTest262"]
 ```
+
+The extractor runs each test file in Node.js with instrumented RegExp methods
+and assertions, and records two kinds of case:
+
+- **Match cases** (`tests/test262_generated_test.go`): a `test`, `exec`,
+  `match`, `replace` or `split` call paired with the assertion on its result —
+  `assert.sameValue`; `assert(...)` on a `test` call (the test's
+  expectation is then the result Node produced, since Node passed the
+  assertion); or `assert.compareArray` on a whole `exec` or non-global
+  `match` result, which also checks which groups are undefined.
+- **Syntax cases** (`tests/test262_syntax_generated_test.go`): patterns that
+  must be SyntaxErrors — those the `RegExp` constructor rejects inside
+  `assert.throws(SyntaxError, …)`, and the regular expression literal of each
+  negative parse test (`negative: phase: parse`) — and patterns that must
+  compile, written as a whole statement such as `/(?i:a)/;`. A negative
+  literal is kept only if Node's `RegExp` constructor also rejects it: errors
+  that belong to the literal rather than the pattern, such as a line
+  terminator inside it, are reported as `literalOnlyErrors` in the JSON and
+  dropped.
+
+The generated files name the Test262 commit they were extracted from.
+Because some expectations are Node's own results and Node's `RegExp` decides
+which negative literals are pattern errors, extract with a Node.js that
+implements the features under test (the committed files were extracted with
+Node.js 26.9.0).
 
 To regenerate after updating the Test262 checkout or extending the extractor:
 
@@ -48,21 +75,24 @@ node tools/test262_convert/extract.js \
     --test262 /path/to/test262 \
     --out tests/test262_cases.json
 
-# 2. Generate the Go test file
+# 2. Generate the Go test files
 go run ./tools/test262_from_json/ \
     -in  tests/test262_cases.json \
-    -out tests/test262_generated_test.go
+    -out tests/test262_generated_test.go \
+    -syntax-out tests/test262_syntax_generated_test.go
 ```
 
 This is the only supported pipeline; earlier generator tools that wrote a
 different case-table schema have been removed.
 
-The extractor records the `assert.sameValue` checks a test makes on a
-`RegExp` call. The `v`-flag suites check with `assert()` inside harness
-helpers instead, so the extractor replaces `testPropertyOfStrings` and
-`testExtendedCharacterClass` with equivalents that make the same checks
-through `assert.sameValue`. `testPropertyEscapes` is deliberately not
-replaced: its inputs span whole Unicode ranges, too large to embed.
+The `v`-flag suites check inside harness helpers, so the extractor replaces
+`testPropertyOfStrings` and `testExtendedCharacterClass` with equivalents
+that make the same checks through `assert.sameValue`. `testPropertyEscapes`
+is deliberately not replaced: its inputs span whole Unicode ranges, too
+large to embed. A case records the pattern and flags the regex matches with
+(its `[[OriginalSource]]` and `[[OriginalFlags]]`), read through
+`RegExp.prototype`'s own accessors, since a test may shadow the flag
+properties.
 
 ## The known-failure skip list
 
@@ -90,12 +120,14 @@ bug to fix, not a skip to add.
 ### Strict mode
 
 By default, compile and flag-parse errors in generated cases produce
-`t.Skip`, so an experimental parser change doesn't drown you in failures.
-Set `TEST262_STRICT=1` to promote those skips to `t.Fatal`, which catches
-regressions where a previously compiling pattern stops compiling:
+`t.Skip`, so an experimental parser change doesn't drown you in failures;
+the same holds for a syntax case that must compile. Set `TEST262_STRICT=1`
+to promote those skips to `t.Fatal`, which catches regressions where a
+previously compiling pattern stops compiling. A pattern that must be a
+SyntaxError but compiles always fails.
 
 ```bash
-TEST262_STRICT=1 go test ./tests/ -run TestTest262Generated
+TEST262_STRICT=1 go test ./tests/ -run TestTest262
 ```
 
 ## Differential testing against node

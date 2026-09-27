@@ -259,10 +259,11 @@ go test ./...
 ```
 
 The implementation is tested against the official ECMAScript
-[Test262](https://github.com/tc39/test262) suite: **all 66,346 extracted
-cases pass or are explicitly skipped**. The 14 permanent skips need a real
-JavaScript runtime (e.g. a JS function as replacement argument) or exceed
-compile-time limits; [`tests/test262_skip_test.go`](tests/test262_skip_test.go)
+[Test262](https://github.com/tc39/test262) suite, at commit `7ab7faf`: **all
+67,783 extracted match cases and 1,019 syntax cases (patterns that must, or
+must not, compile) pass or are explicitly skipped**. The 17 permanent skips
+need a real JavaScript runtime (e.g. a JS function as replacement argument)
+or exceed compile-time limits; [`tests/test262_skip_test.go`](tests/test262_skip_test.go)
 is the canonical list, with the reason for every entry. How to regenerate the
 suite and maintain the skip list is covered in
 [CONTRIBUTING.md](CONTRIBUTING.md).
