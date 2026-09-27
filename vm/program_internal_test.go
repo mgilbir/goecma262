@@ -21,7 +21,7 @@ func TestASCIISetFastMatchesSlow(t *testing.T) {
 			fast++
 			lo, hi := p.asciiSetSlow(&insts[i])
 			if got != [2]uint64{lo, hi} {
-				t.Errorf("flags %05b, %s %v: fast %x, slow %x", mask, insts[i], fmt.Sprint(insts[i].Class), got, [2]uint64{lo, hi})
+				t.Errorf("flags %05b, %s %v mod %06b: fast %x, slow %x", mask, insts[i], fmt.Sprint(insts[i].Class), insts[i].Mod, got, [2]uint64{lo, hi})
 			}
 		}
 	}
@@ -48,7 +48,7 @@ func TestASCIIOnlyIsSound(t *testing.T) {
 			checked++
 			for _, c := range nonASCII {
 				if m.matchOne(&insts[i], c) {
-					t.Errorf("flags %05b, %s %v: called ASCII-only but matches %U", mask, insts[i], fmt.Sprint(insts[i].Class), c)
+					t.Errorf("flags %05b, %s %v mod %06b: called ASCII-only but matches %U", mask, insts[i], fmt.Sprint(insts[i].Class), insts[i].Mod, c)
 				}
 			}
 		}
@@ -64,7 +64,8 @@ func testProgram(mask int) *Program {
 }
 
 // singleRuneInstructions covers every single-rune opcode, with characters and
-// classes around the ASCII boundary and the case-folding exceptions.
+// classes around the ASCII boundary and the case-folding exceptions, each
+// also with the overrides of a modifier group.
 func singleRuneInstructions() []Instruction {
 	r := func(a, b rune) ClassAtom { return ClassAtom{Kind: ClassAtomRange, Range: RuneRange{a, b}} }
 	classes := [][]ClassAtom{
@@ -90,6 +91,13 @@ func singleRuneInstructions() []Instruction {
 	}
 	for _, cl := range classes {
 		insts = append(insts, Instruction{Op: OpClass, Class: cl}, Instruction{Op: OpClass, Class: cl, Negate: true})
+	}
+	n := len(insts)
+	for _, mod := range []Modifiers{ModIgnoreCase, ModNoIgnoreCase, ModDotAll, ModNoDotAll, ModIgnoreCase | ModNoDotAll, ModNoIgnoreCase | ModDotAll} {
+		for _, inst := range insts[:n] {
+			inst.Mod = mod
+			insts = append(insts, inst)
+		}
 	}
 	return insts
 }

@@ -136,9 +136,38 @@ type NamedGroup struct {
 func (n *NamedGroup) node() {}
 func (n *NamedGroup) expr() {}
 
-// NonCapturingGroup represents a non-capturing group (?:...)
+// NonCapturingGroup represents a non-capturing group (?:...), or a group with
+// pattern modifiers (?ims-ims:...) when Add or Remove is non-zero: within Body
+// the flags in Add are on and the flags in Remove are off, whatever they are
+// outside (ECMA-262 RegExp modifiers). Add and Remove never share a flag.
 type NonCapturingGroup struct {
-	Body Expression
+	Body   Expression
+	Add    Modifiers
+	Remove Modifiers
+}
+
+// Modifiers is a set of the flags a modifier group can change.
+type Modifiers uint8
+
+const (
+	ModIgnoreCase Modifiers = 1 << iota // i
+	ModMultiline                        // m
+	ModDotAll                           // s
+)
+
+// String returns the flag letters of m in the order i, m, s.
+func (m Modifiers) String() string {
+	s := ""
+	if m&ModIgnoreCase != 0 {
+		s += "i"
+	}
+	if m&ModMultiline != 0 {
+		s += "m"
+	}
+	if m&ModDotAll != 0 {
+		s += "s"
+	}
+	return s
 }
 
 func (n *NonCapturingGroup) node() {}

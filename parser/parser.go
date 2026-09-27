@@ -694,7 +694,8 @@ func (p *Parser) parsePropertyExpression() (string, error) {
 }
 
 // parseGroup parses a group: (...), (?:...), (?=...), (?!...), (?<=...),
-// (?<!...) or (?<name>...), at the opening parenthesis.
+// (?<!...), (?<name>...) or a modifier group (?ims-ims:...), at the opening
+// parenthesis.
 func (p *Parser) parseGroup() (Expression, error) {
 	start := p.pos
 	if err := p.enterNesting(); err != nil {
@@ -747,7 +748,57 @@ func (p *Parser) parseGroup() (Expression, error) {
 		p.namedGroups[name] = append(p.namedGroups[name], idx)
 		return body(func(b Expression) Expression { return &NamedGroup{Index: idx, Name: name, Body: b} })
 	}
-	return nil, fmt.Errorf("invalid group at offset %d", start)
+
+	// (? RegularExpressionModifiers : Disjunction ) or
+	// (? RegularExpressionModifiers - RegularExpressionModifiers : Disjunction )
+	add, err := p.parseModifiers(start)
+	if err != nil {
+		return nil, err
+	}
+	var remove Modifiers
+	dash := p.eat('-')
+	if dash {
+		if remove, err = p.parseModifiers(start); err != nil {
+			return nil, err
+		}
+	}
+	if !p.eat(':') {
+		return nil, fmt.Errorf("invalid group at offset %d", start)
+	}
+	// Early errors: the (?: form was handled above, so add is non-empty
+	// unless there is a -, and then the two may not both be empty or share
+	// a flag.
+	if add == 0 && remove == 0 {
+		return nil, fmt.Errorf("invalid modifiers at offset %d: (?-: names no flag", start)
+	}
+	if add&remove != 0 {
+		return nil, fmt.Errorf("invalid modifiers at offset %d: %s both added and removed", start, add&remove)
+	}
+	return body(func(b Expression) Expression { return &NonCapturingGroup{Add: add, Remove: remove, Body: b} })
+}
+
+// parseModifiers parses RegularExpressionModifiers: any of i, m and s, each at
+// most once.
+func (p *Parser) parseModifiers(start int) (Modifiers, error) {
+	var m Modifiers
+	for {
+		var f Modifiers
+		switch p.peek(0) {
+		case 'i':
+			f = ModIgnoreCase
+		case 'm':
+			f = ModMultiline
+		case 's':
+			f = ModDotAll
+		default:
+			return m, nil
+		}
+		if m&f != 0 {
+			return 0, fmt.Errorf("invalid modifiers at offset %d: %s repeated", start, f)
+		}
+		m |= f
+		p.pos++
+	}
 }
 
 // parseGroupName parses < RegExpIdentifierName > at the <.

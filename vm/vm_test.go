@@ -192,7 +192,9 @@ func (p pair) compare(t *testing.T, input string, lastIndex int) bool {
 }
 
 var (
-	genAtoms  = []string{"a", "b", "A", ".", "[ab]", "[^a]", "[a-c]", `\d`, `\w`, `\s`, `\W`, "é", `\n`, "[é-ë]", `\p{L}`, "(?:)", "x", `\b`, `\B`, "^", "$", "k", "[r-t]"}
+	genAtoms = []string{"a", "b", "A", ".", "[ab]", "[^a]", "[a-c]", `\d`, `\w`, `\s`, `\W`, "é", `\n`, "[é-ë]", `\p{L}`, "(?:)", "x", `\b`, `\B`, "^", "$", "k", "[r-t]",
+		// Modifier groups change the flags of single instructions.
+		"(?i:k)", "(?-i:a)", "(?i:[r-t])", `(?i:\w)`, `(?-i:\b)`, "(?m:^)", "(?-m:$)", "(?s:.)", "(?-s:.)", `(?i:\p{Lu})`}
 	genQuants = []string{"*", "+", "?", "{0,2}", "{1,3}", "{2}", "{1,}", "*?", "+?", "??", "{0,2}?", "{2,}?"}
 	genInputs = []string{"a", "a", "b", "A", "\n", " ", "1", "é", "x", "\xe2\x82", "\xff", "ab", "€", "\u212a", "ſ", "k"}
 	genFlags  = []string{"", "i", "m", "s", "u", "im", "y", "g", "iu", "ms", "gy", "gu"}
@@ -290,6 +292,8 @@ func TestOptimisedMatchesReferenceCorpus(t *testing.T) {
 		{`(?<!.*x)(.)`, "g"}, {`(?=(.*))(.)`, "y"}, {`.+?(.)(.)`, "y"},
 		{`[a-z]*(\1)`, "g"}, {`(.)*\1`, "g"}, {`.*(.)€`, "y"}, {`(?<=(.)é.*)`, "y"},
 		{`(?:k|x)+`, "giu"}, {`[r-t]*`, "giu"}, {`k*?$`, "giu"},
+		{`(?m:^)a`, "g"}, {`(?m:^).`, "gy"}, {`(?i:k)+`, "g"}, {`(?-i:k)+`, "gi"}, {`(?:x|(?i:k))+`, "gu"}, {`(?:x|(?-i:k))+`, "giu"}, {`(?-s:.)*`, "gs"}, {`(?s:.)*`, "g"},
+		{`(?i:[r-t])*x`, "gu"}, {`a(?m:$)`, "g"}, {`(?<=(?i:k))\w`, "gu"},
 		{`\w*`, "giu"}, {`(?:\w|x)+`, "giu"}, {`(?:\W|x)+`, "giu"}, {`\p{Lu}*`, "giu"}, {`\P{Ll}*`, "giv"},
 	}
 	for _, pc := range patterns {

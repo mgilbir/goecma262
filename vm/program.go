@@ -79,8 +79,8 @@ func NewProgram(code []Instruction, ignoreCase, multiline, dotAll, unicode, unic
 	}
 	p.computeDirections()
 	p.exact = hasBackref(code) || hasEpsilonCycle(code)
-	p.anchored = !backward && !multiline && len(code) > 1 &&
-		code[0].Op == OpSaveStart && code[0].A == 0 && code[1].Op == OpStartLine
+	p.anchored = !backward && len(code) > 1 &&
+		code[0].Op == OpSaveStart && code[0].A == 0 && code[1].Op == OpStartLine && !p.multilineAt(&code[1])
 
 	walk := newFrontierWalker(len(code))
 	need := func(pc int) {
@@ -117,6 +117,20 @@ func (p *Program) matches(code []Instruction, ignoreCase, multiline, dotAll, uni
 		(len(code) == 0 || unsafe.SliceData(p.code) == unsafe.SliceData(code)) &&
 		p.ignoreCase == ignoreCase && p.multiline == multiline && p.dotAll == dotAll &&
 		p.unicode == unicode && p.unicodeSets == unicodeSets && p.backward == backward
+}
+
+// ignoreCaseAt, multilineAt and dotAllAt return the flags in effect for inst:
+// the program's, unless a modifier group overrides them (Instruction.Mod).
+func (p *Program) ignoreCaseAt(inst *Instruction) bool {
+	return inst.Mod.resolve(p.ignoreCase, ModIgnoreCase, ModNoIgnoreCase)
+}
+
+func (p *Program) multilineAt(inst *Instruction) bool {
+	return inst.Mod.resolve(p.multiline, ModMultiline, ModNoMultiline)
+}
+
+func (p *Program) dotAllAt(inst *Instruction) bool {
+	return inst.Mod.resolve(p.dotAll, ModDotAll, ModNoDotAll)
 }
 
 // isSingleRune reports whether op consumes exactly one rune when it succeeds.
@@ -274,11 +288,11 @@ func (p *Program) asciiOnly(inst *Instruction) bool {
 	case OpDigit:
 		return true
 	case OpWord:
-		return !p.ignoreCase || !p.unicode
+		return !p.ignoreCaseAt(inst) || !p.unicode
 	case OpChar:
-		return inst.Char < 0x80 && !p.ignoreCase
+		return inst.Char < 0x80 && !p.ignoreCaseAt(inst)
 	case OpClass:
-		if inst.Negate || p.ignoreCase {
+		if inst.Negate || p.ignoreCaseAt(inst) {
 			return false
 		}
 		for _, a := range inst.Class {
@@ -377,7 +391,7 @@ func asciiRange(lo, hi rune) (s [2]uint64) {
 func (p *Program) asciiSetFast(inst *Instruction) (s [2]uint64, ok bool) {
 	switch inst.Op {
 	case OpChar:
-		if p.ignoreCase {
+		if p.ignoreCaseAt(inst) {
 			return s, false
 		}
 		if inst.Char >= 0 && inst.Char < 0x80 {
@@ -385,7 +399,7 @@ func (p *Program) asciiSetFast(inst *Instruction) (s [2]uint64, ok bool) {
 		}
 		return s, true
 	case OpAny:
-		if p.dotAll {
+		if p.dotAllAt(inst) {
 			return asciiAll, true
 		}
 		return asciiNot(asciiLineTerm), true
@@ -402,7 +416,7 @@ func (p *Program) asciiSetFast(inst *Instruction) (s [2]uint64, ok bool) {
 	case OpNonSpace:
 		return asciiNot(asciiSpace), true
 	case OpClass:
-		if p.ignoreCase {
+		if p.ignoreCaseAt(inst) {
 			return s, false
 		}
 		for _, a := range inst.Class {
@@ -487,7 +501,7 @@ func (p *Program) computeFirst(start int, w *frontierWalker) *firstSet {
 			// Forward, $ holds only at the end of input or, with m, before a
 			// line terminator (which is then the next rune read).
 			fs.atEdge = true
-			if p.multiline {
+			if p.multilineAt(inst) {
 				lt := lineTerminatorBytes()
 				for i := range fs.bytes {
 					fs.bytes[i] |= lt[i]
@@ -497,7 +511,7 @@ func (p *Program) computeFirst(start int, w *frontierWalker) *firstSet {
 			// Backward, ^ holds only at the start of input or, with m, after a
 			// line terminator (which is then the next rune read).
 			fs.atEdge = true
-			if p.multiline {
+			if p.multilineAt(inst) {
 				lt := lineTerminatorBytes()
 				for i := range fs.bytes {
 					fs.bytes[i] |= lt[i]

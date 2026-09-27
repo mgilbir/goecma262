@@ -157,6 +157,23 @@ a match, never its result:
 differentially: `vm.SetOptimize(false)`, available to tests, disables the
 analysis and runs the plain algorithm as the reference.
 
+## Pattern modifiers
+
+A modifier group `(?ims-ims:...)` changes the `i`, `m` and `s` flags for its
+body only. The parser records the added and removed flags on the
+`parser.NonCapturingGroup`; the compiler tracks the flags in effect while it
+emits the body and marks every instruction whose flags differ from the
+pattern's with `vm.Instruction.Mod`, a set of overrides (`ModIgnoreCase`,
+`ModNoIgnoreCase`, and likewise for multiline and dotAll). The VM's own
+`IgnoreCase`, `Multiline` and `DotAll` remain the pattern's flags; each
+flag-dependent instruction (characters, classes, `\w`/`\b` and their
+negations, property escapes, backreferences, `^`, `$`, `.`) resolves its
+flags from them and its overrides, so there is no flag state to save and
+restore while matching, and backtracking into or out of a group needs
+nothing special. The static analysis resolves flags per instruction the same
+way, so first-byte sets, the greedy-loop scan and the anchoring shortcut
+stay exact inside modifier groups.
+
 ## Case folding and Unicode properties
 
 Case-insensitive matching uses Unicode simple case folding under `u`/`v`,

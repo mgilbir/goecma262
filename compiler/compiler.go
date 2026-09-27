@@ -19,6 +19,10 @@ const (
 type Compiler struct {
 	code  []vm.Instruction
 	depth int // current nesting depth
+
+	// The flags a modifier group can change: those of the pattern, and
+	// those in effect where code is being emitted.
+	patternFlags, flags parser.Modifiers
 }
 
 // Compile compiles a regex pattern AST to VM instructions.
@@ -29,6 +33,16 @@ func Compile(pattern *parser.Pattern) ([]vm.Instruction, int, error) {
 	c := &Compiler{
 		code: make([]vm.Instruction, 0),
 	}
+	if pattern.Flags.IgnoreCase {
+		c.patternFlags |= parser.ModIgnoreCase
+	}
+	if pattern.Flags.Multiline {
+		c.patternFlags |= parser.ModMultiline
+	}
+	if pattern.Flags.DotAll {
+		c.patternFlags |= parser.ModDotAll
+	}
+	c.flags = c.patternFlags
 
 	// Emit save instructions for group 0 (full match)
 	c.emit(vm.Instruction{Op: vm.OpSaveStart, A: 0})
@@ -46,10 +60,37 @@ func Compile(pattern *parser.Pattern) ([]vm.Instruction, int, error) {
 	return c.code, pattern.NumGroups, nil
 }
 
+// emit appends inst, marking it with the flags that differ from the
+// pattern's inside a modifier group (vm.Instruction.Mod).
 func (c *Compiler) emit(inst vm.Instruction) int {
 	idx := len(c.code)
+	if c.flags != c.patternFlags {
+		inst.Mod = c.modifiers()
+	}
 	c.code = append(c.code, inst)
 	return idx
+}
+
+// modifiers returns the vm overrides that turn the pattern's flags into the
+// current ones.
+func (c *Compiler) modifiers() vm.Modifiers {
+	var m vm.Modifiers
+	for _, f := range []struct {
+		flag       parser.Modifiers
+		set, clear vm.Modifiers
+	}{
+		{parser.ModIgnoreCase, vm.ModIgnoreCase, vm.ModNoIgnoreCase},
+		{parser.ModMultiline, vm.ModMultiline, vm.ModNoMultiline},
+		{parser.ModDotAll, vm.ModDotAll, vm.ModNoDotAll},
+	} {
+		switch on, was := c.flags&f.flag != 0, c.patternFlags&f.flag != 0; {
+		case on && !was:
+			m |= f.set
+		case !on && was:
+			m |= f.clear
+		}
+	}
+	return m
 }
 
 func (c *Compiler) patchJump(idx, target int) {
@@ -88,7 +129,15 @@ func (c *Compiler) compileNode(node parser.Node) error {
 	case *parser.NamedGroup:
 		return c.compileNamedGroup(n)
 	case *parser.NonCapturingGroup:
-		return c.compileNode(n.Body)
+		if n.Add == 0 && n.Remove == 0 {
+			return c.compileNode(n.Body)
+		}
+		// A modifier group: its body is compiled with the flags it sets.
+		outer := c.flags
+		c.flags = (c.flags | n.Add) &^ n.Remove
+		err := c.compileNode(n.Body)
+		c.flags = outer
+		return err
 	case *parser.Lookahead:
 		return c.compileLookahead(n)
 	case *parser.NegativeLookahead:
@@ -542,7 +591,7 @@ func reverseExpr(e parser.Expression) parser.Expression {
 	case *parser.NamedGroup:
 		return &parser.NamedGroup{Index: n.Index, Name: n.Name, Body: reverseExpr(n.Body)}
 	case *parser.NonCapturingGroup:
-		return &parser.NonCapturingGroup{Body: reverseExpr(n.Body)}
+		return &parser.NonCapturingGroup{Add: n.Add, Remove: n.Remove, Body: reverseExpr(n.Body)}
 	default:
 		return e
 	}

@@ -100,6 +100,7 @@ const (
 // Instruction represents a single VM instruction
 type Instruction struct {
 	Op     Opcode
+	Mod    Modifiers   // flags this instruction overrides (a modifier group (?ims-ims:...))
 	A      int         // First operand
 	B      int         // Second operand
 	Char   rune        // For character matching
@@ -107,6 +108,47 @@ type Instruction struct {
 	Class  []ClassAtom // For OpClass
 	Negate bool        // For OpClass
 	AltA   []int       // Alternative group indices (for duplicate named groups in \k<name>)
+}
+
+// Modifiers overrides, for one instruction, flags that otherwise come from the
+// VM: the compiler sets them on the instructions inside a modifier group
+// (?ims-ims:...) whose flags differ from the pattern's. For each flag at most
+// one of the pair is set. Only the instructions whose behaviour depends on
+// the flag read it: IgnoreCase for characters, classes, \w \W \b \B,
+// property escapes and backreferences, Multiline for ^ and $, DotAll for ".".
+type Modifiers uint8
+
+const (
+	ModIgnoreCase   Modifiers = 1 << iota // case-insensitive, whatever VM.IgnoreCase says
+	ModNoIgnoreCase                       // case-sensitive, whatever VM.IgnoreCase says
+	ModMultiline                          // ^ and $ match at line terminators
+	ModNoMultiline                        // ^ and $ match only at the input's edges
+	ModDotAll                             // . matches line terminators
+	ModNoDotAll                           // . does not match line terminators
+)
+
+// resolve returns the flag's value under m, given its value outside.
+func (m Modifiers) resolve(outside bool, set, clear Modifiers) bool {
+	switch {
+	case m&set != 0:
+		return true
+	case m&clear != 0:
+		return false
+	}
+	return outside
+}
+
+// ignoreCase, multiline and dotAll return the flags in effect for inst.
+func (vm *VM) ignoreCase(inst *Instruction) bool {
+	return inst.Mod.resolve(vm.IgnoreCase, ModIgnoreCase, ModNoIgnoreCase)
+}
+
+func (vm *VM) multiline(inst *Instruction) bool {
+	return inst.Mod.resolve(vm.Multiline, ModMultiline, ModNoMultiline)
+}
+
+func (vm *VM) dotAll(inst *Instruction) bool {
+	return inst.Mod.resolve(vm.DotAll, ModDotAll, ModNoDotAll)
 }
 
 // RuneRange represents a range of runes
@@ -331,38 +373,39 @@ func (vm *VM) readRune(pos int, backward bool) (r rune, next int, ok bool) {
 func (vm *VM) matchOne(inst *Instruction, r rune) bool {
 	switch inst.Op {
 	case OpChar:
-		return vm.matchChar(r, inst.Char)
+		return vm.matchChar(r, inst.Char, vm.ignoreCase(inst))
 	case OpAny:
-		return vm.DotAll || !isLineTerminator(r)
+		return vm.dotAll(inst) || !isLineTerminator(r)
 	case OpDigit:
 		// ECMA-262: \d matches only [0-9], not full Unicode digits
 		return isECMADigit(r)
 	case OpNonDigit:
 		return !isECMADigit(r)
 	case OpWord:
-		return vm.isWordChar(r)
+		return vm.isWordChar(r, vm.ignoreCase(inst))
 	case OpNonWord:
-		return !vm.isWordChar(r)
+		return !vm.isWordChar(r, vm.ignoreCase(inst))
 	case OpSpace:
 		return isSpace(r)
 	case OpNonSpace:
 		return !isSpace(r)
 	case OpClass:
+		ic := vm.ignoreCase(inst)
 		matched := false
 		for _, atom := range inst.Class {
 			atomMatch := false
 			switch atom.Kind {
 			case ClassAtomRange:
-				atomMatch = vm.matchInRange(r, atom.Range.Start, atom.Range.End) != atom.Negated
+				atomMatch = vm.matchInRange(r, atom.Range.Start, atom.Range.End, ic) != atom.Negated
 			case ClassAtomDigit:
 				atomMatch = isECMADigit(r) != atom.Negated
 			case ClassAtomWord:
-				atomMatch = vm.isWordChar(r) != atom.Negated
+				atomMatch = vm.isWordChar(r, ic) != atom.Negated
 			case ClassAtomSpace:
 				atomMatch = isSpace(r) != atom.Negated
 			case ClassAtomUnicodeProp:
 				// Under case folding \P is not the complement of \p's match.
-				atomMatch = vm.matchProperty(r, atom.Prop, atom.Negated)
+				atomMatch = vm.matchProperty(r, atom.Prop, atom.Negated, ic)
 			}
 			if atomMatch {
 				matched = true
@@ -371,9 +414,9 @@ func (vm *VM) matchOne(inst *Instruction, r rune) bool {
 		}
 		return matched != inst.Negate
 	case OpUnicodeProp:
-		return vm.matchProperty(r, inst.Prop, false)
+		return vm.matchProperty(r, inst.Prop, false, vm.ignoreCase(inst))
 	case OpNotUnicodeProp:
-		return vm.matchProperty(r, inst.Prop, true)
+		return vm.matchProperty(r, inst.Prop, true, vm.ignoreCase(inst))
 	}
 	return false
 }
@@ -387,8 +430,8 @@ func (vm *VM) matchOne(inst *Instruction, r rune) bool {
 // complement of prop's set, matched the same way: some case variant lacks
 // prop. Under v, the property's set is case-folded first and \P{prop} is the
 // complement of that: no case variant has prop.
-func (vm *VM) matchProperty(r rune, prop string, negated bool) bool {
-	if !vm.IgnoreCase || !vm.Unicode {
+func (vm *VM) matchProperty(r rune, prop string, negated, ignoreCase bool) bool {
+	if !ignoreCase || !vm.Unicode {
 		return matchUnicodeProperty(r, prop) != negated
 	}
 	want := !negated || vm.UnicodeSets // what a case variant must have
@@ -701,7 +744,7 @@ func (vm *VM) run(st *runState, pc, pos int) (bool, int) {
 			case OpStartLine:
 				if pos == 0 {
 					pc++
-				} else if prevR, _ := utf8.DecodeLastRuneInString(vm.Input[:pos]); vm.Multiline && isLineTerminator(prevR) {
+				} else if prevR, _ := utf8.DecodeLastRuneInString(vm.Input[:pos]); vm.multiline(inst) && isLineTerminator(prevR) {
 					pc++
 				} else {
 					ok = false
@@ -710,21 +753,21 @@ func (vm *VM) run(st *runState, pc, pos int) (bool, int) {
 			case OpEndLine:
 				if pos >= len(vm.Input) {
 					pc++
-				} else if r, _ := utf8.DecodeRuneInString(vm.Input[pos:]); vm.Multiline && isLineTerminator(r) {
+				} else if r, _ := utf8.DecodeRuneInString(vm.Input[pos:]); vm.multiline(inst) && isLineTerminator(r) {
 					pc++
 				} else {
 					ok = false
 				}
 
 			case OpWordBound:
-				if vm.wordCharBefore(pos) != vm.wordCharAt(pos) {
+				if ic := vm.ignoreCase(inst); vm.wordCharBefore(pos, ic) != vm.wordCharAt(pos, ic) {
 					pc++
 				} else {
 					ok = false
 				}
 
 			case OpNonWordBound:
-				if vm.wordCharBefore(pos) == vm.wordCharAt(pos) {
+				if ic := vm.ignoreCase(inst); vm.wordCharBefore(pos, ic) == vm.wordCharAt(pos, ic) {
 					pc++
 				} else {
 					ok = false
@@ -917,7 +960,7 @@ func (vm *VM) matchBackref(inst *Instruction, groups []int, pos int, backward bo
 	refText := vm.Input[start:end]
 	if backward {
 		// Match the referenced text ending at pos, consuming backward.
-		if vm.IgnoreCase {
+		if vm.ignoreCase(inst) {
 			ok, consumed := vm.matchStringIgnoreCaseBackward(vm.Input[:pos], refText)
 			return pos - consumed, ok
 		}
@@ -926,7 +969,7 @@ func (vm *VM) matchBackref(inst *Instruction, groups []int, pos int, backward bo
 		}
 		return pos - len(refText), true
 	}
-	if vm.IgnoreCase {
+	if vm.ignoreCase(inst) {
 		ok, consumed := vm.matchStringIgnoreCaseAt(vm.Input[pos:], refText)
 		return pos + consumed, ok
 	}
@@ -948,7 +991,7 @@ func (vm *VM) matchStringIgnoreCaseBackward(sBefore, ref string) (bool, int) {
 		}
 		sr, sSize := utf8.DecodeLastRuneInString(sBefore[:si])
 		rr, rSize := utf8.DecodeLastRuneInString(ref[:ri])
-		if !vm.matchChar(sr, rr) {
+		if !vm.matchChar(sr, rr, true) {
 			return false, 0
 		}
 		si -= sSize
@@ -969,7 +1012,7 @@ func (vm *VM) matchStringIgnoreCaseAt(s, ref string) (bool, int) {
 		}
 		sr, sSize := utf8.DecodeRuneInString(s[si:])
 		rr, rSize := utf8.DecodeRuneInString(ref[ri:])
-		if !vm.matchChar(sr, rr) {
+		if !vm.matchChar(sr, rr, true) {
 			return false, 0
 		}
 		si += sSize
@@ -979,11 +1022,11 @@ func (vm *VM) matchStringIgnoreCaseAt(s, ref string) (bool, int) {
 	return true, consumed
 }
 
-func (vm *VM) matchChar(input, pattern rune) bool {
+func (vm *VM) matchChar(input, pattern rune, ignoreCase bool) bool {
 	if input == pattern {
 		return true
 	}
-	if !vm.IgnoreCase {
+	if !ignoreCase {
 		return false
 	}
 	if vm.Unicode {
@@ -995,11 +1038,11 @@ func (vm *VM) matchChar(input, pattern rune) bool {
 	return canonicalizeLegacy(input) == canonicalizeLegacy(pattern)
 }
 
-func (vm *VM) matchInRange(ch, start, end rune) bool {
+func (vm *VM) matchInRange(ch, start, end rune, ignoreCase bool) bool {
 	if ch >= start && ch <= end {
 		return true
 	}
-	if !vm.IgnoreCase {
+	if !ignoreCase {
 		return false
 	}
 	// Case-insensitive membership: a character matches the range if any of its
@@ -1084,11 +1127,11 @@ var wordFoldExtras = func() []rune {
 // plus, case-insensitively in Unicode mode, the characters that case-fold into
 // it. That set is closed under case folding, so it is matched as is by \w and
 // complemented as is by \W.
-func (vm *VM) isWordChar(r rune) bool {
+func (vm *VM) isWordChar(r rune, ignoreCase bool) bool {
 	if isWordChar(r) {
 		return true
 	}
-	if r < utf8.RuneSelf || !vm.IgnoreCase || !vm.Unicode {
+	if r < utf8.RuneSelf || !ignoreCase || !vm.Unicode {
 		return false
 	}
 	for _, x := range wordFoldExtras {
@@ -1101,7 +1144,7 @@ func (vm *VM) isWordChar(r rune) bool {
 
 // wordCharBefore reports whether the character before pos is a word character.
 // Handles multi-byte UTF-8 correctly using DecodeLastRuneInString.
-func (vm *VM) wordCharBefore(pos int) bool {
+func (vm *VM) wordCharBefore(pos int, ignoreCase bool) bool {
 	if pos <= 0 {
 		return false
 	}
@@ -1109,11 +1152,11 @@ func (vm *VM) wordCharBefore(pos int) bool {
 	if r == utf8.RuneError {
 		return false
 	}
-	return vm.isWordChar(r)
+	return vm.isWordChar(r, ignoreCase)
 }
 
 // wordCharAt reports whether the character at pos is a word character.
-func (vm *VM) wordCharAt(pos int) bool {
+func (vm *VM) wordCharAt(pos int, ignoreCase bool) bool {
 	if pos >= len(vm.Input) {
 		return false
 	}
@@ -1121,7 +1164,7 @@ func (vm *VM) wordCharAt(pos int) bool {
 	if r == utf8.RuneError {
 		return false
 	}
-	return vm.isWordChar(r)
+	return vm.isWordChar(r, ignoreCase)
 }
 
 func isSpace(r rune) bool {

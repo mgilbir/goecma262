@@ -61,6 +61,7 @@ Runnable, test-asserted examples for every feature below live in
 - ✅ Named capture groups `(?<name>abc)` and backreferences `\k<name>`
 - ✅ Lookahead `(?=...)`, `(?!...)`
 - ✅ Lookbehind `(?<=...)`, `(?<!...)` — including variable-length, with ECMA-262 right-to-left capture semantics
+- ✅ Pattern modifiers `(?ims-ims:...)` (ES2025): turn `i`, `m` and `s` on or off for part of a pattern
 - ✅ Unicode property escapes `\p{...}`, `\P{...}` (requires `u`/`v`; all general categories, scripts via `Script=`, common binary properties; unknown names are rejected)
 - ✅ Escapes: `\xFF`, `\uFFFF`, `\u{...}` (code points require `u`/`v`), `\cA`, `\n`, `\r`, `\t`, `\f`, `\v`
 - ✅ Annex B web-compatibility syntax by default, strict mode opt-in (see [Syntax mode](#syntax-mode-annex-b-vs-strict))
