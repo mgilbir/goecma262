@@ -22,7 +22,8 @@ type Compiler struct {
 	numGroups int // capture groups in the pattern
 	numMarks  int // iteration-start mark slots allocated so far
 
-	ignoreCase bool
+	ignoreCase  bool
+	unicodeSets bool
 	// classSets memoizes evaluated v-mode classes, which a counted quantifier
 	// compiles once per copy.
 	classSets map[*parser.ClassSetExpression]classSetValue
@@ -34,9 +35,10 @@ type Compiler struct {
 // a group more than once even inside a counted quantifier.
 func Compile(pattern *parser.Pattern) ([]vm.Instruction, int, error) {
 	c := &Compiler{
-		code:       make([]vm.Instruction, 0),
-		numGroups:  pattern.NumGroups,
-		ignoreCase: pattern.Flags.IgnoreCase,
+		code:        make([]vm.Instruction, 0),
+		numGroups:   pattern.NumGroups,
+		ignoreCase:  pattern.Flags.IgnoreCase,
+		unicodeSets: pattern.Flags.UnicodeSets,
 	}
 
 	// Emit save instructions for group 0 (full match)
@@ -631,7 +633,12 @@ func (c *Compiler) compileUnicodeProperty(u *parser.UnicodeProperty) error {
 	if !vm.ValidUnicodeProperty(u.Property) {
 		return fmt.Errorf("invalid unicode property escape: \\p{%s}", u.Property)
 	}
-	if u.Negated {
+	if u.Negated && c.unicodeSets {
+		// Under v, \P{…} complements the case-folded property, so /\P{Lu}/vi
+		// rejects "A" where /\P{Lu}/ui matches it; a class set does that.
+		atom := vm.ClassAtom{Kind: vm.ClassAtomUnicodeProp, Prop: u.Property, Negated: true}
+		c.emit(vm.Instruction{Op: vm.OpClassSet, Set: &vm.CharSet{Op: vm.CharSetEscape, Atom: atom}})
+	} else if u.Negated {
 		c.emit(vm.Instruction{Op: vm.OpNotUnicodeProp, Prop: u.Property})
 	} else {
 		c.emit(vm.Instruction{Op: vm.OpUnicodeProp, Prop: u.Property})

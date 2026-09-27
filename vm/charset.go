@@ -60,7 +60,7 @@ func (vm *VM) matchCharSet(s *CharSet, r rune) bool {
 	case CharSetRanges:
 		return vm.anyFold(r, func(f rune) bool { return inRanges(s.Ranges, f) })
 	case CharSetEscape:
-		return vm.anyFold(r, s.Atom.matchPositive) != s.Atom.Negated
+		return vm.anyFold(r, func(f rune) bool { return vm.matchEscape(s.Atom, f) }) != s.Atom.Negated
 	case CharSetUnion:
 		for _, it := range s.Items {
 			if vm.matchCharSet(it, r) {
@@ -81,14 +81,17 @@ func (vm *VM) matchCharSet(s *CharSet, r rune) bool {
 	return false
 }
 
-// anyFold reports whether pred holds for r or, under IgnoreCase, for any rune
-// in r's simple case folding orbit. A CharSet exists only in v mode, where
-// case folding is always Unicode simple case folding.
+// anyFold reports whether pred holds for r or, under IgnoreCase in Unicode
+// mode (u or v), for any rune in r's simple case folding orbit. That is how
+// ECMA-262 matches a rune against a set there: by comparing Canonicalize of
+// both, and Canonicalize is simple case folding. Without u or v it is the
+// legacy uppercase mapping, which no escape's set is affected by (it never
+// maps a non-ASCII rune to ASCII), so pred alone decides.
 func (vm *VM) anyFold(r rune, pred func(rune) bool) bool {
 	if pred(r) {
 		return true
 	}
-	if !vm.IgnoreCase {
+	if !vm.IgnoreCase || !vm.Unicode {
 		return false
 	}
 	for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
@@ -143,13 +146,21 @@ func CanonicalFold(r rune) rune {
 	return m
 }
 
-// matchPositive reports whether r matches the escape a, ignoring a.Negated.
-func (a ClassAtom) matchPositive(r rune) bool {
+// wordChar reports whether r is in ECMA-262's WordCharacters: [A-Za-z0-9_],
+// plus, under IgnoreCase in Unicode mode, the runes that fold to one of those
+// (ſ and the Kelvin sign K). It decides \w, \W, \b and \B.
+func (vm *VM) wordChar(r rune) bool {
+	return isWordChar(r) || vm.anyFold(r, isWordChar)
+}
+
+// matchEscape reports whether r is in the set of the escape a, ignoring
+// a.Negated.
+func (vm *VM) matchEscape(a ClassAtom, r rune) bool {
 	switch a.Kind {
 	case ClassAtomDigit:
 		return isECMADigit(r)
 	case ClassAtomWord:
-		return isWordChar(r)
+		return vm.wordChar(r)
 	case ClassAtomSpace:
 		return isSpace(r)
 	case ClassAtomUnicodeProp:

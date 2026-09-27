@@ -351,9 +351,9 @@ func (vm *VM) matchOne(inst *Instruction, r rune) bool {
 	case OpNonDigit:
 		return !isECMADigit(r)
 	case OpWord:
-		return isWordChar(r)
+		return vm.wordChar(r)
 	case OpNonWord:
-		return !isWordChar(r)
+		return !vm.wordChar(r)
 	case OpSpace:
 		return isSpace(r)
 	case OpNonSpace:
@@ -361,21 +361,15 @@ func (vm *VM) matchOne(inst *Instruction, r rune) bool {
 	case OpClass:
 		matched := false
 		for _, atom := range inst.Class {
-			atomMatch := false
-			switch atom.Kind {
-			case ClassAtomRange:
+			var atomMatch bool
+			if atom.Kind == ClassAtomRange {
 				atomMatch = vm.matchInRange(r, atom.Range.Start, atom.Range.End)
-			case ClassAtomDigit:
-				atomMatch = isECMADigit(r)
-			case ClassAtomWord:
-				atomMatch = isWordChar(r)
-			case ClassAtomSpace:
-				atomMatch = isSpace(r)
-			case ClassAtomUnicodeProp:
-				atomMatch = matchUnicodeProperty(r, atom.Prop)
-			}
-			if atom.Negated {
-				atomMatch = !atomMatch
+			} else {
+				// ECMA-262 CharacterSetMatcher: r matches when some rune of
+				// its case folding orbit is in the escape's set, which for
+				// \P{…} is the complement of the property. So under /ui,
+				// [\P{Lu}] matches "A", whose orbit holds "a".
+				atomMatch = vm.anyFold(r, func(f rune) bool { return vm.matchEscape(atom, f) != atom.Negated })
 			}
 			if atomMatch {
 				matched = true
@@ -389,9 +383,12 @@ func (vm *VM) matchOne(inst *Instruction, r rune) bool {
 		_, ok := inst.Switch.target(vm.switchKey(r))
 		return ok
 	case OpUnicodeProp:
-		return matchUnicodeProperty(r, inst.Prop)
+		return vm.anyFold(r, func(f rune) bool { return matchUnicodeProperty(f, inst.Prop) })
 	case OpNotUnicodeProp:
-		return !matchUnicodeProperty(r, inst.Prop)
+		// Under u, \P{…} is the complement of the property, matched like any
+		// set: /\P{Lu}/ui matches "A". (Under v the compiler emits a class set
+		// instead, whose complement follows case folding.)
+		return vm.anyFold(r, func(f rune) bool { return !matchUnicodeProperty(f, inst.Prop) })
 	}
 	return false
 }
@@ -739,14 +736,14 @@ func (vm *VM) run(st *runState, pc, pos int) (bool, int) {
 				}
 
 			case OpWordBound:
-				if wordCharBeforePos(vm.Input, pos) != wordCharAtPos(vm.Input, pos) {
+				if vm.wordCharBefore(pos) != vm.wordCharAt(pos) {
 					pc++
 				} else {
 					ok = false
 				}
 
 			case OpNonWordBound:
-				if wordCharBeforePos(vm.Input, pos) == wordCharAtPos(vm.Input, pos) {
+				if vm.wordCharBefore(pos) == vm.wordCharAt(pos) {
 					pc++
 				} else {
 					ok = false
@@ -1101,29 +1098,29 @@ func isWordChar(r rune) bool {
 		r == '_'
 }
 
-// wordCharBeforePos returns true if the character before pos is a word char.
+// wordCharBefore reports whether the character before pos is a word char.
 // Handles multi-byte UTF-8 correctly using DecodeLastRuneInString.
-func wordCharBeforePos(s string, pos int) bool {
+func (vm *VM) wordCharBefore(pos int) bool {
 	if pos <= 0 {
 		return false
 	}
-	r, _ := utf8.DecodeLastRuneInString(s[:pos])
+	r, _ := utf8.DecodeLastRuneInString(vm.Input[:pos])
 	if r == utf8.RuneError {
 		return false
 	}
-	return isWordChar(r)
+	return vm.wordChar(r)
 }
 
-// wordCharAtPos returns true if the character at pos is a word char.
-func wordCharAtPos(s string, pos int) bool {
-	if pos >= len(s) {
+// wordCharAt reports whether the character at pos is a word char.
+func (vm *VM) wordCharAt(pos int) bool {
+	if pos >= len(vm.Input) {
 		return false
 	}
-	r, _ := utf8.DecodeRuneInString(s[pos:])
+	r, _ := utf8.DecodeRuneInString(vm.Input[pos:])
 	if r == utf8.RuneError {
 		return false
 	}
-	return isWordChar(r)
+	return vm.wordChar(r)
 }
 
 func isSpace(r rune) bool {

@@ -297,8 +297,11 @@ func (p *Program) greedyLoopAt(pc int) (body, exit int, ok bool) {
 // forms match non-ASCII by definition.
 func (p *Program) asciiOnly(inst *Instruction) bool {
 	switch inst.Op {
-	case OpDigit, OpWord:
+	case OpDigit:
 		return true
+	case OpWord:
+		// Under IgnoreCase in Unicode mode \w also matches ſ and K.
+		return !(p.ignoreCase && p.unicode)
 	case OpChar:
 		return inst.Char < 0x80 && !p.ignoreCase
 	case OpClass:

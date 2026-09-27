@@ -185,7 +185,12 @@ budget on 1,000 characters.
 Case-insensitive matching uses Unicode simple case folding under `u`/`v`,
 and the legacy Canonicalize algorithm (`vm.canonicalizeLegacy`,
 uppercase-based, with the "don't map non-ASCII to ASCII" guard) otherwise —
-matching JavaScript in both modes. `\p{...}` lookups resolve general
+matching JavaScript in both modes. Under `u`/`v` a rune matches an escape's
+set when any rune of its fold orbit does (`vm.anyFold`), and `\w`'s set gains
+the runes that fold into it, `ſ` and `K` (Kelvin sign), which also changes
+`\b`. `\P{…}` is the one escape whose meaning differs: under `u` it is the
+complement matched by folding (`/\P{Lu}/ui` matches `A`, whose orbit holds
+`a`), under `v` the complement of the folded set (it does not). `\p{...}` lookups resolve general
 categories, `Script=`/`Script_Extensions=`, and binary properties against
 Go's `unicode` tables, cached in a `sync.Map` keyed by property expression;
 unknown property names are compile errors ("invalid unicode property
