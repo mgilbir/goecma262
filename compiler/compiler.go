@@ -17,8 +17,20 @@ const (
 
 // Compiler compiles regex AST to VM bytecode
 type Compiler struct {
-	code  []vm.Instruction
-	depth int // current nesting depth
+	code      []vm.Instruction
+	depth     int // current nesting depth
+	numGroups int // capture groups in the pattern
+	numMarks  int // iteration-start mark slots allocated so far
+
+	// ignoreCase, multiline and dotAll are the flags in effect where code is
+	// being emitted, which a modifier group changes; mode stamps them onto
+	// each instruction inside one (0 elsewhere, meaning the VM's flags).
+	ignoreCase, multiline, dotAll bool
+	mode                          vm.Mode
+	unicodeSets                   bool
+	// classSets memoizes evaluated v-mode classes, which a counted quantifier
+	// compiles once per copy.
+	classSets map[*parser.ClassSetExpression]classSetValue
 }
 
 // Compile compiles a regex pattern AST to VM instructions.
@@ -27,7 +39,12 @@ type Compiler struct {
 // a group more than once even inside a counted quantifier.
 func Compile(pattern *parser.Pattern) ([]vm.Instruction, int, error) {
 	c := &Compiler{
-		code: make([]vm.Instruction, 0),
+		code:        make([]vm.Instruction, 0),
+		numGroups:   pattern.NumGroups,
+		ignoreCase:  pattern.Flags.IgnoreCase,
+		multiline:   pattern.Flags.Multiline,
+		dotAll:      pattern.Flags.DotAll,
+		unicodeSets: pattern.Flags.UnicodeSets,
 	}
 
 	// Emit save instructions for group 0 (full match)
@@ -48,8 +65,38 @@ func Compile(pattern *parser.Pattern) ([]vm.Instruction, int, error) {
 
 func (c *Compiler) emit(inst vm.Instruction) int {
 	idx := len(c.code)
+	inst.Mode = c.mode
 	c.code = append(c.code, inst)
 	return idx
+}
+
+// compileModifierGroup compiles the body of (?add-remove:...) with its flags.
+func (c *Compiler) compileModifierGroup(g *parser.ModifierGroup) error {
+	ic, ml, da, mode := c.ignoreCase, c.multiline, c.dotAll, c.mode
+	apply := func(on *bool, m parser.Modifiers) {
+		if g.Add&m != 0 {
+			*on = true
+		}
+		if g.Remove&m != 0 {
+			*on = false
+		}
+	}
+	apply(&c.ignoreCase, parser.ModIgnoreCase)
+	apply(&c.multiline, parser.ModMultiline)
+	apply(&c.dotAll, parser.ModDotAll)
+	c.mode = vm.ModeSet
+	if c.ignoreCase {
+		c.mode |= vm.ModeIgnoreCase
+	}
+	if c.multiline {
+		c.mode |= vm.ModeMultiline
+	}
+	if c.dotAll {
+		c.mode |= vm.ModeDotAll
+	}
+	err := c.compileNode(g.Body)
+	c.ignoreCase, c.multiline, c.dotAll, c.mode = ic, ml, da, mode
+	return err
 }
 
 func (c *Compiler) patchJump(idx, target int) {
@@ -78,6 +125,8 @@ func (c *Compiler) compileNode(node parser.Node) error {
 		return c.compileLiteral(n)
 	case *parser.CharacterClass:
 		return c.compileCharacterClass(n)
+	case *parser.ClassSetExpression:
+		return c.compileClassSet(n)
 	case *parser.Dot:
 		c.emit(vm.Instruction{Op: vm.OpAny})
 		return nil
@@ -89,6 +138,8 @@ func (c *Compiler) compileNode(node parser.Node) error {
 		return c.compileNamedGroup(n)
 	case *parser.NonCapturingGroup:
 		return c.compileNode(n.Body)
+	case *parser.ModifierGroup:
+		return c.compileModifierGroup(n)
 	case *parser.Lookahead:
 		return c.compileLookahead(n)
 	case *parser.NegativeLookahead:
@@ -127,8 +178,16 @@ func (c *Compiler) compileNode(node parser.Node) error {
 }
 
 func (c *Compiler) compileDisjunction(d *parser.Disjunction) error {
-	if len(d.Alternatives) == 1 {
-		return c.compileNode(d.Alternatives[0])
+	return c.emitAlternation(len(d.Alternatives), func(i int) error {
+		return c.compileNode(d.Alternatives[i])
+	})
+}
+
+// emitAlternation emits n alternatives, tried in order, where emitAlt(i)
+// emits the code of alternative i.
+func (c *Compiler) emitAlternation(n int, emitAlt func(i int) error) error {
+	if n == 1 {
+		return emitAlt(0)
 	}
 
 	// Correct NFA structure for alternation (a|b|c|...):
@@ -145,10 +204,10 @@ func (c *Compiler) compileDisjunction(d *parser.Disjunction) error {
 	// Each split's B must point to the NEXT split, not the next body.
 	// This ensures the engine tries each alternative in order.
 
-	splitIdxs := make([]int, 0, len(d.Alternatives)-1)
-	jumpIdxs := make([]int, 0, len(d.Alternatives)-1)
+	splitIdxs := make([]int, 0, n-1)
+	jumpIdxs := make([]int, 0, n-1)
 
-	for i := 0; i < len(d.Alternatives)-1; i++ {
+	for i := 0; i < n-1; i++ {
 		// Emit split: A=body (patched below), B=next split (patched below)
 		splitIdx := c.emit(vm.Instruction{Op: vm.OpSplit, A: 0, B: 0})
 		splitIdxs = append(splitIdxs, splitIdx)
@@ -157,7 +216,7 @@ func (c *Compiler) compileDisjunction(d *parser.Disjunction) error {
 		c.code[splitIdx].A = len(c.code)
 
 		// Compile this alternative
-		err := c.compileNode(d.Alternatives[i])
+		err := emitAlt(i)
 		if err != nil {
 			return err
 		}
@@ -178,7 +237,7 @@ func (c *Compiler) compileDisjunction(d *parser.Disjunction) error {
 	lastAltStart := len(c.code)
 
 	// Last alternative (no split, no jump needed)
-	err := c.compileNode(d.Alternatives[len(d.Alternatives)-1])
+	err := emitAlt(n - 1)
 	if err != nil {
 		return err
 	}
@@ -256,6 +315,10 @@ func (c *Compiler) compileQuantifier(q *parser.Quantifier) error {
 	if q.Max > MaxQuantifierRepeat {
 		return fmt.Errorf("quantifier maximum %d exceeds limit %d", q.Max, MaxQuantifierRepeat)
 	}
+	if q.Max == 0 {
+		// {0} and {0,0}: the body never runs (ECMA-262 RepeatMatcher step 1).
+		return nil
+	}
 
 	// Capturing groups inside the body are reset to unset at the start of each
 	// new iteration, per ECMA-262 RepeatMatcher group-reset semantics. Because
@@ -264,122 +327,178 @@ func (c *Compiler) compileQuantifier(q *parser.Quantifier) error {
 	// a group's value is that of its last participating iteration, and a
 	// non-participating alternative in a later iteration clears it.
 	loGroup, hiGroup, hasGroups := groupIndexRange(q.Body)
-	emitReset := func() int {
-		if !hasGroups {
-			return -1
+	emitReset := func() {
+		if hasGroups {
+			c.emit(vm.Instruction{Op: vm.OpResetGroups, A: loGroup, B: hiGroup})
 		}
-		return c.emit(vm.Instruction{Op: vm.OpResetGroups, A: loGroup, B: hiGroup})
 	}
 
-	if q.Min == 0 && q.Max == -1 {
-		// * quantifier
-		// Structure: loopStart: split[A=reset?body, B=exit]; body; jmp loopStart; exit:
+	// An optional iteration (one taken once the minimum is met) that ends
+	// where it began fails, so the matcher backtracks into the body for a
+	// longer alternative or stops iterating (RepeatMatcher's closure d: "if
+	// min = 0 and y's endIndex = x's endIndex, return failure"). Each such
+	// iteration records its start position in a mark slot and checks it at
+	// the end. A body that cannot match the empty string never ends where it
+	// began, so it needs neither.
+	checked := canMatchEmpty(q.Body)
+	mark := -1
+	if checked {
+		mark = c.allocMark()
+	}
+	// beginOptional starts an optional iteration: record where it starts,
+	// then reset the body's captures.
+	beginOptional := func() {
+		if checked {
+			c.emit(vm.Instruction{Op: vm.OpMark, A: mark})
+		}
+		emitReset()
+	}
+	endIteration := func() {
+		if checked {
+			c.emit(vm.Instruction{Op: vm.OpCheckProgress, A: mark})
+		}
+	}
+	// orient sets the split's preferred branch: another iteration when greedy,
+	// the continuation when lazy.
+	orient := func(splitIdx, iter, exit int) {
+		if q.Greedy {
+			c.code[splitIdx].A, c.code[splitIdx].B = iter, exit
+		} else {
+			c.code[splitIdx].A, c.code[splitIdx].B = exit, iter
+		}
+	}
+	// loop emits an unbounded tail of optional iterations:
+	// loop: split[iter, exit]; iter: mark; reset; body; check; jmp loop; exit:
+	loop := func() error {
 		loopStart := len(c.code)
-		splitIdx := c.emit(vm.Instruction{Op: vm.OpSplit, A: 0, B: 0})
-		bodyEntry := len(c.code) // points at the reset (or body if none)
-		emitReset()
-		err := c.compileNode(q.Body)
-		if err != nil {
+		splitIdx := c.emit(vm.Instruction{Op: vm.OpSplit})
+		iter := len(c.code)
+		beginOptional()
+		if err := c.compileNode(q.Body); err != nil {
 			return err
 		}
+		endIteration()
 		c.emit(vm.Instruction{Op: vm.OpJmp, A: loopStart})
-		exitPos := len(c.code)
-		if q.Greedy {
-			c.code[splitIdx].A = bodyEntry
-			c.code[splitIdx].B = exitPos
-		} else {
-			c.code[splitIdx].A = exitPos
-			c.code[splitIdx].B = bodyEntry
-		}
-
-	} else if q.Min == 1 && q.Max == -1 {
-		// + quantifier: body once (mandatory), then loop back with a reset.
-		bodyStart := len(c.code)
-		err := c.compileNode(q.Body)
-		if err != nil {
-			return err
-		}
-		splitIdx := c.emit(vm.Instruction{Op: vm.OpSplit, A: 0, B: 0})
-		loopEntry := len(c.code)
-		emitReset()
-		c.emit(vm.Instruction{Op: vm.OpJmp, A: bodyStart})
-		exitPos := len(c.code)
-		if q.Greedy {
-			c.code[splitIdx].A = loopEntry
-			c.code[splitIdx].B = exitPos
-		} else {
-			c.code[splitIdx].A = exitPos
-			c.code[splitIdx].B = loopEntry
-		}
-
-	} else if q.Min == 0 && q.Max == 1 {
-		// ? quantifier: split L1, L2; L1: body; L2:
-		splitIdx := c.emit(vm.Instruction{Op: vm.OpSplit, A: 0, B: 0})
-		bodyStart := len(c.code)
-		err := c.compileNode(q.Body)
-		if err != nil {
-			return err
-		}
-		c.code[splitIdx].A = bodyStart   // Try body
-		c.code[splitIdx].B = len(c.code) // Or skip
-		if !q.Greedy {
-			c.code[splitIdx].A, c.code[splitIdx].B = c.code[splitIdx].B, c.code[splitIdx].A
-		}
-
-	} else {
-		// {n,m} quantifier.
-		// Emit the body q.Min times (the required minimum), resetting the body's
-		// groups before every repetition after the first.
-		for i := 0; i < q.Min; i++ {
-			if i > 0 {
-				emitReset()
-			}
-			if err := c.compileNode(q.Body); err != nil {
-				return err
-			}
-		}
-
-		if q.Max == -1 {
-			// {n,} - unlimited tail: loop like * using OpSplit.
-			loopStart := len(c.code)
-			splitIdx := c.emit(vm.Instruction{Op: vm.OpSplit, A: 0, B: 0})
-			bodyEntry := len(c.code)
-			emitReset()
-			if err := c.compileNode(q.Body); err != nil {
-				return err
-			}
-			c.emit(vm.Instruction{Op: vm.OpJmp, A: loopStart})
-			exitPos := len(c.code)
-			if q.Greedy {
-				c.code[splitIdx].A = bodyEntry
-				c.code[splitIdx].B = exitPos
-			} else {
-				c.code[splitIdx].A = exitPos
-				c.code[splitIdx].B = bodyEntry
-			}
-		} else if q.Max > q.Min {
-			// {n,m}: emit the optional part as nested optionals, resetting the
-			// body's groups before each optional repetition.
-			optionalCount := q.Max - q.Min
-			for i := 0; i < optionalCount; i++ {
-				splitIdx := c.emit(vm.Instruction{Op: vm.OpSplit, A: 0, B: 0})
-				bodyEntry := len(c.code)
-				emitReset()
-				if err := c.compileNode(q.Body); err != nil {
-					return err
-				}
-				if q.Greedy {
-					c.code[splitIdx].A = bodyEntry
-					c.code[splitIdx].B = len(c.code)
-				} else {
-					c.code[splitIdx].A = len(c.code)
-					c.code[splitIdx].B = bodyEntry
-				}
-			}
-		}
+		orient(splitIdx, iter, len(c.code))
+		return nil
 	}
 
+	switch {
+	case q.Min == 0 && q.Max == -1:
+		// *
+		return loop()
+
+	case q.Min == 1 && q.Max == -1:
+		// + : the first, mandatory iteration shares the body's code with the
+		// optional ones that follow; each later iteration records its start
+		// before jumping back.
+		//   body: body; check; split[again, exit]; again: mark; reset; jmp body; exit:
+		// The mandatory iteration's check cannot fail. On entry the mark is
+		// unset or holds the start of this loop's last successful optional
+		// iteration on the current path (a rejected iteration's mark is undone
+		// with it), and that start lies strictly behind any position the loop
+		// can be re-entered at: within one run positions only move in the run's
+		// direction, and marks are not carried out of a lookaround body.
+		bodyStart := len(c.code)
+		if err := c.compileNode(q.Body); err != nil {
+			return err
+		}
+		endIteration()
+		splitIdx := c.emit(vm.Instruction{Op: vm.OpSplit})
+		again := len(c.code)
+		beginOptional()
+		c.emit(vm.Instruction{Op: vm.OpJmp, A: bodyStart})
+		orient(splitIdx, again, len(c.code))
+		return nil
+	}
+
+	// {n}, {n,}, {n,m} and ?: the n mandatory iterations are emitted in full,
+	// resetting the body's groups before every one after the first.
+	for i := 0; i < q.Min; i++ {
+		if i > 0 {
+			emitReset()
+		}
+		if err := c.compileNode(q.Body); err != nil {
+			return err
+		}
+	}
+	if q.Max == -1 {
+		return loop()
+	}
+	// Up to max-min optional iterations, nested: declining one ends the
+	// repetition rather than moving on to the next copy.
+	//   split[iter1, end]; iter1: ... split[iter2, end]; iter2: ... end:
+	var exits []int
+	for i := q.Min; i < q.Max; i++ {
+		splitIdx := c.emit(vm.Instruction{Op: vm.OpSplit})
+		exits = append(exits, splitIdx)
+		c.code[splitIdx].A = len(c.code)
+		beginOptional()
+		if err := c.compileNode(q.Body); err != nil {
+			return err
+		}
+		endIteration()
+	}
+	end := len(c.code)
+	for _, splitIdx := range exits {
+		orient(splitIdx, c.code[splitIdx].A, end)
+	}
 	return nil
+}
+
+// allocMark reserves a slot for an iteration's start position. Mark slots
+// follow the capture slots in the VM's slot vector, so they are restored on
+// backtracking exactly as captures are.
+func (c *Compiler) allocMark() int {
+	slot := (c.numGroups+1)*2 + c.numMarks
+	c.numMarks++
+	return slot
+}
+
+// canMatchEmpty reports whether e can match the empty string. It may answer
+// true for an expression that cannot (which only costs an unnecessary
+// progress check), never false for one that can.
+func canMatchEmpty(e parser.Expression) bool {
+	switch n := e.(type) {
+	case *parser.Literal, *parser.CharacterClass, *parser.Dot,
+		*parser.WordChar, *parser.NonWordChar, *parser.Digit, *parser.NonDigit,
+		*parser.Whitespace, *parser.NonWhitespace, *parser.UnicodeProperty:
+		return false
+	case *parser.Sequence:
+		for _, el := range n.Elements {
+			if !canMatchEmpty(el) {
+				return false
+			}
+		}
+		return true
+	case *parser.Disjunction:
+		for _, alt := range n.Alternatives {
+			if canMatchEmpty(alt) {
+				return true
+			}
+		}
+		return false
+	case *parser.Quantifier:
+		return n.Min == 0 || canMatchEmpty(n.Body)
+	case *parser.Group:
+		return canMatchEmpty(n.Body)
+	case *parser.NamedGroup:
+		return canMatchEmpty(n.Body)
+	case *parser.NonCapturingGroup:
+		return canMatchEmpty(n.Body)
+	case *parser.ModifierGroup:
+		return canMatchEmpty(n.Body)
+	case *parser.Backreference:
+		// A reference to an unset or empty group matches empty.
+		return true
+	case *parser.ClassSetExpression:
+		// A class set may hold the empty string (as [\q{}] does); deciding
+		// whether it does would mean evaluating the set, so assume it can.
+		return true
+	default:
+		// Anchors and lookarounds are zero-width.
+		return true
+	}
 }
 
 func (c *Compiler) compileGroup(g *parser.Group) error {
@@ -403,8 +522,8 @@ func (c *Compiler) compileNamedGroup(g *parser.NamedGroup) error {
 }
 
 func (c *Compiler) compileBackreference(b *parser.Backreference) error {
-	// An Annex B numeric escape that did not resolve to a real group compiles to
-	// literal characters (a legacy octal escape and/or literal digits).
+	// A caller-built AST may still use the deprecated Fallback: literal
+	// characters in place of a backreference.
 	if b.Fallback != nil {
 		for _, r := range b.Fallback {
 			c.emit(vm.Instruction{Op: vm.OpChar, Char: r})
@@ -543,6 +662,10 @@ func reverseExpr(e parser.Expression) parser.Expression {
 		return &parser.NamedGroup{Index: n.Index, Name: n.Name, Body: reverseExpr(n.Body)}
 	case *parser.NonCapturingGroup:
 		return &parser.NonCapturingGroup{Body: reverseExpr(n.Body)}
+	case *parser.ModifierGroup:
+		return &parser.ModifierGroup{Add: n.Add, Remove: n.Remove, Body: reverseExpr(n.Body)}
+	case *parser.ClassSetExpression:
+		return reverseClassSet(n)
 	default:
 		return e
 	}
@@ -552,7 +675,12 @@ func (c *Compiler) compileUnicodeProperty(u *parser.UnicodeProperty) error {
 	if !vm.ValidUnicodeProperty(u.Property) {
 		return fmt.Errorf("invalid unicode property escape: \\p{%s}", u.Property)
 	}
-	if u.Negated {
+	if u.Negated && c.unicodeSets {
+		// Under v, \P{…} complements the case-folded property, so /\P{Lu}/vi
+		// rejects "A" where /\P{Lu}/ui matches it; a class set does that.
+		atom := vm.ClassAtom{Kind: vm.ClassAtomUnicodeProp, Prop: u.Property, Negated: true}
+		c.emit(vm.Instruction{Op: vm.OpClassSet, Set: &vm.CharSet{Op: vm.CharSetEscape, Atom: atom}})
+	} else if u.Negated {
 		c.emit(vm.Instruction{Op: vm.OpNotUnicodeProp, Prop: u.Property})
 	} else {
 		c.emit(vm.Instruction{Op: vm.OpUnicodeProp, Prop: u.Property})
@@ -576,6 +704,8 @@ func groupIndexRange(node parser.Expression) (lo, hi int, has bool) {
 			consider(e.Index, &lo, &hi, &has)
 			walk(e.Body)
 		case *parser.NonCapturingGroup:
+			walk(e.Body)
+		case *parser.ModifierGroup:
 			walk(e.Body)
 		case *parser.Disjunction:
 			for _, alt := range e.Alternatives {

@@ -50,4 +50,14 @@ var test262KnownFailures = map[string]string{
 	// These tests produce a compile error which causes t.Skip, not t.Fail.
 	"S15.10.2.8_A3_T15.js#3": "pattern too deeply nested (200+ capturing groups)",
 	"S15.10.2.8_A3_T16.js#3": "pattern too deeply nested (200+ non-capturing groups)",
+
+	// -------------------------------------------------------------------------
+	// Quantifier bounds: compile-time limit
+	// -------------------------------------------------------------------------
+	// b{9007199254740991} and similar exceed MaxQuantifierRepeat=10000, which
+	// bounds compiled program size (a counted quantifier is unrolled). These
+	// produce a compile error, which causes t.Skip, not t.Fail.
+	"quantifier-integer-limit.js#a1": "quantifier bound exceeds MaxQuantifierRepeat",
+	"quantifier-integer-limit.js#a2": "quantifier bound exceeds MaxQuantifierRepeat",
+	"quantifier-integer-limit.js#a3": "quantifier bound exceeds MaxQuantifierRepeat",
 }

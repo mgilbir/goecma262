@@ -57,12 +57,34 @@ func TestAudit_UnicodeCaseFolding(t *testing.T) {
 
 // C10: the step budget is shared across the whole scan, so a pathological input
 // exhausts it once (surfaced via the *Err API) rather than per start position.
+// The pattern has a backreference, so no failure memo survives from one start
+// position to the next: a single attempt fits the budget, the scan does not.
 func TestAudit_StepBudgetSharedAcrossScan(t *testing.T) {
-	re := ecma262.MustCompile(`(a+)+$`, flags.Flags(0))
-	re.SetMaxSteps(5000)
-	input := strings.Repeat("a", 40) + "!"
+	const budget = 5000
+	input := strings.Repeat("a", 20) + "!"
+
+	sticky := ecma262.MustCompile(`(a+)+\1$`, flags.Sticky)
+	sticky.SetMaxSteps(budget)
+	if _, err := sticky.MatchStringErr(input); err != nil {
+		t.Fatalf("a single attempt should fit the budget, got %v", err)
+	}
+
+	re := ecma262.MustCompile(`(a+)+\1$`, flags.Flags(0))
+	re.SetMaxSteps(budget)
 	_, err := re.MatchStringErr(input)
 	if err != vm.ErrStepLimit {
 		t.Fatalf("expected ErrStepLimit for catastrophic pattern, got %v", err)
+	}
+}
+
+// Without backreferences, states that failed from one start position are not
+// re-explored from the next, so the classic catastrophic (a+)+$ is answered
+// within a budget that per-position re-exploration used to exhaust.
+func TestAudit_FailureMemoSharedAcrossScan(t *testing.T) {
+	re := ecma262.MustCompile(`(a+)+$`, flags.Flags(0))
+	re.SetMaxSteps(5000)
+	matched, err := re.MatchStringErr(strings.Repeat("a", 40) + "!")
+	if err != nil || matched {
+		t.Fatalf("got (%v, %v), want (false, nil)", matched, err)
 	}
 }

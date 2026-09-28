@@ -10,7 +10,7 @@ Annex B web-compatibility syntax, same capture and replacement semantics,
 validated against the official [Test262](https://github.com/tc39/test262)
 suite). If you need neither, prefer the standard library: RE2 guarantees
 linear-time matching, while this engine is a backtracker whose worst case is
-bounded by a configurable step limit
+bounded by an execution budget that grows linearly with the input
 (see [Match semantics and safety](#match-semantics-and-safety)).
 
 ## Installation
@@ -59,9 +59,11 @@ Runnable, test-asserted examples for every feature below live in
 ### ECMA-262 specific
 - ✅ Flags: `i`, `g`, `m`, `s`, `u`, `v`, `y`, `d` (see [Flags](#flags))
 - ✅ Named capture groups `(?<name>abc)` and backreferences `\k<name>`
+- ✅ Modifier groups `(?i:...)`, `(?-i:...)`, `(?ms-i:...)`: turn `i`, `m` and `s` on or off for part of a pattern
 - ✅ Lookahead `(?=...)`, `(?!...)`
 - ✅ Lookbehind `(?<=...)`, `(?<!...)` — including variable-length, with ECMA-262 right-to-left capture semantics
 - ✅ Unicode property escapes `\p{...}`, `\P{...}` (requires `u`/`v`; all general categories, scripts via `Script=`, common binary properties; unknown names are rejected)
+- ✅ `v`-flag class sets: intersection `[\p{L}&&\p{Script=Greek}]`, subtraction `[\w--\d]`, nested classes `[[a-z][0-9]]`, strings `[\q{abc|xy}]`, and properties of strings such as `\p{RGI_Emoji}` (Unicode 17.0)
 - ✅ Escapes: `\xFF`, `\uFFFF`, `\u{...}` (code points require `u`/`v`), `\cA`, `\n`, `\r`, `\t`, `\f`, `\v`
 - ✅ Annex B web-compatibility syntax by default, strict mode opt-in (see [Syntax mode](#syntax-mode-annex-b-vs-strict))
 
@@ -117,6 +119,17 @@ re = ecma262.MustCompile(`^\p{Script=Greek}+$`, flags.Unicode)
 re.MatchString("αβγ") // true
 ```
 
+With `v`, classes are sets that can be intersected, subtracted and nested,
+and can hold strings as well as characters:
+
+```go
+re := ecma262.MustCompile(`[\p{L}--[a-z]]+`, flags.UnicodeSets)
+re.FindString("abcÄÖüdef") // "ÄÖü"
+
+re = ecma262.MustCompile(`\p{RGI_Emoji}`, flags.UnicodeSets)
+re.FindString("hi 👨‍👩‍👧!") // "👨‍👩‍👧" (one match for the whole family sequence)
+```
+
 ### Flags from a string
 
 ```go
@@ -153,7 +166,7 @@ such as `a{2,1}` is a syntax error in *every* mode.
 | `m` | Multiline - `^` and `$` match start/end of lines |
 | `s` | DotAll - `.` matches newline characters |
 | `u` | Unicode - enable Unicode features (required for `\p{...}` and `\u{...}`) |
-| `v` | UnicodeSets - extended Unicode features (cannot use with `u`) |
+| `v` | UnicodeSets - Unicode mode plus class set operations, `\q{...}` strings, and properties of strings (cannot use with `u`) |
 | `y` | Sticky - match only at exactly the `lastIndex` position |
 | `d` | HasIndices - parsed and accepted, but a no-op: match indices are always available via the `*Index` methods (see Known Limitations) |
 
@@ -170,31 +183,61 @@ the cursor directly.
 **Offsets are bytes.** All positions (`lastIndex`, `*Index` results) are byte
 offsets into the Go string, not UTF-16 code-unit indices as in JavaScript.
 
-**ReDoS protection.** The backtracking VM enforces a step limit (default
-1,000,000; tune per instance with `SetMaxSteps`). When a match operation
-exceeds it, the boolean/string methods report **no match** — they cannot
-distinguish a limit hit from a genuine non-match. If you match untrusted
-patterns or inputs, use the error-returning variants:
+**Characters above U+FFFF.** Without `u` or `v`, JavaScript matches UTF-16
+code units, and so does this engine: `😀` is two characters to such a
+pattern, its high and low surrogate. `/^..$/` matches `"😀"`, `/^.$/` does
+not, and `/\uD83D/` matches its first half. With `u` or `v` a character is a
+code point. A result that begins or ends between the two halves has no Go
+form (a Go string cannot hold half a pair, and the position between them is
+no byte offset), so the `Err` methods return `ErrSurrogateSplit` for it; the
+others report no match, `FindAll*` and `Split` stop there, and `ReplaceAll*`
+return the input unchanged. Results that can be expressed are returned in
+full: `/x*/g` finds three empty matches in `"😀"`, and replacing them with
+`""` gives `"😀"` back. `lastIndex` may fall between the halves, at the
+character's first byte plus 2 (see `SetLastIndex`).
+
+**Bounded matching (ReDoS protection).** Matching backtracks on an explicit,
+heap-allocated stack, so no input can overflow the goroutine stack. Every
+match operation runs under an execution budget of steps and backtracking
+memory that grows linearly with the input: by default 1,000,000 steps plus
+100 per input byte, and 256 MiB plus 32 bytes per input byte
+(`SetMaxSteps` sets a fixed step limit instead). Common patterns such as
+`^[a-z]+$`, `^(a)+$` or `^(?:a|b)+$` run in linear time and use a handful of
+steps per byte, so they complete at any input length; only super-linear
+(catastrophic) searches exhaust the budget.
+
+An operation that exceeds its budget has **no answer** — which is not the same
+as no match. The error-returning forms report it as `ErrStepLimit`:
+the package-level `MatchString` and `Match`, and the methods ending in `Err`
+(`MatchStringErr`, `MatchErr`, `FindStringIndexErr`,
+`FindStringSubmatchIndexErr`, `FindAllStringSubmatchIndexErr`,
+`ReplaceAllStringErr`, `SplitErr`). The other methods have no error result:
+they report an exceeded budget as **no match**, and the iterating ones
+(`FindAll*`, `ReplaceAll*`, `Split`) stop at that point. If you match untrusted
+patterns or inputs, use the error-returning forms:
 
 ```go
 ok, err := re.MatchStringErr(input)
-if errors.Is(err, vm.ErrStepLimit) {
-    // pattern/input too expensive, not a non-match
+if errors.Is(err, ecma262.ErrStepLimit) {
+    // pattern/input too expensive: no answer, not a non-match
 }
 ```
 
 **Errors.** `Compile` wraps failures as `parse error: …` or
 `compile error: …` and rejects `u`+`v` as `incompatible flags`. `flags.Parse`
 returns typed errors (`InvalidFlagError`, `DuplicateFlagError`,
-`IncompatibleFlagsError`). Match-time step-limit errors are
-`vm.ErrStepLimit`, comparable with `errors.Is`.
+`IncompatibleFlagsError`). An exceeded execution budget is `ErrStepLimit`
+(the same value as `vm.ErrStepLimit`; the memory form wraps it), comparable
+with `errors.Is`. A result with no Go form (see above) is `ErrSurrogateSplit`.
 
 ## Architecture
 
 Pattern strings are parsed to an AST (`parser/`), compiled to bytecode
-(`compiler/`), and executed by a recursive backtracking VM (`vm/`) — the
-backtracking design from Russ Cox's regular-expression articles, with
-memoization of failed states and a step budget bounding worst-case cost.
+(`compiler/`), and executed by a backtracking VM (`vm/`) — the
+backtracking design from Russ Cox's regular-expression articles, run on an
+explicit stack, with memoization of failed states, a static analysis that
+keeps common patterns linear-time, and an execution budget bounding
+worst-case cost.
 Backtracking is what makes backreferences and lookarounds possible (RE2-based
 engines structurally cannot support them). Diagrams and internals — including
 how right-to-left lookbehind and the ReDoS bounds work — are in
@@ -216,17 +259,18 @@ go test ./...
 ```
 
 The implementation is tested against the official ECMAScript
-[Test262](https://github.com/tc39/test262) suite: **all 66,136 extracted
-cases pass or are explicitly skipped**. The 14 permanent skips need a real
-JavaScript runtime (e.g. a JS function as replacement argument) or exceed
-compile-time limits; [`tests/test262_skip_test.go`](tests/test262_skip_test.go)
+[Test262](https://github.com/tc39/test262) suite, at commit `7ab7faf`: **all
+67,783 extracted match cases and 1,019 syntax cases (patterns that must, or
+must not, compile) pass or are explicitly skipped**. The 17 permanent skips
+need a real JavaScript runtime (e.g. a JS function as replacement argument)
+or exceed compile-time limits; [`tests/test262_skip_test.go`](tests/test262_skip_test.go)
 is the canonical list, with the reason for every entry. How to regenerate the
 suite and maintain the skip list is covered in
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Known limitations
 
-1. **Unicode property escapes** - All general categories, scripts (via `Script=`/`Script_Extensions=`), and most binary properties are supported, including aliases (`\p{AHex}`, `\p{WSpace}`) and computed properties (`\p{Cased}`, `\p{Math}`, `\p{ID_Start}`, …). The Emoji-family properties (`\p{Emoji}`, `\p{Emoji_Presentation}`, `\p{Extended_Pictographic}`, …) have no Go table and are reported as errors rather than silently matching nothing; a few computed properties (`Case_Ignorable`, `Default_Ignorable_Code_Point`, `XID_*`) are close approximations.
+1. **Unicode property escapes** - Names and values are matched exactly, as in JavaScript: `\p{Lu}`, `\p{Uppercase_Letter}` and `\p{sc=Latn}` are valid, `\p{uppercase_letter}` is not. The one spelling V8 accepts beyond ECMA-262's table, Unicode's `WSpace` alias for `White_Space`, is rejected here as the spec requires (use `White_Space` or `space`). Every general category, script (`Script=` and `Script_Extensions=`, with every alias in `PropertyValueAliases.txt`) and binary property ECMA-262 lists is supported, and each matches the same code points as node's on Unicode 17.0. Where Go's `unicode` package has no table for a property (the emoji properties, `Script_Extensions`, and derived ones such as `ID_Start` or `Changes_When_Casefolded`), the data is generated from the UCD by `tools/genemoji` and `tools/genpropnames`.
 2. **HasIndices flag** (`d`) - Parsed and accepted, but it has no effect: match indices are always available through the `*Index` methods (`FindStringSubmatchIndex`, `FindAllStringSubmatchIndex`, etc.), which return `[start, end)` byte-offset pairs per group (`-1` for a non-participating group). Named-group indices (JavaScript's `indices.groups`) are obtained by combining `SubexpIndex(name)` with those pairs.
 3. **Compile-time limits** - Patterns nested more than 200 levels deep, with a single quantifier bound above 10,000 (`a{10001}`), or compiling to more than 200,000 instructions are rejected at compile time.
 4. **Case folding** - Case-insensitive matching uses Unicode simple case folding under the `u` flag, and the legacy `Canonicalize` (uppercase-based, with the "don't map non-ASCII to ASCII" guard) otherwise — matching JavaScript in both modes. A handful of full-mapping edge cases (e.g. `ß`↔`SS`) are not folded, as in most engines.

@@ -4,33 +4,48 @@ package vm
 import (
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"sync"
 	"unicode"
 	"unicode/utf8"
+	"unsafe"
 )
 
-// splitKey encodes a full backtracking state (pos, pc, groups) into a map key
-// for the OpSplit failure memo. Groups are included so that states differing
-// only in captured groups are treated as distinct.
-func splitKey(pos, pc int, groups []int) string {
-	buf := make([]byte, 0, 8+len(groups)*3)
-	buf = strconv.AppendInt(buf, int64(pos), 36)
-	buf = append(buf, ':')
-	buf = strconv.AppendInt(buf, int64(pc), 36)
-	for _, g := range groups {
-		buf = append(buf, ':')
-		buf = strconv.AppendInt(buf, int64(g), 36)
-	}
-	return string(buf)
-}
-
-// ErrStepLimit is returned when the VM exceeds its step limit (ReDoS protection)
+// ErrStepLimit is returned when a match operation exceeds its execution
+// budget, which bounds the cost of backtracking (ReDoS protection). It means
+// "no answer", never "no match": the input may or may not match. The budget has
+// two parts, both charged per match operation (a whole scan over start
+// positions, including every lookaround evaluated during it):
+//
+//   - steps: MaxSteps if set, otherwise DefaultMaxSteps plus
+//     DefaultStepsPerByte for every byte of input. The default grows linearly
+//     with the input, so a search the engine completes in linear time fits it
+//     at any input length as long as it averages at most DefaultStepsPerByte
+//     instructions per byte (simple patterns such as ^[a-z]+$ or ^(a|b)+$
+//     take a handful); only super-linear searches, the ReDoS case, run out;
+//   - memory held for backtracking (the backtrack stack and the failure
+//     memo): MaxMemory if set, otherwise DefaultMaxMemory plus
+//     DefaultMemoryPerByte for every byte of input.
+//
+// Exceeding the step budget yields ErrStepLimit itself; exceeding the memory
+// budget yields an error wrapping it. Test with errors.Is.
 var ErrStepLimit = errors.New("regexp execution step limit exceeded")
 
-// DefaultMaxSteps is the default execution step limit
-const DefaultMaxSteps = 1_000_000
+const (
+	// DefaultMaxSteps is the fixed part of the default step budget.
+	DefaultMaxSteps = 1_000_000
+	// DefaultStepsPerByte is the per-input-byte part of the default step
+	// budget: a match operation on n bytes may take
+	// DefaultMaxSteps + DefaultStepsPerByte*n steps.
+	DefaultStepsPerByte = 100
+	// DefaultMaxMemory is the fixed part, in bytes, of the default bound on
+	// the memory a match operation may hold for backtracking.
+	DefaultMaxMemory = 256 << 20
+	// DefaultMemoryPerByte is the per-input-byte part of the default memory
+	// bound. It covers one backtrack entry per input byte; linear-time
+	// patterns need far less (a failure-memo bit per loop and position).
+	DefaultMemoryPerByte = 32
+)
 
 // Opcode represents VM instructions
 type Opcode byte
@@ -49,7 +64,9 @@ const (
 	OpNonSpace // Match \S
 
 	// Character classes
-	OpClass // Match character class with escapes
+	OpClass      // Match character class with escapes
+	OpClassSet   // Match the v-mode class set in Set
+	OpRuneSwitch // Match one rune and jump by it (see RuneSwitch)
 
 	// Anchors
 	OpStartLine    // Match ^
@@ -80,6 +97,11 @@ const (
 
 	// Group reset for quantifier body repeats (ES2022 group-reset semantics)
 	OpResetGroups // Reset groups[A..B] (inclusive, 1-indexed) to -1
+
+	// Empty-iteration check for quantifiers whose body can match empty
+	// (ECMA-262 RepeatMatcher). Mark slots follow the capture slots.
+	OpMark          // Slot A = current position
+	OpCheckProgress // Fail if the position equals slot A
 )
 
 // Instruction represents a single VM instruction
@@ -91,7 +113,42 @@ type Instruction struct {
 	Prop   string      // For unicode properties
 	Class  []ClassAtom // For OpClass
 	Negate bool        // For OpClass
+	Set    *CharSet    // For OpClassSet
+	Switch *RuneSwitch // For OpRuneSwitch
+	Mode   Mode        // i, m and s inside a modifier group; 0 means the VM's
 	AltA   []int       // Alternative group indices (for duplicate named groups in \k<name>)
+}
+
+// Mode is an instruction's own i, m and s flags, set by a modifier group such
+// as (?i:...) or (?-m:...). When ModeSet is clear, the VM's flags apply.
+type Mode uint8
+
+const (
+	ModeSet Mode = 1 << iota
+	ModeIgnoreCase
+	ModeMultiline
+	ModeDotAll
+)
+
+func (vm *VM) ignoreCase(inst *Instruction) bool {
+	if inst.Mode&ModeSet != 0 {
+		return inst.Mode&ModeIgnoreCase != 0
+	}
+	return vm.IgnoreCase
+}
+
+func (vm *VM) multiline(inst *Instruction) bool {
+	if inst.Mode&ModeSet != 0 {
+		return inst.Mode&ModeMultiline != 0
+	}
+	return vm.Multiline
+}
+
+func (vm *VM) dotAll(inst *Instruction) bool {
+	if inst.Mode&ModeSet != 0 {
+		return inst.Mode&ModeDotAll != 0
+	}
+	return vm.DotAll
 }
 
 // RuneRange represents a range of runes
@@ -142,6 +199,10 @@ func (i Instruction) String() string {
 		return "non-space"
 	case OpClass:
 		return "class"
+	case OpClassSet:
+		return "class-set"
+	case OpRuneSwitch:
+		return fmt.Sprintf("rune-switch %d", len(i.Switch.Keys))
 	case OpStartLine:
 		return "start-line"
 	case OpEndLine:
@@ -174,12 +235,24 @@ func (i Instruction) String() string {
 		return fmt.Sprintf("not-unicode-prop %s", i.Prop)
 	case OpResetGroups:
 		return fmt.Sprintf("reset-groups %d..%d", i.A, i.B)
+	case OpMark:
+		return fmt.Sprintf("mark %d", i.A)
+	case OpCheckProgress:
+		return fmt.Sprintf("check-progress %d", i.A)
 	default:
 		return fmt.Sprintf("unknown(%d)", i.Op)
 	}
 }
 
-// VM represents the regex virtual machine
+// VM represents the regex virtual machine.
+//
+// The VM is a backtracking machine with an explicit, heap-allocated stack:
+// pending alternatives and the capture-group writes they must undo are pushed
+// onto it instead of being held in Go call frames, so matching never recurses
+// per input character and cannot overflow the goroutine stack, whatever the
+// input length. The only recursion is into lookaround bodies, bounded by the
+// pattern's nesting depth. Work and memory are charged against the budget
+// described at ErrStepLimit.
 type VM struct {
 	Code       []Instruction
 	Input      string
@@ -188,7 +261,8 @@ type VM struct {
 	Multiline  bool
 	DotAll     bool
 	Unicode    bool
-	MaxSteps   int // 0 means use DefaultMaxSteps
+	MaxSteps   int // 0 means DefaultMaxSteps + DefaultStepsPerByte*len(Input)
+	MaxMemory  int // bytes; 0 means DefaultMaxMemory + DefaultMemoryPerByte*len(Input)
 	Err        error
 
 	// Backward runs the engine right-to-left: character instructions consume the
@@ -197,590 +271,888 @@ type VM struct {
 	// reversed order so that RTL evaluation yields ECMA-262 capture semantics.
 	Backward bool
 
-	steps         int             // current step count
-	visitedSplits map[string]bool // memoized failed split states (pos, pc, groups)
+	// Program optionally supplies the analysis of Code, built once with
+	// NewProgram for this VM's flags and shared between VMs. If it is nil or
+	// was built for a different configuration, the VM builds its own on first
+	// use.
+	Program *Program
+
+	prog      *Program
+	steps     int // current step count
+	stepLimit int
+	memLimit  int
+	memoBytes int // memory held by active failure memos
+
+	stack   []frame
+	choices []int // stack indices of the choice frames, innermost last
+	main    runState
+	subs    []*runState // reusable lookaround states, indexed by depth-1
+
+	// identity of the input the top-level memo was built for; see MatchAt.
+	memoValid bool
+	memoData  *byte
+	memoLen   int
+	memoProg  *Program
 }
 
+type frameKind uint8
+
+const (
+	// frameChoice resumes execution at pc with position a.
+	frameChoice frameKind = iota
+	// frameTrail restores groups[pc] = a and lastTrail[pc] = b when popped.
+	frameTrail
+	// frameGreedy holds the not-yet-tried exits of a greedy single-rune loop
+	// (see greedyLoop): the loop started at a and the last exit tried was at
+	// b; each pop tries the exit (pc) one rune closer to a, ending at a.
+	frameGreedy
+)
+
+type frame struct {
+	a, b int
+	pc   int32
+	kind frameKind
+}
+
+const frameBytes = int(unsafe.Sizeof(frame{}))
+
+// errMemoryLimit is ErrStepLimit's memory-budget form.
+var errMemoryLimit = fmt.Errorf("%w: backtracking memory limit exceeded", ErrStepLimit)
+
+// runState is the per-invocation state of one run: the top-level match or one
+// lookaround body.
+type runState struct {
+	groups     []int
+	lastTrail  []int // stack index of the latest trail frame per slot, or -1
+	base       int   // stack length when the run began
+	choiceBase int   // len(choices) when the run began
+	endPC      int   // reaching this pc is success (a lookaround body's end); -1 for none
+	backward   bool
+	depth      int
+	memo       memo
+	gid        int32 // interned id of groups, valid while gidOK
+	gidOK      bool
+}
+
+func (st *runState) init(n int, from []int) {
+	if cap(st.groups) < n {
+		st.groups = make([]int, n)
+		st.lastTrail = make([]int, n)
+	}
+	st.groups = st.groups[:n]
+	st.lastTrail = st.lastTrail[:n]
+	for i := range st.groups {
+		st.groups[i] = -1
+		st.lastTrail[i] = -1
+	}
+	copy(st.groups, from)
+	st.gidOK = false
+}
+
+// Without the u or v flag, ECMA-262 matches a string as a sequence of UTF-16
+// code units, so a character above U+FFFF is two characters to the pattern:
+// its high surrogate, then its low surrogate. The VM reads it the same way
+// (see readRune). The position between the two halves has no byte offset of
+// its own; it is represented by the offset of the character's first byte plus
+// midOffset, which lies inside the character's four-byte UTF-8 sequence and so
+// is never a character boundary. Positions therefore stay ordered, and every
+// position the VM records is still a single int.
+const midOffset = 2
+
+// astralAt returns the character above U+FFFF whose four-byte UTF-8 sequence
+// starts at s[i], if one does.
+func astralAt(s string, i int) (rune, bool) {
+	if i < 0 || i+4 > len(s) || s[i] < 0xF0 {
+		return 0, false
+	}
+	r, size := utf8.DecodeRuneInString(s[i:])
+	return r, size == 4
+}
+
+// BetweenSurrogates reports whether pos is the position between the two UTF-16
+// halves of a character above U+FFFF in s: the offset of the character's first
+// byte plus 2. Only matching without the u or v flag produces such positions.
+func BetweenSurrogates(s string, pos int) bool {
+	_, ok := astralAt(s, pos-midOffset)
+	return ok
+}
+
+// NextPosition returns the position one character after pos in s, as
+// ECMA-262's AdvanceStringIndex does: one code point in Unicode mode, one
+// UTF-16 code unit otherwise, where the position after a high surrogate is
+// the one BetweenSurrogates reports. At or past the end of s it returns pos+1.
+func NextPosition(s string, pos int, unicode bool) int {
+	if pos >= len(s) || s[pos] < utf8.RuneSelf {
+		return pos + 1
+	}
+	return nextPositionSlow(s, pos, unicode)
+}
+
+func nextPositionSlow(s string, pos int, unicode bool) int {
+	if !unicode {
+		_, next := unitAt(s, pos)
+		return next
+	}
+	_, size := utf8.DecodeRuneInString(s[pos:])
+	return pos + size
+}
+
+func highSurrogate(r rune) rune { return 0xD800 + (r-0x10000)>>10 }
+func lowSurrogate(r rune) rune  { return 0xDC00 + (r-0x10000)&0x3FF }
+
 // readRune returns the rune to consume at pos and the position after consuming
-// it, honoring the match direction: forward reads the rune at pos and advances,
+// it in the given direction: forward reads the rune at pos and advances,
 // backward reads the rune ending at pos and retreats. ok is false at the
-// boundary (end of input forward, start of input backward).
-func (vm *VM) readRune(pos int) (r rune, next int, ok bool) {
-	if vm.Backward {
+// boundary (end of input forward, start of input backward). Outside Unicode
+// mode a character above U+FFFF is read as two surrogate code units, with the
+// position between them as described at midOffset.
+func (vm *VM) readRune(pos int, backward bool) (r rune, next int, ok bool) {
+	if backward {
 		if pos <= 0 {
 			return 0, pos, false
 		}
+		if c := vm.Input[pos-1]; c < utf8.RuneSelf {
+			return rune(c), pos - 1, true
+		}
+		// Only a four-byte character has code units of its own: pos is
+		// between its halves when its lead byte is two back.
+		if !vm.Unicode && pos >= 2 && vm.Input[pos-2] >= 0xF0 {
+			r, next = unitBefore(vm.Input, pos)
+			return r, next, true
+		}
 		r, size := utf8.DecodeLastRuneInString(vm.Input[:pos])
+		if size == 4 && !vm.Unicode {
+			return lowSurrogate(r), pos - (4 - midOffset), true
+		}
 		return r, pos - size, true
 	}
 	if pos >= len(vm.Input) {
 		return 0, pos, false
 	}
+	c := vm.Input[pos]
+	if c < utf8.RuneSelf {
+		return rune(c), pos + 1, true
+	}
+	// Only a four-byte lead, or a continuation byte (between the halves of
+	// one), starts a code unit that is not the whole character.
+	if !vm.Unicode && (c < 0xC0 || c >= 0xF0) {
+		r, next = unitAt(vm.Input, pos)
+		return r, next, true
+	}
 	r, size := utf8.DecodeRuneInString(vm.Input[pos:])
 	return r, pos + size, true
 }
 
-// matchResult holds the result of a recursive match attempt
-type matchResult struct {
-	matched bool
-	pos     int
-	groups  []int
+// unitAt reads the UTF-16 code unit at pos < len(s), whose byte is not ASCII,
+// and returns it with the position after it.
+func unitAt(s string, pos int) (rune, int) {
+	if s[pos] < 0xC0 {
+		// A continuation byte: pos may be between the halves of a pair.
+		if a, ok := astralAt(s, pos-midOffset); ok {
+			return lowSurrogate(a), pos + (4 - midOffset)
+		}
+	}
+	r, size := utf8.DecodeRuneInString(s[pos:])
+	if size == 4 {
+		return highSurrogate(r), pos + midOffset
+	}
+	return r, pos + size
 }
 
-// Match executes the VM against the input string starting at pos.
-// Returns (matched, endPos, groups).
-// Uses recursive backtracking so each branch gets its own copy of state.
+// unitBefore reads the character ending at pos, whose byte two back is a
+// four-byte lead: the high surrogate if pos is between its halves, and
+// otherwise (the sequence is not valid UTF-8) what DecodeLastRuneInString
+// reads, which a valid four-byte sequence cannot be.
+func unitBefore(s string, pos int) (rune, int) {
+	if a, ok := astralAt(s, pos-midOffset); ok {
+		return highSurrogate(a), pos - midOffset
+	}
+	r, size := utf8.DecodeLastRuneInString(s[:pos])
+	return r, pos - size
+}
+
+// matchOne reports whether a single-rune instruction accepts r.
+func (vm *VM) matchOne(inst *Instruction, r rune) bool {
+	ic := vm.ignoreCase(inst)
+	switch inst.Op {
+	case OpChar:
+		return vm.matchChar(ic, r, inst.Char)
+	case OpAny:
+		return vm.dotAll(inst) || !isLineTerminator(r)
+	case OpDigit:
+		// ECMA-262: \d matches only [0-9], not full Unicode digits
+		return isECMADigit(r)
+	case OpNonDigit:
+		return !isECMADigit(r)
+	case OpWord:
+		return vm.wordChar(ic, r)
+	case OpNonWord:
+		return !vm.wordChar(ic, r)
+	case OpSpace:
+		return isSpace(r)
+	case OpNonSpace:
+		return !isSpace(r)
+	case OpClass:
+		matched := false
+		for _, atom := range inst.Class {
+			var atomMatch bool
+			if atom.Kind == ClassAtomRange {
+				atomMatch = vm.matchInRange(ic, r, atom.Range.Start, atom.Range.End)
+			} else {
+				// ECMA-262 CharacterSetMatcher: r matches when some rune of
+				// its case folding orbit is in the escape's set, which for
+				// \P{…} is the complement of the property. So under /ui,
+				// [\P{Lu}] matches "A", whose orbit holds "a".
+				atomMatch = vm.anyFold(ic, r, func(f rune) bool { return vm.matchEscape(ic, atom, f) != atom.Negated })
+			}
+			if atomMatch {
+				matched = true
+				break
+			}
+		}
+		return matched != inst.Negate
+	case OpClassSet:
+		return vm.matchCharSet(ic, inst.Set, r)
+	case OpRuneSwitch:
+		_, ok := inst.Switch.target(vm.switchKey(ic, r))
+		return ok
+	case OpUnicodeProp:
+		return vm.anyFold(ic, r, func(f rune) bool { return matchUnicodeProperty(f, inst.Prop) })
+	case OpNotUnicodeProp:
+		// Under u, \P{…} is the complement of the property, matched like any
+		// set: /\P{Lu}/ui matches "A". (Under v the compiler emits a class set
+		// instead, whose complement follows case folding.)
+		return vm.anyFold(ic, r, func(f rune) bool { return !matchUnicodeProperty(f, inst.Prop) })
+	}
+	return false
+}
+
+// Match executes the VM against the input string starting at pos, as a single
+// standalone attempt with a fresh budget. Returns (matched, endPos, groups).
 func (vm *VM) Match(input string, pos int) (bool, int, []int) {
 	vm.steps = 0
 	vm.Err = nil
-	return vm.matchWithInitialGroups(input, pos, nil)
+	vm.memoValid = false // force a fresh failure memo
+	return vm.MatchAt(input, pos)
 }
 
 // MatchAt is like Match but does NOT reset the step counter or Err, so a caller
-// scanning successive start positions shares a single step budget. This keeps
-// the ReDoS bound at O(MaxSteps) for a whole search instead of O(len·MaxSteps).
-// Callers must inspect Err after the scan to distinguish "no match" from
-// "step limit exceeded".
+// scanning successive start positions shares a single budget. This keeps the
+// ReDoS bound at one budget for a whole search instead of one per start
+// position. Callers must inspect Err after the scan to distinguish "no match"
+// from "budget exceeded".
+//
+// Successive MatchAt calls on the same input string also share the failure
+// memo when that is sound (programs without backreferences), so states that
+// already failed from an earlier start position are not explored again. The VM's configuration must not change between such calls.
 func (vm *VM) MatchAt(input string, pos int) (bool, int, []int) {
-	return vm.matchWithInitialGroups(input, pos, nil)
+	vm.prepare(input)
+	if vm.Err != nil {
+		return false, 0, nil
+	}
+	// A non-multiline ^ at the start of the program fails at any pos > 0.
+	if vm.prog.anchored && pos > 0 {
+		return false, 0, nil
+	}
+
+	st := &vm.main
+	nCaptures := (vm.NumGroups + 1) * 2
+	st.init(max(nCaptures, vm.prog.slots), nil)
+	st.base, st.choiceBase = 0, 0
+	st.endPC = -1
+	st.backward = vm.Backward
+	st.depth = 0
+	vm.stack = vm.stack[:0]
+	vm.choices = vm.choices[:0]
+
+	matched, end := vm.run(st, 0, pos)
+	vm.stack = vm.stack[:0]
+	vm.choices = vm.choices[:0]
+
+	// The memo may outlive this attempt only if every state it records has
+	// failed, i.e. the attempt failed normally.
+	if matched || vm.Err != nil || vm.prog.exact {
+		vm.resetMemo(st)
+		vm.memoValid = false
+	}
+	if !matched {
+		return false, 0, nil
+	}
+	groups := make([]int, nCaptures)
+	copy(groups, st.groups)
+	return true, end, groups
 }
 
-// matchWithInitialGroups is like Match but pre-initializes the groups slice
-// with values from outerGroups (used to pass captures from outer match into
-// lookahead/lookbehind sub-VMs for backreference resolution).
-func (vm *VM) matchWithInitialGroups(input string, pos int, outerGroups []int) (bool, int, []int) {
+// prepare binds the VM to input and its program, and computes the budget.
+func (vm *VM) prepare(input string) {
 	vm.Input = input
-	// Note: steps and Err are intentionally not reset here so that a scan over
-	// successive start positions (via MatchAt) shares one step budget. Match
-	// resets them for a single standalone attempt.
-	vm.visitedSplits = nil // memo is per attempt (keys embed the absolute pos)
-
-	totalGroups := vm.NumGroups + 1
-	groups := make([]int, totalGroups*2)
-	for i := range groups {
-		groups[i] = -1
-	}
-	// Pre-seed with outer groups if provided (for backreference resolution in lookarounds)
-	if outerGroups != nil {
-		for i := 0; i < len(outerGroups) && i < len(groups); i++ {
-			groups[i] = outerGroups[i]
+	if !vm.prog.matches(vm.Code, vm.IgnoreCase, vm.Multiline, vm.DotAll, vm.Unicode, vm.Backward) {
+		if vm.Program.matches(vm.Code, vm.IgnoreCase, vm.Multiline, vm.DotAll, vm.Unicode, vm.Backward) {
+			vm.prog = vm.Program
+		} else {
+			vm.prog = NewProgram(vm.Code, vm.IgnoreCase, vm.Multiline, vm.DotAll, vm.Unicode, vm.Backward)
 		}
 	}
-
-	res := vm.exec(pos, 0, groups)
-	if res.matched {
-		return true, res.pos, res.groups
+	if !vm.memoValid || vm.memoData != unsafe.StringData(input) || vm.memoLen != len(input) || vm.memoProg != vm.prog {
+		vm.resetMemo(&vm.main)
+		vm.memoValid = true
+		vm.memoData, vm.memoLen, vm.memoProg = unsafe.StringData(input), len(input), vm.prog
 	}
-	return false, 0, nil
+	vm.stepLimit = vm.MaxSteps
+	if vm.stepLimit <= 0 {
+		vm.stepLimit = scaledLimit(DefaultMaxSteps, DefaultStepsPerByte, len(input))
+	}
+	vm.memLimit = vm.MaxMemory
+	if vm.memLimit <= 0 {
+		vm.memLimit = scaledLimit(DefaultMaxMemory, DefaultMemoryPerByte, len(input))
+	}
 }
 
-// exec is the recursive backtracking engine.
-// It executes from the given (pos, pc) with the given groups snapshot.
-// Returns a matchResult indicating success/failure.
-func (vm *VM) exec(pos, pc int, groups []int) matchResult {
-	maxSteps := vm.MaxSteps
-	if maxSteps == 0 {
-		maxSteps = DefaultMaxSteps
+// scaledLimit returns base + perByte*n, saturating instead of overflowing int
+// (which is 32 bits on some platforms).
+func scaledLimit(base, perByte, n int) int {
+	const maxInt = int(^uint(0) >> 1)
+	if n > (maxInt-base)/perByte {
+		return maxInt
 	}
+	return base + perByte*n
+}
 
-	for {
-		if vm.Err != nil {
-			return matchResult{matched: false}
+func (vm *VM) resetMemo(st *runState) {
+	vm.memoBytes -= st.memo.bytes
+	st.memo.reset()
+	st.gidOK = false
+}
+
+// step charges one step to the budget.
+func (vm *VM) step() bool {
+	vm.steps++
+	if vm.steps > vm.stepLimit {
+		vm.Err = ErrStepLimit
+		return false
+	}
+	return true
+}
+
+// push appends f to the backtrack stack, charging its memory to the budget.
+func (vm *VM) push(f frame) bool {
+	vm.stack = append(vm.stack, f)
+	if vm.memUsed() > vm.memLimit {
+		vm.Err = errMemoryLimit
+		return false
+	}
+	return true
+}
+
+// memUsed is the memory held for backtracking: the allocated backtrack stacks
+// and the failure memos (whose map overhead is estimated).
+func (vm *VM) memUsed() int {
+	return cap(vm.stack)*frameBytes + cap(vm.choices)*8 + vm.memoBytes
+}
+
+func (vm *VM) pushChoice(f frame) bool {
+	vm.choices = append(vm.choices, len(vm.stack))
+	return vm.push(f)
+}
+
+// setGroup writes a capture slot, first trailing the old value if a choice
+// point of this run could need it restored: that is, unless the slot was
+// already trailed since the innermost choice point was pushed.
+func (vm *VM) setGroup(st *runState, slot, val int) bool {
+	old := st.groups[slot]
+	if old == val {
+		return true
+	}
+	if n := len(vm.choices); n > st.choiceBase && st.lastTrail[slot] < vm.choices[n-1] {
+		if !vm.push(frame{kind: frameTrail, pc: int32(slot), a: old, b: st.lastTrail[slot]}) {
+			return false
 		}
-		vm.steps++
-		if vm.steps > maxSteps {
-			// Step limit exceeded — treat as no match (ReDoS protection)
-			vm.Err = ErrStepLimit
-			return matchResult{matched: false}
+		st.lastTrail[slot] = len(vm.stack) - 1
+	}
+	st.groups[slot] = val
+	st.gidOK = false
+	return true
+}
+
+// memoVisit reports whether the split state (pc, pos, the captures when the
+// program needs them, and its iteration marks) was already visited, marking it
+// if not. ok is false if marking exceeded the memory budget.
+//
+// An iteration mark enters the key only as whether it equals pos. That is all
+// the rest of the run can observe of it: a mark is read only by its loop's
+// progress check, positions move only one way within a run, and any mark the
+// run can still read before overwriting it is at or behind pos in that
+// direction — so one that differs from pos now differs from every later
+// position its check can run at. (A mark the run cannot read, such as an
+// enclosing run's, only splits states further, which is sound.) Keying on the
+// exact value instead would make the states of an empty-matching loop
+// quadratic in the input.
+func (vm *VM) memoVisit(st *runState, pc, pos int) (visited, ok bool) {
+	before := st.memo.bytes
+	key := memoKey{pc: pc}
+	lo := min(vm.prog.markLo, len(st.groups))
+	if vm.prog.exact {
+		if !st.gidOK {
+			st.gid = st.memo.internGroups(st.groups[:lo])
+			st.gidOK = true
 		}
-
-		if pc >= len(vm.Code) {
-			return matchResult{matched: false}
+		key.gid = st.gid
+	}
+	for i, v := range st.groups[lo:] {
+		if v == pos {
+			key.marks |= 1 << i
 		}
+	}
+	visited = st.memo.visit(key, pos)
+	if d := st.memo.bytes - before; d != 0 {
+		vm.memoBytes += d
+		if vm.memUsed() > vm.memLimit {
+			vm.Err = errMemoryLimit
+			return visited, false
+		}
+	}
+	return visited, true
+}
 
-		inst := vm.Code[pc]
+// canStart reports whether execution from pc could possibly succeed given the
+// next input byte in direction backward (see firstSet). false means it is
+// certain to fail without consuming anything.
+func (vm *VM) canStart(pc, pos int, backward bool) bool {
+	if pc < 0 || pc >= len(vm.prog.first) {
+		return true
+	}
+	fs := vm.prog.first[pc]
+	if fs == nil || fs.any {
+		return true
+	}
+	var c byte
+	if backward {
+		if pos <= 0 {
+			return fs.atEdge
+		}
+		c = vm.Input[pos-1]
+	} else {
+		if pos >= len(vm.Input) {
+			return fs.atEdge
+		}
+		c = vm.Input[pos]
+	}
+	return fs.bytes[c>>6]&(1<<(c&63)) != 0
+}
 
-		switch inst.Op {
-		case OpMatch:
-			return matchResult{matched: true, pos: pos, groups: copyGroups(groups)}
+// retreat returns the loop position one rune before cur on the path a greedy
+// single-rune loop took from start, in the loop's direction. Reading in the
+// opposite direction reproduces that path except where start fell inside a
+// multi-byte sequence, in which case the loop advanced byte by byte.
+func (vm *VM) retreat(start, cur int, backward bool) int {
+	_, p, _ := vm.readRune(cur, !backward)
+	if !backward {
+		if p >= start {
+			return p
+		}
+		return cur - 1
+	}
+	if p <= start {
+		return p
+	}
+	return cur + 1
+}
 
-		case OpChar:
-			r, next, ok := vm.readRune(pos)
-			if !ok || !vm.matchChar(r, inst.Char) {
-				return matchResult{matched: false}
+// backtrack pops the stack down to the innermost alternative of st, undoing
+// capture writes on the way, and returns where to resume. found is false when
+// st has no alternatives left (or the budget ran out; see Err).
+func (vm *VM) backtrack(st *runState) (pc, pos int, found bool) {
+	for len(vm.stack) > st.base {
+		top := len(vm.stack) - 1
+		f := vm.stack[top]
+		switch f.kind {
+		case frameTrail:
+			st.groups[f.pc] = f.a
+			st.lastTrail[f.pc] = f.b
+			st.gidOK = false
+			vm.stack = vm.stack[:top]
+		case frameChoice:
+			vm.stack = vm.stack[:top]
+			vm.choices = vm.choices[:len(vm.choices)-1]
+			return int(f.pc), f.a, true
+		case frameGreedy:
+			if !vm.step() {
+				return 0, 0, false
 			}
-			pos = next
-			pc++
-
-		case OpAny:
-			r, next, ok := vm.readRune(pos)
-			if !ok || (!vm.DotAll && isLineTerminator(r)) {
-				return matchResult{matched: false}
-			}
-			pos = next
-			pc++
-
-		case OpDigit:
-			r, next, ok := vm.readRune(pos)
-			// ECMA-262: \d matches only [0-9], not full Unicode digits
-			if !ok || !isECMADigit(r) {
-				return matchResult{matched: false}
-			}
-			pos = next
-			pc++
-
-		case OpNonDigit:
-			r, next, ok := vm.readRune(pos)
-			if !ok || isECMADigit(r) {
-				return matchResult{matched: false}
-			}
-			pos = next
-			pc++
-
-		case OpWord:
-			r, next, ok := vm.readRune(pos)
-			if !ok || !isWordChar(r) {
-				return matchResult{matched: false}
-			}
-			pos = next
-			pc++
-
-		case OpNonWord:
-			r, next, ok := vm.readRune(pos)
-			if !ok || isWordChar(r) {
-				return matchResult{matched: false}
-			}
-			pos = next
-			pc++
-
-		case OpSpace:
-			r, next, ok := vm.readRune(pos)
-			if !ok || !isSpace(r) {
-				return matchResult{matched: false}
-			}
-			pos = next
-			pc++
-
-		case OpNonSpace:
-			r, next, ok := vm.readRune(pos)
-			if !ok || isSpace(r) {
-				return matchResult{matched: false}
-			}
-			pos = next
-			pc++
-
-		case OpClass:
-			r, next, ok := vm.readRune(pos)
-			if !ok {
-				return matchResult{matched: false}
-			}
-			matched := false
-			for _, atom := range inst.Class {
-				atomMatch := false
-				switch atom.Kind {
-				case ClassAtomRange:
-					atomMatch = vm.matchInRange(r, atom.Range.Start, atom.Range.End)
-				case ClassAtomDigit:
-					atomMatch = isECMADigit(r)
-				case ClassAtomWord:
-					atomMatch = isWordChar(r)
-				case ClassAtomSpace:
-					atomMatch = isSpace(r)
-				case ClassAtomUnicodeProp:
-					atomMatch = matchUnicodeProperty(r, atom.Prop)
-				}
-				if atom.Negated {
-					atomMatch = !atomMatch
-				}
-				if atomMatch {
-					matched = true
-					break
-				}
-			}
-			if inst.Negate {
-				matched = !matched
-			}
-			if !matched {
-				return matchResult{matched: false}
-			}
-			pos = next
-			pc++
-
-		case OpStartLine:
-			if pos == 0 {
-				pc++
-				continue
-			}
-			if vm.Multiline {
-				prevR, _ := utf8.DecodeLastRuneInString(vm.Input[:pos])
-				if isLineTerminator(prevR) {
-					pc++
-					continue
-				}
-			}
-			return matchResult{matched: false}
-
-		case OpEndLine:
-			if pos >= len(vm.Input) {
-				pc++
-				continue
-			}
-			if vm.Multiline {
-				r, _ := utf8.DecodeRuneInString(vm.Input[pos:])
-				if isLineTerminator(r) {
-					pc++
-					continue
-				}
-			}
-			return matchResult{matched: false}
-
-		case OpWordBound:
-			leftWord := wordCharBeforePos(vm.Input, pos)
-			rightWord := wordCharAtPos(vm.Input, pos)
-			if leftWord == rightWord {
-				return matchResult{matched: false} // Not at word boundary
-			}
-			pc++
-
-		case OpNonWordBound:
-			leftWord := wordCharBeforePos(vm.Input, pos)
-			rightWord := wordCharAtPos(vm.Input, pos)
-			if leftWord != rightWord {
-				return matchResult{matched: false} // At word boundary
-			}
-			pc++
-
-		case OpSaveStart:
-			// Copy groups, update, then continue. When matching backward, this
-			// instruction is reached at the group's far (right) edge, so it
-			// records the end; OpSaveEnd, reached at the near (left) edge, records
-			// the start. A group's stored range is always [start, end].
-			newGroups := copyGroups(groups)
-			if vm.Backward {
-				newGroups[inst.A*2+1] = pos
+			p := vm.retreat(f.a, f.b, st.backward)
+			if p == f.a {
+				vm.stack = vm.stack[:top]
+				vm.choices = vm.choices[:len(vm.choices)-1]
 			} else {
-				newGroups[inst.A*2] = pos
+				vm.stack[top].b = p
 			}
-			groups = newGroups
-			pc++
-
-		case OpSaveEnd:
-			newGroups := copyGroups(groups)
-			if vm.Backward {
-				newGroups[inst.A*2] = pos
-			} else {
-				newGroups[inst.A*2+1] = pos
+			if vm.canStart(int(f.pc), p, st.backward) {
+				return int(f.pc), p, true
 			}
-			groups = newGroups
-			pc++
-
-		case OpJmp:
-			pc = inst.A
-
-		case OpSplit:
-			// The outcome of matching from a given (pos, pc, groups) is a pure
-			// function of that state, so once branch A has failed for a state we
-			// can memoize it: revisiting the same state (an empty-match cycle, or
-			// a different backtracking path that reconverges) skips A and takes
-			// the exit B. The key MUST include groups — keying on (pos, pc) alone
-			// wrongly pruned branches reachable with different captures, e.g.
-			// (?:(a)|a)(?:b|c)\1 on "ab".
-			key := splitKey(pos, pc, groups)
-			if vm.visitedSplits == nil {
-				vm.visitedSplits = make(map[string]bool)
-			}
-			if vm.visitedSplits[key] {
-				pc = inst.B
-				continue
-			}
-			vm.visitedSplits[key] = true
-
-			// Try branch A first; if it fails, try branch B.
-			// Each branch gets its own copy of groups.
-			res := vm.exec(pos, inst.A, copyGroups(groups))
-			if res.matched {
-				return res
-			}
-			// Fall through to branch B
-			pc = inst.B
-
-		case OpBackref:
-			// For duplicate named groups (ES2022), try all alternative group indices
-			// to find one that participated in the current match.
-			groupIndices := []int{inst.A}
-			for _, altIdx := range inst.AltA {
-				groupIndices = append(groupIndices, altIdx)
-			}
-
-			start, end := -1, -1
-			for _, gidx := range groupIndices {
-				groupIdx := gidx - 1 // 1-indexed to 0-indexed
-				if groupIdx < 0 || groupIdx >= vm.NumGroups {
-					continue
-				}
-				s := groups[groupIdx*2+2] // +2 because group 0 is full match
-				e := groups[groupIdx*2+2+1]
-				if s >= 0 && e >= 0 {
-					start, end = s, e
-					break
-				}
-			}
-			if start < 0 || end < 0 {
-				// No group with this name was captured — ECMA-262: match empty string
-				pc++
-				continue
-			}
-
-			refText := vm.Input[start:end]
-			if vm.Backward {
-				// Match the referenced text ending at pos, consuming backward.
-				if vm.IgnoreCase {
-					ok, consumed := vm.matchStringIgnoreCaseBackward(vm.Input[:pos], refText)
-					if !ok {
-						return matchResult{matched: false}
-					}
-					pos -= consumed
-				} else {
-					if pos < len(refText) || vm.Input[pos-len(refText):pos] != refText {
-						return matchResult{matched: false}
-					}
-					pos -= len(refText)
-				}
-			} else if vm.IgnoreCase {
-				// Case-insensitive backreference matching
-				ok, consumed := vm.matchStringIgnoreCaseAt(vm.Input[pos:], refText)
-				if !ok {
-					return matchResult{matched: false}
-				}
-				pos += consumed
-			} else {
-				if pos+len(refText) > len(vm.Input) {
-					return matchResult{matched: false}
-				}
-				if vm.Input[pos:pos+len(refText)] != refText {
-					return matchResult{matched: false}
-				}
-				pos += len(refText)
-			}
-			pc++
-
-		case OpLookahead:
-			// inst.A = start PC of lookahead body
-			// inst.B = end PC of lookahead body (one past last body instruction)
-			if vm.executeLookahead(inst.A, inst.B, pos, groups) {
-				pc++
-			} else {
-				return matchResult{matched: false}
-			}
-
-		case OpNegLookahead:
-			if !vm.executeLookahead(inst.A, inst.B, pos, groups) {
-				pc++
-			} else {
-				return matchResult{matched: false}
-			}
-
-		case OpLookbehind:
-			if vm.executeLookbehind(inst.A, inst.B, pos, groups) {
-				pc++
-			} else {
-				return matchResult{matched: false}
-			}
-
-		case OpNegLookbehind:
-			if !vm.executeLookbehind(inst.A, inst.B, pos, groups) {
-				pc++
-			} else {
-				return matchResult{matched: false}
-			}
-
-		case OpUnicodeProp:
-			r, next, ok := vm.readRune(pos)
-			if !ok || !matchUnicodeProperty(r, inst.Prop) {
-				return matchResult{matched: false}
-			}
-			pos = next
-			pc++
-
-		case OpNotUnicodeProp:
-			r, next, ok := vm.readRune(pos)
-			if !ok || matchUnicodeProperty(r, inst.Prop) {
-				return matchResult{matched: false}
-			}
-			pos = next
-			pc++
-
-		case OpResetGroups:
-			// Reset groups[A..B] (inclusive, 1-indexed) to -1
-			// Used to implement ECMA-262 group-reset semantics for quantifier body repeats.
-			newGroups := copyGroups(groups)
-			for g := inst.A; g <= inst.B; g++ {
-				if g*2+1 < len(newGroups) {
-					newGroups[g*2] = -1
-					newGroups[g*2+1] = -1
-				}
-			}
-			groups = newGroups
-			pc++
-
 		default:
-			return matchResult{matched: false}
+			panic("vm: corrupt backtrack stack")
 		}
 	}
+	return 0, 0, false
 }
 
-// executeLookahead executes a lookahead sub-pattern using only the body code [startPC, endPC).
-// The lookahead does not consume input.
-func (vm *VM) executeLookahead(startPC, endPC, pos int, groups []int) bool {
-	// Build a sub-VM with only the lookahead body + OpMatch
-	bodyLen := endPC - startPC
-	subCode := make([]Instruction, bodyLen+1)
-	copy(subCode, vm.Code[startPC:endPC])
-	subCode[bodyLen] = Instruction{Op: OpMatch}
+// subState returns the reusable run state for a lookaround at depth.
+func (vm *VM) subState(depth int) *runState {
+	for len(vm.subs) < depth {
+		vm.subs = append(vm.subs, &runState{})
+	}
+	return vm.subs[depth-1]
+}
 
-	// Fix jump targets: adjust all PCs relative to startPC
-	for i := range subCode[:bodyLen] {
-		switch subCode[i].Op {
-		case OpJmp:
-			subCode[i].A -= startPC
-		case OpSplit:
-			subCode[i].A -= startPC
-			subCode[i].B -= startPC
-		case OpLookahead, OpNegLookahead, OpLookbehind, OpNegLookbehind:
-			subCode[i].A -= startPC
-			subCode[i].B -= startPC
+// run executes from (pc, pos) until success, returning the end position, or
+// until every alternative of st is exhausted. The outcome of a run is that of
+// the ECMA-262 backtracking semantics: alternatives are explored depth-first
+// in priority order, exactly as a recursive backtracker would.
+func (vm *VM) run(st *runState, pc, pos int) (bool, int) {
+	code := vm.prog.code
+	back := st.backward
+	for {
+		if pc == st.endPC {
+			return true, pos
 		}
-	}
+		if !vm.step() {
+			return false, 0
+		}
+		ok := true
+		if pc < 0 || pc >= len(code) {
+			ok = false
+		} else {
+			inst := &code[pc]
+			switch inst.Op {
+			case OpMatch:
+				return true, pos
 
-	subVM := &VM{
-		Code:       subCode,
-		Input:      vm.Input,
-		NumGroups:  vm.NumGroups,
-		IgnoreCase: vm.IgnoreCase,
-		Multiline:  vm.Multiline,
-		DotAll:     vm.DotAll,
-		Unicode:    vm.Unicode,
-		MaxSteps:   vm.MaxSteps,
-	}
+			case OpChar, OpAny, OpDigit, OpNonDigit, OpWord, OpNonWord, OpSpace, OpNonSpace,
+				OpClass, OpClassSet, OpUnicodeProp, OpNotUnicodeProp:
+				r, next, rok := vm.readRune(pos, back)
+				if rok && vm.matchOne(inst, r) {
+					pos = next
+					pc++
+				} else {
+					ok = false
+				}
 
-	// Pass outer groups so backreferences inside lookahead can see prior captures
-	matched, _, subGroups := subVM.matchWithInitialGroups(vm.Input, pos, groups)
-	if subVM.Err != nil {
-		vm.Err = subVM.Err
-		return false
-	}
-	if matched && subGroups != nil {
-		// Propagate captures from lookahead body back into outer groups
-		for i := 0; i < len(subGroups) && i < len(groups); i++ {
-			if subGroups[i] >= 0 {
-				groups[i] = subGroups[i]
+			case OpRuneSwitch:
+				r, next, rok := vm.readRune(pos, back)
+				target, found := 0, false
+				if rok {
+					target, found = inst.Switch.target(vm.switchKey(vm.ignoreCase(inst), r))
+				}
+				if found {
+					pos = next
+					pc = target
+				} else {
+					ok = false
+				}
+
+			case OpStartLine:
+				if pos == 0 {
+					pc++
+				} else if prevR, _, _ := vm.readRune(pos, true); vm.multiline(inst) && isLineTerminator(prevR) {
+					pc++
+				} else {
+					ok = false
+				}
+
+			case OpEndLine:
+				if pos >= len(vm.Input) {
+					pc++
+				} else if r, _, _ := vm.readRune(pos, false); vm.multiline(inst) && isLineTerminator(r) {
+					pc++
+				} else {
+					ok = false
+				}
+
+			case OpWordBound:
+				if ic := vm.ignoreCase(inst); vm.wordCharBefore(ic, pos) != vm.wordCharAt(ic, pos) {
+					pc++
+				} else {
+					ok = false
+				}
+
+			case OpNonWordBound:
+				if ic := vm.ignoreCase(inst); vm.wordCharBefore(ic, pos) == vm.wordCharAt(ic, pos) {
+					pc++
+				} else {
+					ok = false
+				}
+
+			case OpSaveStart, OpSaveEnd:
+				// When matching backward, OpSaveStart is reached at the group's
+				// far (right) edge, so it records the end; OpSaveEnd, reached at
+				// the near (left) edge, records the start. A group's stored range
+				// is always [start, end].
+				slot := inst.A * 2
+				if (inst.Op == OpSaveEnd) != back {
+					slot++
+				}
+				if !vm.setGroup(st, slot, pos) {
+					return false, 0
+				}
+				pc++
+
+			case OpJmp:
+				pc = inst.A
+
+			case OpSplit:
+				if lp := &vm.prog.loops[pc]; lp.ok {
+					// Greedy single-rune loop: consume as far as possible,
+					// recording the exits given back on backtracking as one
+					// frame rather than one choice per rune. Each position is
+					// still a visit of this split, as in the expanded loop.
+					start := pos
+					body := &code[lp.body]
+					for {
+						visited, mok := vm.memoVisit(st, pc, pos)
+						if !mok {
+							return false, 0
+						}
+						if visited {
+							break
+						}
+						r, next, rok := vm.readRune(pos, back)
+						if !rok || !vm.matchOne(body, r) {
+							break
+						}
+						if !vm.step() {
+							return false, 0
+						}
+						pos = next
+					}
+					if pos != start && !lp.possessive {
+						if !vm.pushChoice(frame{kind: frameGreedy, pc: int32(lp.exit), a: start, b: pos}) {
+							return false, 0
+						}
+					}
+					pc = lp.exit
+					ok = vm.canStart(pc, pos, back)
+					break
+				}
+
+				// The outcome of matching from a given state is a function of
+				// that state, so once a split state has been visited its branch
+				// A needs no second exploration: a revisit takes the exit B.
+				// The state includes the captures when the program has
+				// backreferences (which make outcomes depend on them); keying
+				// on (pos, pc) alone there wrongly prunes branches reachable
+				// with different captures, e.g. (?:(a)|a)(?:b|c)\1 on "ab". It
+				// includes the iteration marks of loops whose body can match
+				// empty, since those decide whether an iteration may end here.
+				visited, mok := vm.memoVisit(st, pc, pos)
+				if !mok {
+					return false, 0
+				}
+				if visited {
+					pc = inst.B
+					break
+				}
+				// A branch that cannot start at this input is not explored (or
+				// kept as an alternative): it would fail without consuming.
+				aOK := vm.canStart(inst.A, pos, back)
+				bOK := vm.canStart(inst.B, pos, back)
+				switch {
+				case aOK && bOK:
+					if !vm.pushChoice(frame{kind: frameChoice, pc: int32(inst.B), a: pos}) {
+						return false, 0
+					}
+					pc = inst.A
+				case aOK:
+					pc = inst.A
+				case bOK:
+					pc = inst.B
+				default:
+					ok = false
+				}
+
+			case OpBackref:
+				var matched bool
+				pos, matched = vm.matchBackref(inst, st.groups, pos, back)
+				if matched {
+					pc++
+				} else {
+					ok = false
+				}
+
+			case OpLookahead, OpNegLookahead, OpLookbehind, OpNegLookbehind:
+				// inst.A..inst.B is the body; reaching inst.B (this
+				// instruction's own pc) inside the body is success.
+				sub := vm.subState(st.depth + 1)
+				sub.init(len(st.groups), st.groups) // outer captures feed backreferences
+				sub.base, sub.choiceBase = len(vm.stack), len(vm.choices)
+				sub.endPC = inst.B
+				sub.backward = inst.Op == OpLookbehind || inst.Op == OpNegLookbehind
+				sub.depth = st.depth + 1
+				matched, _ := vm.run(sub, inst.A, pos)
+				// Lookarounds are atomic: the body's alternatives are dropped.
+				vm.stack = vm.stack[:sub.base]
+				vm.choices = vm.choices[:sub.choiceBase]
+				vm.resetMemo(sub)
+				if vm.Err != nil {
+					return false, 0
+				}
+				positive := inst.Op == OpLookahead || inst.Op == OpLookbehind
+				if matched != positive {
+					ok = false
+					break
+				}
+				if positive {
+					// Propagate captures from the body back into outer groups.
+					// Iteration marks stay behind: they belong to loops in the
+					// body, and only the body's own runs may read them.
+					for i, v := range sub.groups[:(vm.NumGroups+1)*2] {
+						if v >= 0 && !vm.setGroup(st, i, v) {
+							return false, 0
+						}
+					}
+				}
+				pc++
+
+			case OpResetGroups:
+				// Reset groups[A..B] (inclusive, 1-indexed) to -1: ECMA-262
+				// group-reset semantics for quantifier body repeats.
+				for g := inst.A; g <= inst.B; g++ {
+					if g*2+1 < len(st.groups) {
+						if !vm.setGroup(st, g*2, -1) || !vm.setGroup(st, g*2+1, -1) {
+							return false, 0
+						}
+					}
+				}
+				pc++
+
+			case OpMark:
+				if !vm.setGroup(st, inst.A, pos) {
+					return false, 0
+				}
+				pc++
+
+			case OpCheckProgress:
+				// An optional iteration that consumed nothing fails.
+				if st.groups[inst.A] == pos {
+					ok = false
+				} else {
+					pc++
+				}
+
+			default:
+				ok = false
+			}
+		}
+		if !ok {
+			if vm.Err != nil {
+				return false, 0
+			}
+			var found bool
+			pc, pos, found = vm.backtrack(st)
+			if !found {
+				return false, 0
 			}
 		}
 	}
-	return matched
 }
 
-// executeLookbehind matches the lookbehind body ending at the current position.
-// The body was compiled in reversed order, so running it backward from pos (the
-// body's right edge) evaluates it right-to-left per ECMA-262, which gives the
-// correct capture-group values inside quantified/backreferencing lookbehinds.
-// The match starts at pos and consumes toward the start of input; wherever the
-// body's left edge lands is the (zero-width) lookbehind's start.
-func (vm *VM) executeLookbehind(startPC, endPC, pos int, groups []int) bool {
-	bodyLen := endPC - startPC
-	subCode := make([]Instruction, bodyLen+1)
-	copy(subCode, vm.Code[startPC:endPC])
-	subCode[bodyLen] = Instruction{Op: OpMatch}
-
-	for i := range subCode[:bodyLen] {
-		switch subCode[i].Op {
-		case OpJmp:
-			subCode[i].A -= startPC
-		case OpSplit:
-			subCode[i].A -= startPC
-			subCode[i].B -= startPC
-		case OpLookahead, OpNegLookahead, OpLookbehind, OpNegLookbehind:
-			subCode[i].A -= startPC
-			subCode[i].B -= startPC
+// matchBackref matches the text of the referenced group at pos in the given
+// direction, returning the new position.
+func (vm *VM) matchBackref(inst *Instruction, groups []int, pos int, backward bool) (int, bool) {
+	// For duplicate named groups (ES2022), try all alternative group indices
+	// to find one that participated in the current match.
+	start, end := -1, -1
+	for i := -1; i < len(inst.AltA); i++ {
+		gidx := inst.A
+		if i >= 0 {
+			gidx = inst.AltA[i]
+		}
+		groupIdx := gidx - 1 // 1-indexed to 0-indexed
+		if groupIdx < 0 || groupIdx >= vm.NumGroups {
+			continue
+		}
+		s := groups[groupIdx*2+2] // +2 because group 0 is full match
+		e := groups[groupIdx*2+2+1]
+		if s >= 0 && e >= 0 {
+			start, end = s, e
+			break
 		}
 	}
-
-	subVM := &VM{
-		Code:       subCode,
-		Input:      vm.Input,
-		NumGroups:  vm.NumGroups,
-		IgnoreCase: vm.IgnoreCase,
-		Multiline:  vm.Multiline,
-		DotAll:     vm.DotAll,
-		Unicode:    vm.Unicode,
-		MaxSteps:   vm.MaxSteps,
-		Backward:   true,
+	if start < 0 || end < 0 {
+		// No group with this name was captured — ECMA-262: match empty string
+		return pos, true
 	}
 
-	// Pass outer groups so backreferences inside the lookbehind can see prior captures.
-	matched, _, subGroups := subVM.matchWithInitialGroups(vm.Input, pos, groups)
-	if subVM.Err != nil {
-		vm.Err = subVM.Err
-		return false
-	}
-	if matched && subGroups != nil {
-		for i := 0; i < len(subGroups) && i < len(groups); i++ {
-			if subGroups[i] >= 0 {
-				groups[i] = subGroups[i]
+	ic := vm.ignoreCase(inst)
+	if !ic && (vm.Unicode || !BetweenSurrogates(vm.Input, start) && !BetweenSurrogates(vm.Input, end) && !BetweenSurrogates(vm.Input, pos)) {
+		// Equal bytes are equal characters, since every edge falls on a whole
+		// character.
+		refText := vm.Input[start:end]
+		if backward {
+			// Match the referenced text ending at pos, consuming backward.
+			if pos < len(refText) || vm.Input[pos-len(refText):pos] != refText {
+				return pos, false
 			}
+			return pos - len(refText), true
 		}
+		if pos+len(refText) > len(vm.Input) || vm.Input[pos:pos+len(refText)] != refText {
+			return pos, false
+		}
+		return pos + len(refText), true
 	}
-	return matched
+	return vm.matchRef(ic, start, end, pos, backward)
 }
 
-// matchStringIgnoreCaseBackward matches ref against the end of sBefore
-// (= vm.Input[:pos]) case-insensitively, consuming from the end, and returns
-// how many bytes of sBefore were consumed.
-func (vm *VM) matchStringIgnoreCaseBackward(sBefore, ref string) (bool, int) {
-	si, ri := len(sBefore), len(ref)
-	consumed := 0
-	for ri > 0 {
-		if si <= 0 {
-			return false, 0
+// matchRef matches the input between start and end (a capture's text) at pos
+// in the given direction, one character at a time as readRune reads them (so
+// by code unit outside Unicode mode, where a capture can begin or end between
+// the halves of a surrogate pair), and returns the position after it.
+func (vm *VM) matchRef(ic bool, start, end, pos int, backward bool) (int, bool) {
+	in := vm.Input
+	if backward {
+		for i := end; i > start; {
+			if pos <= 0 {
+				return pos, false
+			}
+			rr, sr := rune(in[i-1]), rune(in[pos-1])
+			ni, np := i-1, pos-1
+			if rr >= utf8.RuneSelf {
+				rr, ni, _ = vm.readRune(i, true)
+			}
+			if sr >= utf8.RuneSelf {
+				sr, np, _ = vm.readRune(pos, true)
+			}
+			if !vm.matchChar(ic, sr, rr) {
+				return pos, false
+			}
+			i, pos = ni, np
 		}
-		sr, sSize := utf8.DecodeLastRuneInString(sBefore[:si])
-		rr, rSize := utf8.DecodeLastRuneInString(ref[:ri])
-		if !vm.matchChar(sr, rr) {
-			return false, 0
-		}
-		si -= sSize
-		consumed += sSize
-		ri -= rSize
+		return pos, true
 	}
-	return true, consumed
+	for i := start; i < end; {
+		if pos >= len(in) {
+			return pos, false
+		}
+		rr, sr := rune(in[i]), rune(in[pos])
+		ni, np := i+1, pos+1
+		if rr >= utf8.RuneSelf {
+			rr, ni, _ = vm.readRune(i, false)
+		}
+		if sr >= utf8.RuneSelf {
+			sr, np, _ = vm.readRune(pos, false)
+		}
+		if !vm.matchChar(ic, sr, rr) {
+			return pos, false
+		}
+		i, pos = ni, np
+	}
+	return pos, true
 }
 
-// matchStringIgnoreCaseAt compares a prefix of s against ref and returns
-// whether it matches and how many bytes were consumed in s.
-func (vm *VM) matchStringIgnoreCaseAt(s, ref string) (bool, int) {
-	si, ri := 0, 0
-	consumed := 0
-	for ri < len(ref) {
-		if si >= len(s) {
-			return false, 0
-		}
-		sr, sSize := utf8.DecodeRuneInString(s[si:])
-		rr, rSize := utf8.DecodeRuneInString(ref[ri:])
-		if !vm.matchChar(sr, rr) {
-			return false, 0
-		}
-		si += sSize
-		consumed += sSize
-		ri += rSize
-	}
-	return true, consumed
-}
-
-func (vm *VM) matchChar(input, pattern rune) bool {
+func (vm *VM) matchChar(ic bool, input, pattern rune) bool {
 	if input == pattern {
 		return true
 	}
-	if !vm.IgnoreCase {
+	if !ic {
 		return false
 	}
 	if vm.Unicode {
@@ -792,11 +1164,11 @@ func (vm *VM) matchChar(input, pattern rune) bool {
 	return canonicalizeLegacy(input) == canonicalizeLegacy(pattern)
 }
 
-func (vm *VM) matchInRange(ch, start, end rune) bool {
+func (vm *VM) matchInRange(ic bool, ch, start, end rune) bool {
 	if ch >= start && ch <= end {
 		return true
 	}
-	if !vm.IgnoreCase {
+	if !ic {
 		return false
 	}
 	// Case-insensitive membership: a character matches the range if any of its
@@ -848,13 +1220,6 @@ func canonicalizeLegacy(ch rune) rune {
 	return up
 }
 
-// copyGroups returns a copy of the groups slice
-func copyGroups(g []int) []int {
-	cp := make([]int, len(g))
-	copy(cp, g)
-	return cp
-}
-
 // isECMADigit matches ECMA-262 \d: only [0-9]
 func isECMADigit(r rune) bool {
 	return r >= '0' && r <= '9'
@@ -867,29 +1232,22 @@ func isWordChar(r rune) bool {
 		r == '_'
 }
 
-// wordCharBeforePos returns true if the character before pos is a word char.
-// Handles multi-byte UTF-8 correctly using DecodeLastRuneInString.
-func wordCharBeforePos(s string, pos int) bool {
-	if pos <= 0 {
+// wordCharBefore reports whether the character before pos is a word char.
+func (vm *VM) wordCharBefore(ic bool, pos int) bool {
+	r, _, ok := vm.readRune(pos, true)
+	if !ok || r == utf8.RuneError {
 		return false
 	}
-	r, _ := utf8.DecodeLastRuneInString(s[:pos])
-	if r == utf8.RuneError {
-		return false
-	}
-	return isWordChar(r)
+	return vm.wordChar(ic, r)
 }
 
-// wordCharAtPos returns true if the character at pos is a word char.
-func wordCharAtPos(s string, pos int) bool {
-	if pos >= len(s) {
+// wordCharAt reports whether the character at pos is a word char.
+func (vm *VM) wordCharAt(ic bool, pos int) bool {
+	r, _, ok := vm.readRune(pos, false)
+	if !ok || r == utf8.RuneError {
 		return false
 	}
-	r, _ := utf8.DecodeRuneInString(s[pos:])
-	if r == utf8.RuneError {
-		return false
-	}
-	return isWordChar(r)
+	return vm.wordChar(ic, r)
 }
 
 func isSpace(r rune) bool {
@@ -946,169 +1304,173 @@ func resolveUnicodePropertyCached(prop string) (func(rune) bool, bool) {
 	return fn, ok
 }
 
-// resolveUnicodeProperty maps a property expression to a rune predicate. It
-// accepts "Name=Value" (general category or script) and lone names (a general
-// category value or a binary property). It returns ok=false for anything it
-// does not recognize.
+// resolveUnicodeProperty maps a property expression to a rune predicate: a
+// lone General_Category value or binary property, or Name=Value for
+// General_Category, Script or Script_Extensions. Names and values must be
+// spelled exactly as ECMA-262 and PropertyValueAliases.txt give them, so
+// \p{Lu} and \p{Uppercase_Letter} are valid and \p{uppercase_letter} is not.
+// It returns ok=false for anything else.
 func resolveUnicodeProperty(prop string) (func(rune) bool, bool) {
-	if eq := strings.IndexByte(prop, '='); eq >= 0 {
-		name := normalizeUnicodeProperty(prop[:eq])
-		value := prop[eq+1:]
+	if name, value, ok := strings.Cut(prop, "="); ok {
 		switch name {
-		case "gc", "generalcategory":
-			if t := categoryTable(value); t != nil {
-				return func(r rune) bool { return unicode.Is(t, r) }, true
-			}
-		case "sc", "script", "scx", "scriptextensions":
-			if t := scriptTable(value); t != nil {
-				return func(r rune) bool { return unicode.Is(t, r) }, true
-			}
+		case "General_Category", "gc":
+			return generalCategory(value)
+		case "Script", "sc":
+			return script(value)
+		case "Script_Extensions", "scx":
+			return scriptExtension(value)
 		}
 		return nil, false
 	}
-	if t := categoryTable(prop); t != nil {
-		return func(r rune) bool { return unicode.Is(t, r) }, true
-	}
-	return binaryProperty(prop)
-}
-
-// categoryTable resolves a general-category name or alias (short or long, in any
-// case, with underscores/hyphens/spaces ignored) to its unicode.RangeTable.
-func categoryTable(name string) *unicode.RangeTable {
-	short, ok := categoryAliases[normalizeUnicodeProperty(name)]
-	if !ok {
-		return nil
-	}
-	return unicode.Categories[short]
-}
-
-// scriptTable resolves a script name (ignoring case and separators) to its table.
-func scriptTable(name string) *unicode.RangeTable {
-	norm := normalizeUnicodeProperty(name)
-	for scriptName, table := range unicode.Scripts {
-		if normalizeUnicodeProperty(scriptName) == norm {
-			return table
-		}
-	}
-	return nil
-}
-
-// binaryProperty resolves a lone \p{Name} to a predicate, covering the ECMA-262
-// binary properties: computed derivations, aliases onto Go's unicode.Properties
-// tables, and the general/canonical names directly.
-func binaryProperty(prop string) (func(rune) bool, bool) {
-	norm := normalizeUnicodeProperty(prop)
-	if fn, ok := binaryPropertyPredicates[norm]; ok {
+	if fn, ok := generalCategory(prop); ok {
 		return fn, true
 	}
-	if canonical, ok := binaryPropertyAliases[norm]; ok {
-		if t := unicode.Properties[canonical]; t != nil {
-			return func(r rune) bool { return unicode.Is(t, r) }, true
-		}
-	}
-	// Canonical long names directly (e.g. \p{White_Space}, \p{Dash}).
-	for name, table := range unicode.Properties {
-		if normalizeUnicodeProperty(name) == norm {
-			t := table
-			return func(r rune) bool { return unicode.Is(t, r) }, true
-		}
-	}
-	return nil, false
+	fn, ok := binaryProperties[prop]
+	return fn, ok
 }
 
-// binaryPropertyPredicates holds the ECMA-262 binary properties that are
-// computed from Go's categories/case mappings rather than a single table.
-// Some (Case_Ignorable, Default_Ignorable_Code_Point, XID_*) are close
-// approximations of the full Unicode definitions.
-var binaryPropertyPredicates = map[string]func(rune) bool{
-	"ascii": func(r rune) bool { return r <= 0x7F },
-	"any":   func(r rune) bool { return true },
-	"assigned": func(r rune) bool {
-		return r != unicode.ReplacementChar && (unicode.IsGraphic(r) || unicode.IsControl(r) || unicode.Is(unicode.Cf, r))
-	},
-	"alphabetic":                isAlphabetic,
-	"alpha":                     isAlphabetic,
-	"lowercase":                 func(r rune) bool { return unicode.IsLower(r) || unicode.Is(unicode.Other_Lowercase, r) },
-	"lower":                     func(r rune) bool { return unicode.IsLower(r) || unicode.Is(unicode.Other_Lowercase, r) },
-	"uppercase":                 func(r rune) bool { return unicode.IsUpper(r) || unicode.Is(unicode.Other_Uppercase, r) },
-	"upper":                     func(r rune) bool { return unicode.IsUpper(r) || unicode.Is(unicode.Other_Uppercase, r) },
-	"cased":                     isCased,
-	"caseignorable":             isCaseIgnorable,
-	"ci":                        isCaseIgnorable,
-	"whitespace":                unicode.IsSpace,
-	"space":                     unicode.IsSpace,
-	"wspace":                    unicode.IsSpace,
-	"math":                      func(r rune) bool { return unicode.Is(unicode.Sm, r) || unicode.Is(unicode.Other_Math, r) },
-	"idstart":                   isIDStart,
-	"ids":                       isIDStart,
-	"idcontinue":                isIDContinue,
-	"idc":                       isIDContinue,
-	"xidstart":                  isIDStart,    // NFKC-closure approximation
-	"xids":                      isIDStart,    // NFKC-closure approximation
-	"xidcontinue":               isIDContinue, // NFKC-closure approximation
-	"xidc":                      isIDContinue, // NFKC-closure approximation
-	"graphemeextend":            isGraphemeExtend,
-	"grext":                     isGraphemeExtend,
-	"changeswhenuppercased":     func(r rune) bool { return unicode.ToUpper(r) != r },
-	"cwu":                       func(r rune) bool { return unicode.ToUpper(r) != r },
-	"changeswhenlowercased":     func(r rune) bool { return unicode.ToLower(r) != r },
-	"cwl":                       func(r rune) bool { return unicode.ToLower(r) != r },
-	"changeswhentitlecased":     func(r rune) bool { return unicode.ToTitle(r) != r },
-	"cwt":                       func(r rune) bool { return unicode.ToTitle(r) != r },
-	"defaultignorablecodepoint": isDefaultIgnorable,
-	"di":                        isDefaultIgnorable,
-	"digit":                     func(r rune) bool { return unicode.Is(unicode.Nd, r) }, // non-standard alias for Nd
+func generalCategory(value string) (func(rune) bool, bool) {
+	short, ok := generalCategoryNames[value]
+	if !ok {
+		return nil, false
+	}
+	t := unicode.Categories[short]
+	return func(r rune) bool { return unicode.Is(t, r) }, true
 }
 
-// binaryPropertyAliases maps ECMA-262 binary-property aliases to the canonical
-// names keying Go's unicode.Properties table.
-var binaryPropertyAliases = map[string]string{
-	"asciihexdigit":         "ASCII_Hex_Digit",
-	"ahex":                  "ASCII_Hex_Digit",
-	"bidicontrol":           "Bidi_Control",
-	"bidic":                 "Bidi_Control",
-	"dash":                  "Dash",
-	"deprecated":            "Deprecated",
-	"dep":                   "Deprecated",
-	"diacritic":             "Diacritic",
-	"dia":                   "Diacritic",
-	"extender":              "Extender",
-	"ext":                   "Extender",
-	"hexdigit":              "Hex_Digit",
-	"hex":                   "Hex_Digit",
-	"hyphen":                "Hyphen",
-	"idsbinaryoperator":     "IDS_Binary_Operator",
-	"idsb":                  "IDS_Binary_Operator",
-	"idstrinaryoperator":    "IDS_Trinary_Operator",
-	"idst":                  "IDS_Trinary_Operator",
-	"ideographic":           "Ideographic",
-	"ideo":                  "Ideographic",
-	"joincontrol":           "Join_Control",
-	"joinc":                 "Join_Control",
-	"logicalorderexception": "Logical_Order_Exception",
-	"loe":                   "Logical_Order_Exception",
-	"noncharactercodepoint": "Noncharacter_Code_Point",
-	"nchar":                 "Noncharacter_Code_Point",
-	"patternsyntax":         "Pattern_Syntax",
-	"patsyn":                "Pattern_Syntax",
-	"patternwhitespace":     "Pattern_White_Space",
-	"patws":                 "Pattern_White_Space",
-	"quotationmark":         "Quotation_Mark",
-	"qmark":                 "Quotation_Mark",
-	"radical":               "Radical",
-	"regionalindicator":     "Regional_Indicator",
-	"ri":                    "Regional_Indicator",
-	"sentenceterminal":      "Sentence_Terminal",
-	"sterm":                 "Sentence_Terminal",
-	"softdotted":            "Soft_Dotted",
-	"sd":                    "Soft_Dotted",
-	"terminalpunctuation":   "Terminal_Punctuation",
-	"term":                  "Terminal_Punctuation",
-	"unifiedideograph":      "Unified_Ideograph",
-	"uideo":                 "Unified_Ideograph",
-	"variationselector":     "Variation_Selector",
-	"vs":                    "Variation_Selector",
+func script(value string) (func(rune) bool, bool) {
+	long, ok := scriptNames[value]
+	if !ok {
+		return nil, false
+	}
+	if long == "Unknown" {
+		return isUnknownScript, true
+	}
+	t := unicode.Scripts[long]
+	return func(r rune) bool { return unicode.Is(t, r) }, true
 }
+
+// scriptExtension is Script_Extensions=value: the code points
+// ScriptExtensions.txt lists with that script, and those it does not list
+// whose Script is that script.
+func scriptExtension(value string) (func(rune) bool, bool) {
+	sc, ok := script(value)
+	if !ok {
+		return nil, false
+	}
+	ext := scriptExtensions[scriptNames[value]]
+	return func(r rune) bool {
+		if inRanges(scriptExtensionsListed, r) {
+			return inRanges(ext, r)
+		}
+		return sc(r)
+	}, true
+}
+
+// anyScript holds the code points of every script Go has a table for, which
+// is every script but Unknown.
+var anyScript = sync.OnceValue(func() []RuneRange {
+	var rs []RuneRange
+	for _, t := range unicode.Scripts {
+		for _, r := range t.R16 {
+			for c := rune(r.Lo); c <= rune(r.Hi); c += rune(r.Stride) {
+				rs = append(rs, RuneRange{c, c})
+			}
+		}
+		for _, r := range t.R32 {
+			for c := rune(r.Lo); c <= rune(r.Hi); c += rune(r.Stride) {
+				rs = append(rs, RuneRange{c, c})
+			}
+		}
+	}
+	return NewCharSetRanges(rs).Ranges
+})
+
+// isUnknownScript is Script=Unknown (Zzzz): a code point in no other script.
+func isUnknownScript(r rune) bool { return !inRanges(anyScript(), r) }
+
+// binaryProperties maps each spelling of each binary property in ECMA-262's
+// table of binary Unicode property aliases to its predicate. Names are exact.
+// Properties Go's unicode package has no exact table for come from the UCD
+// tables tools/genpropnames generates (ucd_props.go).
+var binaryProperties = func() map[string]func(rune) bool {
+	m := map[string]func(rune) bool{}
+	add := func(fn func(rune) bool, names ...string) {
+		for _, n := range names {
+			m[n] = fn
+		}
+	}
+	table := func(name string) func(rune) bool {
+		t := unicode.Properties[name]
+		if t == nil {
+			panic("vm: no unicode.Properties table " + name)
+		}
+		return func(r rune) bool { return unicode.Is(t, r) }
+	}
+	ucd := func(name string) func(rune) bool {
+		rs := ucdProperties[name]
+		if rs == nil {
+			panic("vm: no generated table " + name)
+		}
+		return func(r rune) bool { return inRanges(rs, r) }
+	}
+	add(func(r rune) bool { return r <= 0x7F }, "ASCII")
+	add(func(r rune) bool { return true }, "Any")
+	add(func(r rune) bool { return !unicode.Is(unicode.Categories["Cn"], r) }, "Assigned")
+	add(table("ASCII_Hex_Digit"), "ASCII_Hex_Digit", "AHex")
+	add(isAlphabetic, "Alphabetic", "Alpha")
+	add(table("Bidi_Control"), "Bidi_Control", "Bidi_C")
+	add(ucd("Bidi_Mirrored"), "Bidi_Mirrored", "Bidi_M")
+	add(ucd("Case_Ignorable"), "Case_Ignorable", "CI")
+	add(isCased, "Cased")
+	add(ucd("Changes_When_Casefolded"), "Changes_When_Casefolded", "CWCF")
+	add(ucd("Changes_When_Casemapped"), "Changes_When_Casemapped", "CWCM")
+	add(func(r rune) bool { return unicode.ToLower(r) != r }, "Changes_When_Lowercased", "CWL")
+	add(ucd("Changes_When_NFKC_Casefolded"), "Changes_When_NFKC_Casefolded", "CWKCF")
+	add(ucd("Changes_When_Titlecased"), "Changes_When_Titlecased", "CWT")
+	add(ucd("Changes_When_Uppercased"), "Changes_When_Uppercased", "CWU")
+	add(table("Dash"), "Dash")
+	add(ucd("Default_Ignorable_Code_Point"), "Default_Ignorable_Code_Point", "DI")
+	add(table("Deprecated"), "Deprecated", "Dep")
+	add(table("Diacritic"), "Diacritic", "Dia")
+	add(emojiProperty("Emoji"), "Emoji")
+	add(emojiProperty("Emoji_Component"), "Emoji_Component", "EComp")
+	add(emojiProperty("Emoji_Modifier"), "Emoji_Modifier", "EMod")
+	add(emojiProperty("Emoji_Modifier_Base"), "Emoji_Modifier_Base", "EBase")
+	add(emojiProperty("Emoji_Presentation"), "Emoji_Presentation", "EPres")
+	add(emojiProperty("Extended_Pictographic"), "Extended_Pictographic", "ExtPict")
+	add(table("Extender"), "Extender", "Ext")
+	add(ucd("Grapheme_Base"), "Grapheme_Base", "Gr_Base")
+	add(isGraphemeExtend, "Grapheme_Extend", "Gr_Ext")
+	add(table("Hex_Digit"), "Hex_Digit", "Hex")
+	add(table("IDS_Binary_Operator"), "IDS_Binary_Operator", "IDSB")
+	add(table("IDS_Trinary_Operator"), "IDS_Trinary_Operator", "IDST")
+	add(ucd("ID_Continue"), "ID_Continue", "IDC")
+	add(ucd("ID_Start"), "ID_Start", "IDS")
+	add(table("Ideographic"), "Ideographic", "Ideo")
+	add(table("Join_Control"), "Join_Control", "Join_C")
+	add(table("Logical_Order_Exception"), "Logical_Order_Exception", "LOE")
+	add(func(r rune) bool { return unicode.IsLower(r) || unicode.Is(unicode.Other_Lowercase, r) }, "Lowercase", "Lower")
+	add(func(r rune) bool { return unicode.Is(unicode.Sm, r) || unicode.Is(unicode.Other_Math, r) }, "Math")
+	add(table("Noncharacter_Code_Point"), "Noncharacter_Code_Point", "NChar")
+	add(table("Pattern_Syntax"), "Pattern_Syntax", "Pat_Syn")
+	add(table("Pattern_White_Space"), "Pattern_White_Space", "Pat_WS")
+	add(table("Quotation_Mark"), "Quotation_Mark", "QMark")
+	add(table("Radical"), "Radical")
+	add(table("Regional_Indicator"), "Regional_Indicator", "RI")
+	add(table("Sentence_Terminal"), "Sentence_Terminal", "STerm")
+	add(table("Soft_Dotted"), "Soft_Dotted", "SD")
+	add(table("Terminal_Punctuation"), "Terminal_Punctuation", "Term")
+	add(table("Unified_Ideograph"), "Unified_Ideograph", "UIdeo")
+	add(func(r rune) bool { return unicode.IsUpper(r) || unicode.Is(unicode.Other_Uppercase, r) }, "Uppercase", "Upper")
+	add(table("Variation_Selector"), "Variation_Selector", "VS")
+	// ECMA-262's table lists only space as White_Space's alias; Unicode's
+	// WSpace is not a name the spec accepts, although V8 does.
+	add(table("White_Space"), "White_Space", "space")
+	add(ucd("XID_Continue"), "XID_Continue", "XIDC")
+	add(ucd("XID_Start"), "XID_Start", "XIDS")
+	return m
+}()
 
 func isAlphabetic(r rune) bool {
 	return unicode.IsLetter(r) || unicode.Is(unicode.Nl, r) || unicode.Is(unicode.Other_Alphabetic, r)
@@ -1119,78 +1481,6 @@ func isCased(r rune) bool {
 		unicode.Is(unicode.Other_Lowercase, r) || unicode.Is(unicode.Other_Uppercase, r)
 }
 
-func isCaseIgnorable(r rune) bool {
-	// Approximation of Case_Ignorable: the combining/format/modifier categories
-	// (the Word_Break refinements are omitted).
-	return unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Me, r) || unicode.Is(unicode.Cf, r) ||
-		unicode.Is(unicode.Lm, r) || unicode.Is(unicode.Sk, r)
-}
-
-func isIDStart(r rune) bool {
-	return unicode.IsLetter(r) || unicode.Is(unicode.Nl, r) || unicode.Is(unicode.Other_ID_Start, r)
-}
-
-func isIDContinue(r rune) bool {
-	return isIDStart(r) || unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Mc, r) ||
-		unicode.Is(unicode.Nd, r) || unicode.Is(unicode.Pc, r) || unicode.Is(unicode.Other_ID_Continue, r)
-}
-
 func isGraphemeExtend(r rune) bool {
 	return unicode.Is(unicode.Me, r) || unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Other_Grapheme_Extend, r)
-}
-
-func isDefaultIgnorable(r rune) bool {
-	// Approximation of Default_Ignorable_Code_Point.
-	return unicode.Is(unicode.Other_Default_Ignorable_Code_Point, r) ||
-		unicode.Is(unicode.Cf, r) || unicode.Is(unicode.Variation_Selector, r)
-}
-
-func normalizeUnicodeProperty(prop string) string {
-	prop = strings.TrimSpace(prop)
-	prop = strings.ReplaceAll(prop, "_", "")
-	prop = strings.ReplaceAll(prop, "-", "")
-	prop = strings.ReplaceAll(prop, " ", "")
-	return strings.ToLower(prop)
-}
-
-// categoryAliases maps normalized general-category names (short codes and long
-// names/aliases) to the short code keying unicode.Categories.
-var categoryAliases = map[string]string{
-	"l": "L", "letter": "L",
-	"lu": "Lu", "uppercaseletter": "Lu",
-	"ll": "Ll", "lowercaseletter": "Ll",
-	"lt": "Lt", "titlecaseletter": "Lt",
-	"lm": "Lm", "modifierletter": "Lm",
-	"lo": "Lo", "otherletter": "Lo",
-	"lc": "L", "casedletter": "L",
-	"m": "M", "mark": "M", "combiningmark": "M",
-	"mn": "Mn", "nonspacingmark": "Mn",
-	"mc": "Mc", "spacingcombiningmark": "Mc", "spacingmark": "Mc",
-	"me": "Me", "enclosingmark": "Me",
-	"n": "N", "number": "N",
-	"nd": "Nd", "decimalnumber": "Nd",
-	"nl": "Nl", "letternumber": "Nl",
-	"no": "No", "othernumber": "No",
-	"p": "P", "punctuation": "P",
-	"pc": "Pc", "connectorpunctuation": "Pc",
-	"pd": "Pd", "dashpunctuation": "Pd",
-	"ps": "Ps", "openpunctuation": "Ps",
-	"pe": "Pe", "closepunctuation": "Pe",
-	"pi": "Pi", "initialpunctuation": "Pi",
-	"pf": "Pf", "finalpunctuation": "Pf",
-	"po": "Po", "otherpunctuation": "Po",
-	"s": "S", "symbol": "S",
-	"sm": "Sm", "mathsymbol": "Sm",
-	"sc": "Sc", "currencysymbol": "Sc",
-	"sk": "Sk", "modifiersymbol": "Sk",
-	"so": "So", "othersymbol": "So",
-	"z": "Z", "separator": "Z",
-	"zs": "Zs", "spaceseparator": "Zs",
-	"zl": "Zl", "lineseparator": "Zl",
-	"zp": "Zp", "paragraphseparator": "Zp",
-	"c": "C", "other": "C",
-	"cc": "Cc", "control": "Cc", "cntrl": "Cc",
-	"cf": "Cf", "format": "Cf",
-	"cs": "Cs", "surrogate": "Cs",
-	"co": "Co", "privateuse": "Co",
 }

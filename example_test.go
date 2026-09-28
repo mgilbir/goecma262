@@ -3,6 +3,7 @@ package ecma262_test
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/mgilbir/goecma262"
 	"github.com/mgilbir/goecma262/flags"
@@ -146,6 +147,21 @@ func ExampleRegexp_MatchStringErr() {
 	// true
 }
 
+func ExampleMatchString() {
+	// Linear-time patterns complete at any input length: the default budget
+	// grows with the input.
+	matched, err := ecma262.MatchString(`^[a-z]+$`, flags.Flags(0), strings.Repeat("a", 1_000_000))
+	fmt.Println(matched, err)
+
+	// A catastrophic search has no answer. The error is distinct from a
+	// non-match; never read matched without checking it.
+	_, err = ecma262.MatchString(`^(a*)(a*)(a*)\1\2\3$`, flags.Flags(0), strings.Repeat("a", 300))
+	fmt.Println(errors.Is(err, ecma262.ErrStepLimit))
+	// Output:
+	// true <nil>
+	// true
+}
+
 func ExampleRegexp_MatchString_unicodeProperties() {
 	// \p{...} requires the u (or v) flag and matches by Unicode property.
 	re := ecma262.MustCompile(`^\p{Script=Greek}+$`, flags.Unicode)
@@ -154,6 +170,34 @@ func ExampleRegexp_MatchString_unicodeProperties() {
 	// Output:
 	// true
 	// false
+}
+
+func ExampleRegexp_FindString_classSets() {
+	// With the v flag, classes are sets: they can be subtracted (--),
+	// intersected (&&) and nested, and can hold strings as well as characters.
+	re := ecma262.MustCompile(`[\p{L}--[a-z]]+`, flags.UnicodeSets)
+	fmt.Println(re.FindString("abcÄÖüdef"))
+
+	// A property of strings matches a whole emoji sequence as one element.
+	re = ecma262.MustCompile(`\p{RGI_Emoji}`, flags.UnicodeSets)
+	fmt.Println(re.FindString("hi 👨‍👩‍👧!") == "👨‍👩‍👧")
+	// Output:
+	// ÄÖü
+	// true
+}
+
+// Without u or v, a character above U+FFFF is two UTF-16 code units, as in
+// JavaScript. A result that splits it has no Go form.
+func ExampleErrSurrogateSplit() {
+	fmt.Println(ecma262.MustCompile(`^..$`, flags.Flags(0)).MatchString("😀"))
+	fmt.Println(ecma262.MustCompile(`^.$`, flags.Unicode).MatchString("😀"))
+
+	_, err := ecma262.MustCompile(`\uD83D`, flags.Flags(0)).FindStringIndexErr("😀")
+	fmt.Println(errors.Is(err, ecma262.ErrSurrogateSplit))
+	// Output:
+	// true
+	// true
+	// true
 }
 
 func ExampleWithSyntax() {
