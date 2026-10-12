@@ -241,6 +241,23 @@ holds (its instructions and the data they own, the program's analysis, its
 group names and source), for callers that keep compiled patterns in a
 byte-bounded cache or charge them to a memory budget.
 
+That cost is known before it is paid. `compiler.Bound` computes a parsed
+pattern's instruction count (exactly, except for some v-mode classes of
+strings, which it bounds) and a bound on its footprint, in time linear in
+the pattern, and `parser.AllocBound` bounds what parsing allocates by the
+pattern's length. `Compile` refuses a pattern over the 200,000-instruction
+limit before emitting anything, and `WithBudget(maxInstructions, maxBytes)`
+refuses one over a caller's own budget, with `ErrBudgetExceeded`, before
+parsing it if it is too long and before compiling it if it is too large. A
+`Regexp` compiled within a budget holds at most `maxBytes`:
+
+```go
+re, err := ecma262.Compile(untrusted, f, ecma262.WithBudget(10_000, 4<<20))
+if errors.Is(err, ecma262.ErrBudgetExceeded) {
+    // too expensive: refused before the cost was paid
+}
+```
+
 ## Architecture
 
 Pattern strings are parsed to an AST (`parser/`), compiled to bytecode
@@ -259,8 +276,8 @@ how right-to-left lookbehind and the ReDoS bounds work — are in
 Basic performance on an AMD Ryzen 9 6900HX (`go test ./tests/ -bench . -benchmem`):
 
 ```
-BenchmarkMatch-16            782073    1536 ns/op    1000 B/op    28 allocs/op
-BenchmarkCompileAndMatch-16  399681    2691 ns/op    3256 B/op    50 allocs/op
+BenchmarkMatch-16            1810467    636 ns/op     808 B/op    12 allocs/op
+BenchmarkCompileAndMatch-16   410583   2838 ns/op    3616 B/op    48 allocs/op
 ```
 
 ## Testing and Test262 compliance
@@ -283,7 +300,7 @@ suite and maintain the skip list is covered in
 
 1. **Unicode property escapes** - Names and values are matched exactly, as in JavaScript: `\p{Lu}`, `\p{Uppercase_Letter}` and `\p{sc=Latn}` are valid, `\p{uppercase_letter}` is not. The one spelling V8 accepts beyond ECMA-262's table, Unicode's `WSpace` alias for `White_Space`, is rejected here as the spec requires (use `White_Space` or `space`). Every general category, script (`Script=` and `Script_Extensions=`, with every alias in `PropertyValueAliases.txt`) and binary property ECMA-262 lists is supported, and each matches the same code points as node's on Unicode 17.0. Where Go's `unicode` package has no table for a property (the emoji properties, `Script_Extensions`, and derived ones such as `ID_Start` or `Changes_When_Casefolded`), the data is generated from the UCD by `tools/genemoji` and `tools/genpropnames`.
 2. **HasIndices flag** (`d`) - Parsed and accepted, but it has no effect: match indices are always available through the `*Index` methods (`FindStringSubmatchIndex`, `FindAllStringSubmatchIndex`, etc.), which return `[start, end)` byte-offset pairs per group (`-1` for a non-participating group). Named-group indices (JavaScript's `indices.groups`) are obtained by combining `SubexpIndex(name)` with those pairs.
-3. **Compile-time limits** - Patterns nested more than 200 levels deep, with a single quantifier bound above 10,000 (`a{10001}`), or compiling to more than 200,000 instructions are rejected at compile time, with an error wrapping `ErrLimit`.
+3. **Compile-time limits** - Patterns nested more than 200 levels deep, with a single quantifier bound above 10,000 (`a{10001}`), or compiling to more than 200,000 instructions are rejected at compile time, before any code is emitted, with an error wrapping `ErrLimit`.
 4. **Case folding** - Case-insensitive matching uses Unicode simple case folding under the `u` flag, and the legacy `Canonicalize` (uppercase-based, with the "don't map non-ASCII to ASCII" guard) otherwise — matching JavaScript in both modes. A handful of full-mapping edge cases (e.g. `ß`↔`SS`) are not folded, as in most engines.
 
 ## Contributing

@@ -2,6 +2,7 @@ package compiler
 
 import (
 	"fmt"
+	"maps"
 	"slices"
 
 	"github.com/mgilbir/goecma262/parser"
@@ -13,8 +14,19 @@ import (
 type classSetValue struct {
 	chars *vm.CharSet
 	// strings is keyed by the string, case-canonicalized under IgnoreCase so
-	// that set operations compare strings as the matcher will.
+	// that set operations compare strings as the matcher will. A value's
+	// strings are never modified once it is built, so values may share them.
 	strings map[string]bool
+	trie    *trieNode // of strings, if any (see setValue)
+	// prop is set on the value of a property of strings, shared by every
+	// compile (see propertyValue).
+	prop *propertyKey
+}
+
+// sameProperty reports whether v and o are the value of the same property
+// of strings.
+func (v classSetValue) sameProperty(o classSetValue) bool {
+	return v.prop != nil && o.prop != nil && *v.prop == *o.prop
 }
 
 // compileClassSet compiles a v-mode character class.
@@ -29,23 +41,12 @@ type classSetValue struct {
 // position only if one is a prefix of the other, and a trie node tries its
 // children, the longer strings, before ending the string there.
 func (c *Compiler) compileClassSet(e *parser.ClassSetExpression) error {
-	v, ok := c.classSets[e]
-	if !ok {
-		v = c.evalClassSet(e)
-		if c.classSets == nil {
-			c.classSets = make(map[*parser.ClassSetExpression]classSetValue)
-		}
-		c.classSets[e] = v
-	}
+	v := c.setValue(e)
 	if len(v.strings) == 0 {
 		c.emit(vm.Instruction{Op: vm.OpClassSet, Set: v.chars})
 		return nil
 	}
-
-	root := &trieNode{}
-	for s := range v.strings {
-		root.insert([]rune(s))
-	}
+	root := v.trie
 	// At the root, the trie's children begin the strings of two or more code
 	// points; its terminal is the empty string, tried after the characters.
 	hasStrings := len(root.children) > 0
@@ -56,7 +57,7 @@ func (c *Compiler) compileClassSet(e *parser.ClassSetExpression) error {
 	if root.terminal {
 		alts++
 	}
-	err := c.emitAlternation(alts, func(i int) error {
+	return c.emitAlternation(alts, func(i int) error {
 		if hasStrings {
 			if i == 0 {
 				c.emitTrieChildren(root)
@@ -69,13 +70,26 @@ func (c *Compiler) compileClassSet(e *parser.ClassSetExpression) error {
 		}
 		return nil // the empty string emits nothing
 	})
-	if err != nil {
-		return err
+}
+
+// setValue returns e evaluated, with the trie of its strings if it holds
+// any, once per expression: a counted quantifier compiles e once per copy.
+func (c *Compiler) setValue(e *parser.ClassSetExpression) *classSetValue {
+	if v, ok := c.classSets[e]; ok {
+		return v
 	}
-	if len(c.code) > MaxProgramSize {
-		return errProgramTooLarge()
+	v := c.evalClassSet(e)
+	if len(v.strings) > 0 {
+		v.trie = &trieNode{}
+		for s := range v.strings {
+			v.trie.insert([]rune(s))
+		}
 	}
-	return nil
+	if c.classSets == nil {
+		c.classSets = make(map[*parser.ClassSetExpression]*classSetValue)
+	}
+	c.classSets[e] = &v
+	return &v
 }
 
 type trieNode struct {
@@ -152,16 +166,10 @@ func (c *Compiler) evalClassSetNode(n parser.ClassSetNode) classSetValue {
 	case *parser.ClassEscape:
 		return classSetValue{chars: &vm.CharSet{Op: vm.CharSetEscape, Atom: classEscapeAtom(n)}}
 	case *parser.ClassStrings:
-		var singles []vm.RuneRange
-		strs := map[string]bool{}
-		for _, s := range n.Strings {
-			if len(s) == 1 {
-				singles = append(singles, vm.RuneRange{Start: s[0], End: s[0]})
-				continue
-			}
-			strs[c.canonicalString(s)] = true
+		if backward, ok := sharedTable(n); ok {
+			return propertyValue(propertyKey{n.Property, c.ignoreCase, backward})
 		}
-		return classSetValue{chars: vm.NewCharSetRanges(singles), strings: strs}
+		return c.evalStrings(n)
 	case *parser.ClassSetExpression:
 		return c.evalClassSet(n)
 	case *parser.ClassSetOperation:
@@ -170,13 +178,36 @@ func (c *Compiler) evalClassSetNode(n parser.ClassSetNode) classSetValue {
 	panic(fmt.Sprintf("unknown class set node %T", n))
 }
 
+// evalStrings evaluates a \q{...} or the members of a property of strings.
+func (c *Compiler) evalStrings(n *parser.ClassStrings) classSetValue {
+	var singles []vm.RuneRange
+	strs := map[string]bool{}
+	for _, s := range n.Strings {
+		if len(s) == 1 {
+			singles = append(singles, vm.RuneRange{Start: s[0], End: s[0]})
+			continue
+		}
+		strs[c.canonicalString(s)] = true
+	}
+	return classSetValue{chars: vm.NewCharSetRanges(singles), strings: strs}
+}
+
 func (c *Compiler) evalClassSetOperation(n *parser.ClassSetOperation) classSetValue {
-	values := make([]classSetValue, len(n.Items))
+	values := make([]classSetValue, 0, len(n.Items))
 	for i, it := range n.Items {
-		values[i] = c.evalClassSetNode(it)
+		v := c.evalClassSetNode(it)
+		if i > 0 && n.Kind != parser.SetSubtraction && v.prop != nil && slices.ContainsFunc(values, v.sameProperty) {
+			// A ∪ A and A ∩ A are A: a property named again adds nothing,
+			// and its strings need not be gone through again.
+			continue
+		}
+		values = append(values, v)
 	}
 	switch n.Kind {
 	case parser.SetIntersection:
+		if len(values) == 1 {
+			return values[0]
+		}
 		sets := make([]*vm.CharSet, len(values))
 		strs := values[0].strings
 		for i, v := range values {
@@ -189,9 +220,12 @@ func (c *Compiler) evalClassSetOperation(n *parser.ClassSetOperation) classSetVa
 	case parser.SetSubtraction:
 		removed := unionValues(values[1:])
 		strs := map[string]bool{}
-		for s := range values[0].strings {
-			if !removed.strings[s] {
-				strs[s] = true
+		if values[0].prop == nil || !slices.ContainsFunc(values[1:], values[0].sameProperty) {
+			// (A − A's strings are none, and need not be gone through.)
+			for s := range values[0].strings {
+				if !removed.strings[s] {
+					strs[s] = true
+				}
 			}
 		}
 		chars := &vm.CharSet{Op: vm.CharSetIntersection, Items: []*vm.CharSet{values[0].chars, complementSet(removed.chars)}}
@@ -203,17 +237,33 @@ func (c *Compiler) evalClassSetOperation(n *parser.ClassSetOperation) classSetVa
 // unionValues returns the union of values, merging their plain ranges into one
 // node so that a union of characters is a single binary search.
 func unionValues(values []classSetValue) classSetValue {
+	if len(values) == 1 {
+		// Values are never modified, so the union of one is the value.
+		return values[0]
+	}
 	var ranges []vm.RuneRange
 	var others []*vm.CharSet
-	strs := map[string]bool{}
+	// The strings of a single operand that has any are shared rather than
+	// copied.
+	var strs map[string]bool
+	shared := false
 	for _, v := range values {
 		if v.chars.Op == vm.CharSetRanges {
 			ranges = append(ranges, v.chars.Ranges...)
 		} else {
 			others = append(others, v.chars)
 		}
-		for s := range v.strings {
-			strs[s] = true
+		switch {
+		case len(v.strings) == 0:
+		case strs == nil:
+			strs, shared = v.strings, true
+		default:
+			if shared {
+				strs, shared = maps.Clone(strs), false
+			}
+			for s := range v.strings {
+				strs[s] = true
+			}
 		}
 	}
 	chars := vm.NewCharSetRanges(ranges)
@@ -279,13 +329,17 @@ func classEscapeAtom(e *parser.ClassEscape) vm.ClassAtom {
 // reverseClassSet returns e for a lookbehind body, which is matched right to
 // left: every string reversed, so that the trie shares suffixes, and longer
 // strings are still tried first among those that can both end at a position.
-func reverseClassSet(e *parser.ClassSetExpression) *parser.ClassSetExpression {
-	return &parser.ClassSetExpression{Negated: e.Negated, Body: reverseClassSetNode(e.Body)}
+func (c *Compiler) reverseClassSet(e *parser.ClassSetExpression) *parser.ClassSetExpression {
+	return &parser.ClassSetExpression{Negated: e.Negated, Body: c.reverseClassSetNode(e.Body)}
 }
 
-func reverseClassSetNode(n parser.ClassSetNode) parser.ClassSetNode {
+func (c *Compiler) reverseClassSetNode(n parser.ClassSetNode) parser.ClassSetNode {
 	switch n := n.(type) {
 	case *parser.ClassStrings:
+		if backward, ok := sharedTable(n); ok {
+			t, _ := table(n.Property, !backward)
+			return &parser.ClassStrings{Strings: t, Property: n.Property}
+		}
 		strs := make([][]rune, len(n.Strings))
 		for i, s := range n.Strings {
 			r := slices.Clone(s)
@@ -294,11 +348,11 @@ func reverseClassSetNode(n parser.ClassSetNode) parser.ClassSetNode {
 		}
 		return &parser.ClassStrings{Strings: strs, Property: n.Property}
 	case *parser.ClassSetExpression:
-		return reverseClassSet(n)
+		return c.reverseClassSet(n)
 	case *parser.ClassSetOperation:
 		items := make([]parser.ClassSetNode, len(n.Items))
 		for i, it := range n.Items {
-			items[i] = reverseClassSetNode(it)
+			items[i] = c.reverseClassSetNode(it)
 		}
 		return &parser.ClassSetOperation{Kind: n.Kind, Items: items}
 	}

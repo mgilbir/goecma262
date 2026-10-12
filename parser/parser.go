@@ -15,6 +15,25 @@ import (
 // MaxNestingDepth is the maximum allowed nesting depth for the parser
 const MaxNestingDepth = 200
 
+// AllocBound bounds what parsing a pattern of n bytes allocates: New and
+// Parse together allocate at most AllocBound(n) bytes, garbage included. It
+// does not count the tables shared by every pattern that are built once, on
+// first use, such as the members of a property of strings. A caller with a
+// memory budget can refuse a pattern by its length before parsing it.
+// TestParseAllocBound checks it on every construct of the grammar.
+func AllocBound(n int) int64 {
+	const base, perByte = 1024, 128
+	if n < 0 {
+		n = 0
+	}
+	if int64(n) > (maxInt64-base)/perByte {
+		return maxInt64
+	}
+	return base + perByte*int64(n)
+}
+
+const maxInt64 = int64(^uint64(0) >> 1)
+
 // ErrLimit is wrapped by every error that refuses a pattern because it exceeds
 // a limit of this implementation, not because it is invalid. ECMA-262 has no
 // such limits, so to a JavaScript-compatible caller such a refusal is a
@@ -59,6 +78,8 @@ type Parser struct {
 
 	namedGroups  map[string][]int // name -> every group number carrying it
 	pendingNamed []pendingNamed
+
+	stack termStack
 }
 
 type pendingNamed struct {
@@ -157,8 +178,10 @@ func (p *Parser) Parse() (pat *Pattern, err error) {
 			br.node.AltIndices = alt
 		}
 	}
-	if _, err := p.pathNames(body); err != nil {
-		return nil, err
+	if p.hasNamedGroups {
+		if _, err := p.pathNames(body); err != nil {
+			return nil, err
+		}
 	}
 
 	return &Pattern{
@@ -260,25 +283,88 @@ func (p *Parser) parseDisjunction() Expression {
 	if p.atEnd() || p.peek() != '|' {
 		return first
 	}
-	alts := []Expression{first}
+	base := p.stack.n
+	p.stack.push(first)
 	for p.eat('|') {
-		alts = append(alts, p.parseAlternative())
+		p.stack.push(p.parseAlternative())
 	}
-	return &Disjunction{Alternatives: alts}
+	return &Disjunction{Alternatives: p.stack.pop(base)}
 }
 
 func (p *Parser) parseAlternative() Expression {
-	var elements []Expression
+	base := p.stack.n
 	for !p.atEnd() && p.peek() != '|' && p.peek() != ')' {
-		elements = append(elements, p.parseTerm())
+		p.stack.push(p.parseTerm())
 	}
-	switch len(elements) {
+	switch p.stack.n - base {
 	case 0:
 		return &Sequence{Elements: []Expression{}}
 	case 1:
-		return elements[0]
+		c, off := locate(base)
+		p.stack.n = base
+		return p.stack.chunks[c][off]
 	}
-	return &Sequence{Elements: elements}
+	return &Sequence{Elements: p.stack.pop(base)}
+}
+
+// termStack collects the terms of the sequences and the alternatives of the
+// disjunctions being parsed, each of which takes its entries off the top
+// before returning. Appending to a slice per sequence instead would grow a
+// long one by a quarter at a time, allocating about five times its final
+// size; the stack is kept in chunks that never move, so collecting n entries
+// allocates about twice their size: the chunks, which are reused, and the
+// exact-size slice each sequence keeps.
+type termStack struct {
+	chunks [][]Expression // chunks[i] has length chunkLen(i)
+	n      int            // entries on the stack
+}
+
+// Chunks grow from 4 entries to 256, so that a short pattern allocates
+// little.
+const (
+	firstChunks    = 6   // chunks of 4, 8, 16, 32, 64 and 128 entries
+	firstChunksLen = 252 // the entries they hold
+	chunkLenMax    = 256
+)
+
+func chunkLen(c int) int { return 4 << min(c, firstChunks) }
+
+// locate returns the chunk and offset of entry i.
+func locate(i int) (c, off int) {
+	if i >= firstChunksLen {
+		i -= firstChunksLen
+		return firstChunks + i/chunkLenMax, i % chunkLenMax
+	}
+	for i >= chunkLen(c) {
+		i -= chunkLen(c)
+		c++
+	}
+	return c, i
+}
+
+func (s *termStack) push(e Expression) {
+	c, off := locate(s.n)
+	if c == len(s.chunks) {
+		s.chunks = append(s.chunks, make([]Expression, chunkLen(c)))
+	}
+	s.chunks[c][off] = e
+	s.n++
+}
+
+// pop removes the entries from base on and returns them in a slice of exactly
+// their number.
+func (s *termStack) pop(base int) []Expression {
+	out := make([]Expression, s.n-base)
+	c, off := locate(base)
+	for i := range out {
+		if off == len(s.chunks[c]) {
+			c, off = c+1, 0
+		}
+		out[i] = s.chunks[c][off]
+		off++
+	}
+	s.n = base
+	return out
 }
 
 // -------------------------------------------------------------------- term
@@ -410,6 +496,11 @@ func (p *Parser) applyQuantifier(atom Expression) Expression {
 	if p.atEnd() {
 		return atom
 	}
+	switch p.peek() {
+	case '*', '+', '?', '{':
+	default:
+		return atom
+	}
 	q := &Quantifier{Body: atom, Greedy: true}
 	switch p.peek() {
 	case '*':
@@ -439,8 +530,6 @@ func (p *Parser) applyQuantifier(atom Expression) Expression {
 			}
 			q.Max = bounds[1].value
 		}
-	default:
-		return atom
 	}
 	if p.eat('?') {
 		q.Greedy = false
@@ -986,18 +1075,14 @@ func (p *Parser) propertyOfStrings(spec string, negated bool) *ClassStrings {
 	if !p.flags.UnicodeSets {
 		return nil
 	}
-	members, ok := vm.PropertyOfStrings(spec)
+	members, ok := vm.PropertyOfStringsRunes(spec)
 	if !ok {
 		return nil
 	}
 	if negated {
 		p.fail(`invalid property name: \P{%s}: a property of strings cannot be negated`, spec)
 	}
-	strs := make([][]rune, len(members))
-	for i, m := range members {
-		strs[i] = []rune(m)
-	}
-	return &ClassStrings{Strings: strs, Property: spec}
+	return &ClassStrings{Strings: members, Property: spec}
 }
 
 // -------------------------------------------------------- character classes
@@ -1387,34 +1472,32 @@ type nameSet map[string]struct{}
 // disjunction). It runs in linear time: a Disjunction unions its alternatives'
 // name sets without conflict, while a Sequence errors if two elements share a
 // name. (Materializing the cartesian product of all alternatives instead is
-// exponential — e.g. 30 nested (a|b) groups.)
+// exponential — e.g. 30 nested (a|b) groups.) A subtree without names yields
+// nil, so only named groups cost an allocation, and a set returned to a
+// caller belongs to it: merging grows the larger of two sets.
 func (p *Parser) pathNames(node Expression) (nameSet, error) {
 	switch n := node.(type) {
 	case *Disjunction:
-		result := nameSet{}
+		var result nameSet
 		for _, alt := range n.Alternatives {
 			s, err := p.pathNames(alt)
 			if err != nil {
 				return nil, err
 			}
 			// Names in different alternatives may coincide; just union them.
-			for k := range s {
-				result[k] = struct{}{}
-			}
+			result, _ = mergeNames(result, s, false)
 		}
 		return result, nil
 	case *Sequence:
-		result := nameSet{}
+		var result nameSet
 		for _, elem := range n.Elements {
 			s, err := p.pathNames(elem)
 			if err != nil {
 				return nil, err
 			}
-			for k := range s {
-				if _, dup := result[k]; dup {
-					return nil, fmt.Errorf("duplicate group name: %s", k)
-				}
-				result[k] = struct{}{}
+			var dup string
+			if result, dup = mergeNames(result, s, true); dup != "" {
+				return nil, fmt.Errorf("duplicate group name: %s", dup)
 			}
 		}
 		return result, nil
@@ -1428,11 +1511,11 @@ func (p *Parser) pathNames(node Expression) (nameSet, error) {
 		if _, dup := bodyNames[n.Name]; dup {
 			return nil, fmt.Errorf("duplicate group name: %s", n.Name)
 		}
-		result := nameSet{n.Name: struct{}{}}
-		for k := range bodyNames {
-			result[k] = struct{}{}
+		if bodyNames == nil {
+			bodyNames = nameSet{}
 		}
-		return result, nil
+		bodyNames[n.Name] = struct{}{}
+		return bodyNames, nil
 	case *NonCapturingGroup:
 		return p.pathNames(n.Body)
 	case *ModifierGroup:
@@ -1449,8 +1532,27 @@ func (p *Parser) pathNames(node Expression) (nameSet, error) {
 	case *Quantifier:
 		return p.pathNames(n.Body)
 	default:
-		return nameSet{}, nil
+		return nil, nil
 	}
+}
+
+// mergeNames returns the union of a and b, which it may build in either. With
+// checkDup it instead stops at a name in both, returning it.
+func mergeNames(a, b nameSet, checkDup bool) (nameSet, string) {
+	if len(a) < len(b) {
+		a, b = b, a
+	}
+	if checkDup {
+		for k := range b {
+			if _, dup := a[k]; dup {
+				return a, k
+			}
+		}
+	}
+	for k := range b {
+		a[k] = struct{}{}
+	}
+	return a, ""
 }
 
 // -------------------------------------------------------------- characters

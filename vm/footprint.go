@@ -115,3 +115,20 @@ func (s *sizer) charSet(cs *CharSet) {
 		s.charSet(it)
 	}
 }
+
+// FootprintBound bounds the Footprint of a Program built from an instruction
+// slice of capacity n, holding at most splits OpSplit instructions, whose
+// instructions own at most owned bytes as Footprint counts them. It saturates
+// rather than overflow.
+func FootprintBound(n, splits, owned int64) int64 {
+	b := memsize.Round(int64(unsafe.Sizeof(Program{})))
+	b = memsize.Add(b, memsize.Round(memsize.Mul(n, int64(unsafe.Sizeof(Instruction{})))))
+	b = memsize.Add(b, owned)
+	// The analysis: a first set per split target (two per split at most), and
+	// the per-instruction tables.
+	b = memsize.Add(b, memsize.Round(memsize.Mul(n, int64(unsafe.Sizeof((*firstSet)(nil))))))
+	b = memsize.Add(b, memsize.Mul(min(n, memsize.Mul(2, splits)), memsize.RoundNoScan(int64(unsafe.Sizeof(firstSet{})))))
+	b = memsize.Add(b, memsize.RoundNoScan(memsize.Mul(n, int64(unsafe.Sizeof(greedyLoop{})))))
+	b = memsize.Add(b, memsize.RoundNoScan(n))
+	return b
+}

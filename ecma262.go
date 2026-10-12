@@ -148,7 +148,9 @@ const (
 )
 
 type config struct {
-	syntax Syntax
+	syntax          Syntax
+	maxInstructions int
+	maxBytes        int64
 }
 
 // Option configures a Compile call.
@@ -158,6 +160,58 @@ type Option func(*config)
 // behavior. See Syntax.
 func WithSyntax(s Syntax) Option {
 	return func(c *config) { c.syntax = s }
+}
+
+// WithBudget bounds what Compile may spend on a pattern, so that a pattern
+// from untrusted input is refused before the cost is paid rather than after.
+// A pattern over budget is refused with an error wrapping ErrBudgetExceeded:
+//
+//   - maxInstructions caps the size of the compiled program (every pattern
+//     is held to compiler.MaxProgramSize regardless);
+//   - maxBytes caps memory. A pattern too long to parse within it is refused
+//     before it is parsed (see parser.AllocBound), and one whose compiled
+//     form could hold more is refused before it is compiled (see
+//     compiler.Bound). A Regexp compiled within the budget has a
+//     MemoryFootprint of at most maxBytes.
+//
+// A value of 0 or less leaves that part unbounded. Both checks use upper
+// bounds, which are exact for the instruction count except for v-mode
+// classes holding strings other than one property of strings' members, so
+// such a pattern may be refused near its budget although it would fit. In
+// the library's tests, a compile within a byte budget allocates in all,
+// garbage included, under three times the budget, not counting tables built
+// once per process (such as a property of strings' members).
+func WithBudget(maxInstructions int, maxBytes int64) Option {
+	return func(c *config) { c.maxInstructions, c.maxBytes = maxInstructions, maxBytes }
+}
+
+// ErrBudgetExceeded is wrapped by the error for a pattern refused because it
+// would cost more than the budget given to Compile with WithBudget. It wraps
+// ErrLimit.
+var ErrBudgetExceeded error = &limitError{msg: "pattern exceeds the budget given to Compile"}
+
+// limitError is a sentinel for a limit; it wraps ErrLimit.
+type limitError struct{ msg string }
+
+func (e *limitError) Error() string { return e.msg }
+func (e *limitError) Unwrap() error { return ErrLimit }
+
+// checkBudget refuses ast if compiling it could exceed cfg's budget.
+func (cfg *config) checkBudget(expr string, ast *parser.Pattern, names []string) error {
+	if cfg.maxInstructions <= 0 && cfg.maxBytes <= 0 {
+		return nil
+	}
+	cost, err := compiler.Bound(ast)
+	if err != nil {
+		return fmt.Errorf("compile error: %w", err)
+	}
+	if cfg.maxInstructions > 0 && cost.Instructions > cfg.maxInstructions {
+		return fmt.Errorf("%w: compiles to %d instructions, over the %d allowed", ErrBudgetExceeded, cost.Instructions, cfg.maxInstructions)
+	}
+	if n := memsize.Add(cost.Bytes, ownBytes(expr, names)); cfg.maxBytes > 0 && n > cfg.maxBytes {
+		return fmt.Errorf("%w: may hold %d bytes once compiled, over the %d allowed", ErrBudgetExceeded, n, cfg.maxBytes)
+	}
+	return nil
 }
 
 // Compile parses a regular expression and returns, if successful, a Regexp
@@ -172,6 +226,10 @@ func Compile(expr string, f flags.Flags, opts ...Option) (*Regexp, error) {
 	// reject the same inputs (u and v are mutually exclusive per ECMA-262).
 	if f.Has(flags.Unicode) && f.Has(flags.UnicodeSets) {
 		return nil, fmt.Errorf("incompatible flags: u and v")
+	}
+
+	if n := parser.AllocBound(len(expr)); cfg.maxBytes > 0 && n > cfg.maxBytes {
+		return nil, fmt.Errorf("%w: parsing %d bytes may allocate %d bytes, over the %d allowed", ErrBudgetExceeded, len(expr), n, cfg.maxBytes)
 	}
 
 	// Annex B leniencies apply only outside Unicode mode.
@@ -192,15 +250,19 @@ func Compile(expr string, f flags.Flags, opts ...Option) (*Regexp, error) {
 		return nil, fmt.Errorf("parse error: %w", err)
 	}
 
+	// Extract group names from AST, indexed by the parse-time group number so
+	// that len(names) == numGroups+1 always holds.
+	names := extractGroupNames(ast.Body, ast.NumGroups)
+
+	if err := cfg.checkBudget(expr, ast, names); err != nil {
+		return nil, err
+	}
+
 	// Compile to VM code
 	code, numGroups, err := compiler.Compile(ast)
 	if err != nil {
 		return nil, fmt.Errorf("compile error: %w", err)
 	}
-
-	// Extract group names from AST, indexed by the parse-time group number so
-	// that len(names) == numGroups+1 always holds.
-	names := extractGroupNames(ast.Body, numGroups)
 
 	return &Regexp{
 		expr:  expr,
@@ -1098,11 +1160,16 @@ func (re *Regexp) ProgramSize() int {
 // own a large class. It is computed on first use and is safe to call
 // concurrently.
 func (re *Regexp) MemoryFootprint() int64 {
-	n := re.prog.Footprint()
-	n = memsize.Add(n, memsize.Round(int64(unsafe.Sizeof(*re))))
-	n = memsize.Add(n, memsize.RoundNoScan(int64(len(re.expr))))
-	n = memsize.Add(n, memsize.Round(int64(cap(re.names))*int64(unsafe.Sizeof(""))))
-	for _, name := range re.names {
+	return memsize.Add(re.prog.Footprint(), ownBytes(re.expr, re.names))
+}
+
+// ownBytes is what a Regexp holds besides its program: itself, its source and
+// its group names.
+func ownBytes(expr string, names []string) int64 {
+	n := memsize.Round(int64(unsafe.Sizeof(Regexp{})))
+	n = memsize.Add(n, memsize.RoundNoScan(int64(len(expr))))
+	n = memsize.Add(n, memsize.Round(int64(cap(names))*int64(unsafe.Sizeof(""))))
+	for _, name := range names {
 		n = memsize.Add(n, memsize.RoundNoScan(int64(len(name))))
 	}
 	return n

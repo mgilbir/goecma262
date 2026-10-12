@@ -242,3 +242,20 @@ func ExampleRegexp_MemoryFootprint() {
 	// 13 100302
 	// true
 }
+
+// A pattern from untrusted input can be refused by what it would cost before
+// that cost is paid: (a{1000}){1000} would compile to a million instructions.
+func ExampleWithBudget() {
+	budget := ecma262.WithBudget(10_000, 4<<20) // instructions, bytes
+	for _, p := range []string{`^[a-z]+@[a-z]+\.com$`, `(a{1000}){1000}`} {
+		re, err := ecma262.Compile(p, flags.Flags(0), budget)
+		if errors.Is(err, ecma262.ErrBudgetExceeded) {
+			fmt.Println(p, "refused")
+			continue
+		}
+		fmt.Println(p, "compiled to", re.ProgramSize(), "instructions")
+	}
+	// Output:
+	// ^[a-z]+@[a-z]+\.com$ compiled to 16 instructions
+	// (a{1000}){1000} refused
+}

@@ -287,6 +287,50 @@ errors also wraps `ErrLimit` (`parser.ErrLimit`, re-exported by the compiler
 and the root package): a caller tells a pattern the library refuses from an
 invalid one with `errors.Is`, without reading the message.
 
+### Knowing the cost before paying it
+
+`compiler.Bound` walks the AST as `compiler.Compile` does, but visits a
+quantifier's body once and multiplies, so it takes time linear in the AST
+whatever the program's size. It counts instructions exactly: its rules mirror
+the compiler's node by node, and `TestBoundMatchesCompileOnTest262`,
+`TestBoundMatchesCompileOnRandomPatterns` and `FuzzBound` check it against
+real programs. The exception is a v-mode class whose strings are not exactly
+one property of strings' members (`[\q{ab|cd}]`, `[\p{RGI_Emoji}--\q{x}]`):
+counting its trie would mean evaluating the set, so Bound bounds it by the
+strings' lengths and reports the count as inexact. A property's own trie is
+measured once per process and cached.
+
+`Compile` calls `Bound` first. An exact count over `MaxProgramSize` is
+refused before anything is emitted. An inexact one is made exact by
+evaluating the pattern's class sets first, which compiling needs anyway (the
+compiler keeps them), and measuring their tries. Either way the instruction
+slice is allocated once, at its final size, and the limit is exact: a program
+of `MaxProgramSize` instructions compiles and one more does not.
+
+A counted quantifier compiles its body once per copy. What does not depend on
+where the code goes is computed once and shared by the copies: a class's atoms
+(`([a-z0-9]{1000}){190}` used to hold 190,000 copies of 36 atoms, 425 MB), a
+lookbehind body's reversal, and a v-mode class's evaluation and trie. The
+members of a property of strings are fixed, so their code points
+(`vm.PropertyOfStringsRunes`), their reversal and their evaluation as a set
+are built once per process and shared read-only by every pattern, and set
+operations recognise a property named again (`[\p{RGI_Emoji}\p{RGI_Emoji}]`,
+`[\p{RGI_Emoji}--\p{RGI_Emoji}]`) without going through its strings.
+
+Parsing allocates at most `parser.AllocBound(len(pattern))`, 1 KiB plus 128
+bytes per byte (`TestParseAllocBound` checks every construct; the most
+measured is about 78). Sequences and alternatives are collected on one
+chunked stack and copied out at their exact length, rather than appended to
+a slice each, which allocated about five times their size.
+
+`ecma262.WithBudget` puts these together: a pattern is refused before parsing
+if `AllocBound` exceeds the byte budget, and before compiling if `Bound` puts
+its instruction count or its `MemoryFootprint` over the budget.
+`TestBudgetBoundsCompileAllocation` checks that a compile within a byte
+budget allocates, garbage included, at most three times it.
+
+### What a compiled pattern holds
+
 The instruction count does not bound memory by itself: an instruction may own
 data (class atoms, a class set's `vm.CharSet`, a trie node's `vm.RuneSwitch`).
 `vm.Program.Footprint` adds up what a program holds, counting an object
