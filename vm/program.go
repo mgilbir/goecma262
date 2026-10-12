@@ -29,7 +29,7 @@ type Program struct {
 	dir       []bool
 	first     []*firstSet  // indexed by pc; set for split targets and loop exits
 	loops     []greedyLoop // indexed by pc; ok for recognised loops
-	leafCache map[int]*[4]uint64
+	leafCache map[leafKey]*[4]uint64
 
 	footprintOnce sync.Once
 	footprint     int64
@@ -81,7 +81,7 @@ func NewProgram(code []Instruction, ignoreCase, multiline, dotAll, unicode, back
 		dotAll:     dotAll,
 		unicode:    unicode,
 		backward:   backward,
-		leafCache:  make(map[int]*[4]uint64),
+		leafCache:  make(map[leafKey]*[4]uint64),
 	}
 	p.first = make([]*firstSet, len(code))
 	p.loops = make([]greedyLoop, len(code))
@@ -362,10 +362,11 @@ func (p *Program) asciiOnly(inst *Instruction) bool {
 // a non-ASCII rune (or decodes to U+FFFD), so those bits are set unless the
 // instruction is ASCII-only.
 func (p *Program) leafBytes(pc int) *[4]uint64 {
-	if s, ok := p.leafCache[pc]; ok {
+	inst := &p.code[pc]
+	key := p.leafKeyOf(inst)
+	if s, ok := p.leafCache[key]; ok {
 		return s
 	}
-	inst := &p.code[pc]
 	var s [4]uint64
 	if lo, ok := p.asciiSetFast(inst); ok {
 		s[0], s[1] = lo[0], lo[1]
@@ -375,8 +376,32 @@ func (p *Program) leafBytes(pc int) *[4]uint64 {
 	if !p.asciiOnly(inst) {
 		s[2], s[3] = ^uint64(0), ^uint64(0)
 	}
-	p.leafCache[pc] = &s
+	p.leafCache[key] = &s
 	return &s
+}
+
+// leafKey is what decides an instruction's leafBytes: the copies of a
+// quantifier's body share their class data, so a program of many copies of a
+// class works out its bytes once, where computing them for each copy (by
+// matching every ASCII rune) dominated compiling such a program.
+type leafKey struct {
+	op                 Opcode
+	ignoreCase, dotAll bool // in effect at the instruction
+	negate             bool
+	char               rune
+	prop               string
+	class              *ClassAtom // the atoms, which are never modified
+	classLen           int
+	set                *CharSet
+	sw                 *RuneSwitch
+}
+
+func (p *Program) leafKeyOf(inst *Instruction) leafKey {
+	return leafKey{
+		op: inst.Op, ignoreCase: p.ignoreCaseAt(inst), dotAll: p.dotAllAt(inst), negate: inst.Negate,
+		char: inst.Char, prop: inst.Prop, class: unsafe.SliceData(inst.Class), classLen: len(inst.Class),
+		set: inst.Set, sw: inst.Switch,
+	}
 }
 
 // asciiSetSlow returns the ASCII runes the single-rune instruction accepts, by

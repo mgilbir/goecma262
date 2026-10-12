@@ -102,3 +102,34 @@ func singleRuneInstructions() []Instruction {
 	}
 	return insts
 }
+
+// TestLeafBytesCacheKeepsInstructionsApart computes the leaf bytes of every
+// single-rune instruction in one program, whose cache is shared by
+// instructions with the same class data but different negation or flags,
+// and checks each against the bytes computed alone.
+func TestLeafBytesCacheKeepsInstructionsApart(t *testing.T) {
+	insts := singleRuneInstructions()
+	insts = append(insts,
+		Instruction{Op: OpUnicodeProp, Prop: "Lu"}, Instruction{Op: OpNotUnicodeProp, Prop: "Lu"},
+		Instruction{Op: OpUnicodeProp, Prop: "Nd"}, Instruction{Op: OpNotUnicodeProp, Prop: "Nd"},
+		Instruction{Op: OpClassSet, Set: NewCharSetRanges([]RuneRange{{'a', 'c'}})},
+		Instruction{Op: OpClassSet, Set: NewCharSetRanges([]RuneRange{{'x', 'z'}})},
+		Instruction{Op: OpRuneSwitch, Switch: &RuneSwitch{Keys: []rune{'a'}, Targets: []int{0}}},
+		Instruction{Op: OpRuneSwitch, Switch: &RuneSwitch{Keys: []rune{'q'}, Targets: []int{0}}},
+		Instruction{Op: OpUnicodeProp, Prop: "Lu", Mode: ModeSet | ModeIgnoreCase},
+		Instruction{Op: OpNotUnicodeProp, Prop: "Lu", Mode: ModeSet | ModeIgnoreCase})
+	for mask := 0; mask < 16; mask++ {
+		p := testProgram(mask)
+		p.code = insts
+		p.leafCache = make(map[leafKey]*[4]uint64)
+		for pc := range insts {
+			got := *p.leafBytes(pc)
+			alone := testProgram(mask)
+			alone.code = insts[pc : pc+1]
+			alone.leafCache = make(map[leafKey]*[4]uint64)
+			if want := *alone.leafBytes(0); got != want {
+				t.Errorf("flags %04b, %s %v negate %v mode %04b: %x in the program, %x alone", mask, insts[pc], fmt.Sprint(insts[pc].Class), insts[pc].Negate, insts[pc].Mode, got, want)
+			}
+		}
+	}
+}
