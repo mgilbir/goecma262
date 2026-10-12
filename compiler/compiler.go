@@ -2,6 +2,7 @@
 package compiler
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/mgilbir/goecma262/parser"
@@ -14,6 +15,46 @@ const (
 	MaxNestingDepth     = 200     // Max AST nesting depth during compilation
 	MaxProgramSize      = 200_000 // Max total emitted instructions
 )
+
+// Errors for the compilation limits. Each wraps ErrLimit, so
+// errors.Is(err, ErrLimit) tells a pattern this implementation refuses from an
+// invalid one.
+var (
+	// ErrLimit is parser.ErrLimit.
+	ErrLimit = parser.ErrLimit
+	// ErrNestingTooDeep is parser.ErrNestingTooDeep: the AST nests more than
+	// MaxNestingDepth deep.
+	ErrNestingTooDeep = parser.ErrNestingTooDeep
+	// ErrProgramTooLarge: the program would exceed MaxProgramSize
+	// instructions.
+	ErrProgramTooLarge error = &limitError{msg: "compiled program too large"}
+	// ErrQuantifierTooLarge: a quantifier bound exceeds MaxQuantifierRepeat.
+	ErrQuantifierTooLarge error = &limitError{msg: "quantifier bound too large"}
+)
+
+// limitError is a sentinel for one compilation limit; it wraps ErrLimit.
+type limitError struct{ msg string }
+
+func (e *limitError) Error() string { return e.msg }
+func (e *limitError) Unwrap() error { return ErrLimit }
+
+// limitf returns an error with the given message that wraps the limit
+// sentinel err.
+func limitf(err error, format string, args ...any) error {
+	return &wrapped{msg: fmt.Sprintf(format, args...), err: err}
+}
+
+type wrapped struct {
+	msg string
+	err error
+}
+
+func (e *wrapped) Error() string { return e.msg }
+func (e *wrapped) Unwrap() error { return e.err }
+
+func errProgramTooLarge() error {
+	return limitf(ErrProgramTooLarge, "compiled program too large (limit: %d instructions)", MaxProgramSize)
+}
 
 // Compiler compiles regex AST to VM bytecode
 type Compiler struct {
@@ -28,29 +69,104 @@ type Compiler struct {
 	ignoreCase, multiline, dotAll bool
 	mode                          vm.Mode
 	unicodeSets                   bool
-	// classSets memoizes evaluated v-mode classes, which a counted quantifier
-	// compiles once per copy.
-	classSets map[*parser.ClassSetExpression]classSetValue
+	// A counted quantifier compiles its body once per copy, and the copies
+	// share what does not depend on where the code is: the atoms of a class,
+	// the reversal of a lookbehind body, and the evaluation and trie of a
+	// v-mode class. Without the sharing, ([a-z0-9]{1000}){190} held 190,000
+	// copies of the same atoms.
+	classAtoms map[*parser.CharacterClass][]vm.ClassAtom
+	reversed   map[parser.Expression]parser.Expression
+	classSets  map[*parser.ClassSetExpression]*classSetValue
+
+	poll poller
+}
+
+// poller polls a context every pollEvery units of work, and remembers why
+// the work must stop.
+type poller struct {
+	ctx   context.Context // nil if it cannot be cancelled
+	ticks int
+	err   error
+}
+
+// pollEvery is how much compiling work separates two polls of the context.
+const pollEvery = 1024
+
+// tick counts a unit of work, returning an error once the context is done.
+func (p *poller) tick() error {
+	if p.ctx == nil || p.err != nil {
+		return p.err
+	}
+	if p.ticks--; p.ticks > 0 {
+		return nil
+	}
+	p.ticks = pollEvery
+	if err := p.ctx.Err(); err != nil {
+		p.err = fmt.Errorf("compiling interrupted: %w", err)
+	}
+	return p.err
 }
 
 // Compile compiles a regex pattern AST to VM instructions.
 // The returned group count is the parse-time total (pattern.NumGroups), so it
 // includes groups that a {0} quantifier compiles zero times, and never counts
 // a group more than once even inside a counted quantifier.
+//
+// MaxQuantifierRepeat caps a single quantifier, but nested quantifiers
+// multiply: ((a{100}){100}){100} is a million instructions. So the size of
+// the program is bounded by MaxProgramSize too. It is known before any code is
+// emitted (see Bound), so a pattern over the limit is refused before the cost
+// is paid, and the instruction slice is allocated once at its final size.
 func Compile(pattern *parser.Pattern) ([]vm.Instruction, int, error) {
+	return CompileContext(context.Background(), pattern)
+}
+
+// CompileContext is Compile, but gives up when ctx is done, returning an error
+// that wraps ctx.Err(). It polls ctx as it works, so it returns soon after ctx
+// is done, whatever the size of the program.
+func CompileContext(ctx context.Context, pattern *parser.Pattern) ([]vm.Instruction, int, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, 0, fmt.Errorf("compiling interrupted: %w", err)
+	}
+	cost, err := Bound(pattern)
+	if err != nil {
+		return nil, 0, err
+	}
+	if cost.Exact && cost.Instructions > MaxProgramSize {
+		return nil, 0, errProgramTooLarge()
+	}
 	c := &Compiler{
-		code:        make([]vm.Instruction, 0),
 		numGroups:   pattern.NumGroups,
 		ignoreCase:  pattern.Flags.IgnoreCase,
 		multiline:   pattern.Flags.Multiline,
 		dotAll:      pattern.Flags.DotAll,
 		unicodeSets: pattern.Flags.UnicodeSets,
 	}
+	if ctx.Done() != nil {
+		c.poll = poller{ctx: ctx, ticks: pollEvery}
+	}
+	n := cost.Instructions
+	if !cost.Exact {
+		// Bound bounds a class set's strings by their lengths, which may be
+		// far over (a subtraction may remove them all). Compiling evaluates
+		// the sets anyway, so do it first and count their tries exactly; the
+		// code then reuses them.
+		exact, err := (&bounder{c: c, ignoreCase: c.ignoreCase, unicodeSets: c.unicodeSets, exact: true}).node(pattern.Body)
+		if err != nil {
+			return nil, 0, err
+		}
+		c.ignoreCase = pattern.Flags.IgnoreCase
+		if exact.instructions+3 > MaxProgramSize {
+			return nil, 0, errProgramTooLarge()
+		}
+		n = int(exact.instructions + 3)
+	}
+	c.code = make([]vm.Instruction, 0, n)
 
 	// Emit save instructions for group 0 (full match)
 	c.emit(vm.Instruction{Op: vm.OpSaveStart, A: 0})
 
-	err := c.compileNode(pattern.Body)
+	err = c.compileNode(pattern.Body)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -104,15 +220,12 @@ func (c *Compiler) patchJump(idx, target int) {
 }
 
 func (c *Compiler) compileNode(node parser.Node) error {
-	// Bound total code size. MaxQuantifierRepeat caps a single quantifier, but
-	// nested quantifiers multiply (e.g. ((a{100}){100}){100} ~ 10^6 instrs), so
-	// the product must be bounded independently to prevent memory blowup.
-	if len(c.code) > MaxProgramSize {
-		return fmt.Errorf("compiled program too large (limit: %d instructions)", MaxProgramSize)
+	if err := c.poll.tick(); err != nil {
+		return err
 	}
 	c.depth++
 	if c.depth > MaxNestingDepth {
-		return fmt.Errorf("pattern too deeply nested (limit: %d)", MaxNestingDepth)
+		return limitf(ErrNestingTooDeep, "pattern too deeply nested (limit: %d)", MaxNestingDepth)
 	}
 	defer func() { c.depth-- }()
 
@@ -271,6 +384,10 @@ func (c *Compiler) compileLiteral(l *parser.Literal) error {
 }
 
 func (c *Compiler) compileCharacterClass(cc *parser.CharacterClass) error {
+	if atoms, ok := c.classAtoms[cc]; ok {
+		c.emit(vm.Instruction{Op: vm.OpClass, Class: atoms, Negate: cc.Negated})
+		return nil
+	}
 	classAtoms := make([]vm.ClassAtom, 0, len(cc.Atoms))
 	for _, atom := range cc.Atoms {
 		switch a := atom.(type) {
@@ -303,6 +420,10 @@ func (c *Compiler) compileCharacterClass(cc *parser.CharacterClass) error {
 		}
 	}
 
+	if c.classAtoms == nil {
+		c.classAtoms = make(map[*parser.CharacterClass][]vm.ClassAtom)
+	}
+	c.classAtoms[cc] = classAtoms
 	c.emit(vm.Instruction{Op: vm.OpClass, Class: classAtoms, Negate: cc.Negated})
 	return nil
 }
@@ -310,10 +431,10 @@ func (c *Compiler) compileCharacterClass(cc *parser.CharacterClass) error {
 func (c *Compiler) compileQuantifier(q *parser.Quantifier) error {
 	// Enforce complexity limits
 	if q.Min > MaxQuantifierRepeat {
-		return fmt.Errorf("quantifier minimum %d exceeds limit %d", q.Min, MaxQuantifierRepeat)
+		return limitf(ErrQuantifierTooLarge, "quantifier minimum %d exceeds limit %d", q.Min, MaxQuantifierRepeat)
 	}
 	if q.Max > MaxQuantifierRepeat {
-		return fmt.Errorf("quantifier maximum %d exceeds limit %d", q.Max, MaxQuantifierRepeat)
+		return limitf(ErrQuantifierTooLarge, "quantifier maximum %d exceeds limit %d", q.Max, MaxQuantifierRepeat)
 	}
 	if q.Max == 0 {
 		// {0} and {0,0}: the body never runs (ECMA-262 RepeatMatcher step 1).
@@ -601,7 +722,7 @@ func (c *Compiler) compileLookbehind(l *parser.Lookbehind) error {
 	// Compile the body in reversed order; the VM runs the lookbehind sub-VM
 	// backward, so a reversed program matched right-to-left reproduces ECMA-262
 	// lookbehind evaluation (including capture-group and backreference order).
-	err := c.compileNode(reverseExpr(l.Body))
+	err := c.compileNode(c.reverseBody(l.Body))
 	if err != nil {
 		return err
 	}
@@ -620,7 +741,7 @@ func (c *Compiler) compileNegativeLookbehind(l *parser.NegativeLookbehind) error
 
 	bodyStart := len(c.code)
 
-	err := c.compileNode(reverseExpr(l.Body))
+	err := c.compileNode(c.reverseBody(l.Body))
 	if err != nil {
 		return err
 	}
@@ -634,38 +755,51 @@ func (c *Compiler) compileNegativeLookbehind(l *parser.NegativeLookbehind) error
 	return nil
 }
 
+// reverseBody returns reverseExpr of a lookbehind body, once per body.
+func (c *Compiler) reverseBody(body parser.Expression) parser.Expression {
+	if r, ok := c.reversed[body]; ok {
+		return r
+	}
+	r := c.reverseExpr(body)
+	if c.reversed == nil {
+		c.reversed = make(map[parser.Expression]parser.Expression)
+	}
+	c.reversed[body] = r
+	return r
+}
+
 // reverseExpr returns a structurally reversed copy of e for right-to-left
 // lookbehind compilation: sequences are emitted last-element-first and group
 // bodies are reversed, while capture indices are preserved. Single-width atoms
 // (literals, classes, escapes, anchors, backreferences) are unchanged, and
 // nested lookarounds are treated as atomic — they carry their own direction and
 // reverse (or not) their own bodies when compiled.
-func reverseExpr(e parser.Expression) parser.Expression {
+func (c *Compiler) reverseExpr(e parser.Expression) parser.Expression {
 	switch n := e.(type) {
 	case *parser.Sequence:
 		rev := make([]parser.Expression, len(n.Elements))
 		for i, el := range n.Elements {
-			rev[len(n.Elements)-1-i] = reverseExpr(el)
+			rev[len(n.Elements)-1-i] = c.reverseExpr(el)
 		}
 		return &parser.Sequence{Elements: rev}
 	case *parser.Disjunction:
 		alts := make([]parser.Expression, len(n.Alternatives))
 		for i, a := range n.Alternatives {
-			alts[i] = reverseExpr(a)
+			alts[i] = c.reverseExpr(a)
 		}
 		return &parser.Disjunction{Alternatives: alts}
 	case *parser.Quantifier:
-		return &parser.Quantifier{Min: n.Min, Max: n.Max, Greedy: n.Greedy, Body: reverseExpr(n.Body)}
+		return &parser.Quantifier{Min: n.Min, Max: n.Max, Greedy: n.Greedy, Body: c.reverseExpr(n.Body)}
 	case *parser.Group:
-		return &parser.Group{Index: n.Index, Body: reverseExpr(n.Body)}
+		return &parser.Group{Index: n.Index, Body: c.reverseExpr(n.Body)}
 	case *parser.NamedGroup:
-		return &parser.NamedGroup{Index: n.Index, Name: n.Name, Body: reverseExpr(n.Body)}
+		return &parser.NamedGroup{Index: n.Index, Name: n.Name, Body: c.reverseExpr(n.Body)}
 	case *parser.NonCapturingGroup:
-		return &parser.NonCapturingGroup{Body: reverseExpr(n.Body)}
+		return &parser.NonCapturingGroup{Body: c.reverseExpr(n.Body)}
 	case *parser.ModifierGroup:
-		return &parser.ModifierGroup{Add: n.Add, Remove: n.Remove, Body: reverseExpr(n.Body)}
+		return &parser.ModifierGroup{Add: n.Add, Remove: n.Remove, Body: c.reverseExpr(n.Body)}
 	case *parser.ClassSetExpression:
-		return reverseClassSet(n)
+		return c.reverseClassSet(n)
 	default:
 		return e
 	}

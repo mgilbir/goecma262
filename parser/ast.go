@@ -157,6 +157,8 @@ func (c *ClassSetRange) classSetNode() {}
 // ClassStrings is a set of strings: a \q{...} string disjunction, or the
 // members of a property of strings (Property is then its name). A string of
 // one code point denotes that character, and the empty string may be a member.
+// For a property, Strings is the table vm.PropertyOfStringsRunes shares
+// between every pattern that names it, so Strings must not be modified.
 type ClassStrings struct {
 	Strings  [][]rune
 	Property string

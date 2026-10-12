@@ -1,6 +1,12 @@
 package vm
 
-import "unsafe"
+import (
+	"context"
+	"fmt"
+	"slices"
+	"sync"
+	"unsafe"
+)
 
 // Program is the read-only analysis of a compiled instruction slice for one
 // flag configuration. The VM uses it to execute without a backtracking entry
@@ -26,7 +32,10 @@ type Program struct {
 	dir       []bool
 	first     []*firstSet  // indexed by pc; set for split targets and loop exits
 	loops     []greedyLoop // indexed by pc; ok for recognised loops
-	leafCache map[int]*[4]uint64
+	leafCache map[leafKey]*[4]uint64
+
+	footprintOnce sync.Once
+	footprint     int64
 }
 
 // firstSet over-approximates what an execution starting at some pc can do
@@ -68,6 +77,21 @@ const firstSetNodeLimit = 64
 // NewProgram analyses code for the given flags. backward is the direction the
 // top-level program runs in (false for every program the compiler emits).
 func NewProgram(code []Instruction, ignoreCase, multiline, dotAll, unicode, backward bool) *Program {
+	p, _ := NewProgramContext(context.Background(), code, ignoreCase, multiline, dotAll, unicode, backward)
+	return p
+}
+
+// NewProgramContext is NewProgram, but gives up when ctx is done, returning
+// an error that wraps ctx.Err(). The analysis takes time linear in the
+// program, and polls ctx as it goes.
+func NewProgramContext(ctx context.Context, code []Instruction, ignoreCase, multiline, dotAll, unicode, backward bool) (*Program, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("analysing the program interrupted: %w", err)
+	}
+	poll := &analysisPoll{}
+	if ctx.Done() != nil {
+		poll.ctx = ctx
+	}
 	p := &Program{
 		code:       code,
 		ignoreCase: ignoreCase,
@@ -75,7 +99,7 @@ func NewProgram(code []Instruction, ignoreCase, multiline, dotAll, unicode, back
 		dotAll:     dotAll,
 		unicode:    unicode,
 		backward:   backward,
-		leafCache:  make(map[int]*[4]uint64),
+		leafCache:  make(map[leafKey]*[4]uint64),
 	}
 	p.first = make([]*firstSet, len(code))
 	p.loops = make([]greedyLoop, len(code))
@@ -95,10 +119,10 @@ func NewProgram(code []Instruction, ignoreCase, multiline, dotAll, unicode, back
 	if !optimize {
 		p.exact = true
 		p.leafCache = nil
-		return p
+		return p, nil
 	}
 	p.computeDirections()
-	p.exact = hasBackref(code) || hasEpsilonCycle(code) || tooManyMarks
+	p.exact = hasBackref(code) || hasEpsilonCycle(code, poll) || tooManyMarks
 	p.anchored = !backward && len(code) > 1 &&
 		code[0].Op == OpSaveStart && code[0].A == 0 && code[1].Op == OpStartLine && !p.multilineAt(&code[1])
 
@@ -109,6 +133,9 @@ func NewProgram(code []Instruction, ignoreCase, multiline, dotAll, unicode, back
 		}
 	}
 	for pc := range code {
+		if !poll.tick() {
+			break
+		}
 		if code[pc].Op != OpSplit {
 			continue
 		}
@@ -128,7 +155,30 @@ func NewProgram(code []Instruction, ignoreCase, multiline, dotAll, unicode, back
 		}
 	}
 	p.leafCache = nil // only needed during construction; keeps Program immutable
-	return p
+	if poll.err != nil {
+		return nil, poll.err
+	}
+	return p, nil
+}
+
+// analysisPoll polls a context every so many units of analysis.
+type analysisPoll struct {
+	ctx context.Context // nil if it cannot be cancelled
+	n   int
+	err error
+}
+
+// tick counts a unit of work, reporting whether the analysis may go on.
+func (a *analysisPoll) tick() bool {
+	if a.ctx == nil || a.err != nil {
+		return a.err == nil
+	}
+	if a.n++; a.n%1024 == 0 {
+		if err := a.ctx.Err(); err != nil {
+			a.err = fmt.Errorf("analysing the program interrupted: %w", err)
+		}
+	}
+	return a.err == nil
 }
 
 // matches reports whether p was built for exactly this configuration.
@@ -195,12 +245,11 @@ func (p *Program) computeDirections() {
 			spans = append(spans, span{inst.A, inst.B, inst.Op == OpLookbehind || inst.Op == OpNegLookbehind})
 		}
 	}
-	// Insertion sort by decreasing length; lookaround counts are small.
-	for i := 1; i < len(spans); i++ {
-		for j := i; j > 0 && spans[j].b-spans[j].a > spans[j-1].b-spans[j-1].a; j-- {
-			spans[j], spans[j-1] = spans[j-1], spans[j]
-		}
-	}
+	// By decreasing length. A counted quantifier can make tens of thousands
+	// of lookarounds, so this must not be quadratic (an insertion sort took
+	// a second over (?:(?:(?=a)){5000}){5}(?:(?:(?=ab)){5000}){5}). Spans of
+	// equal length are disjoint, so their order does not matter.
+	slices.SortStableFunc(spans, func(x, y span) int { return (y.b - y.a) - (x.b - x.a) })
 	for _, s := range spans {
 		for pc := s.a; pc < s.b; pc++ {
 			p.dir[pc] = s.back
@@ -249,7 +298,7 @@ func epsilonSuccs(code []Instruction, pc int, out []int) []int {
 // subtree known to fail. The compiler guards every loop whose body can match
 // empty with a progress check (see epsilonSuccs), so this holds only for
 // hand-built programs.
-func hasEpsilonCycle(code []Instruction) bool {
+func hasEpsilonCycle(code []Instruction, poll *analysisPoll) bool {
 	const (
 		white = iota
 		grey
@@ -268,6 +317,9 @@ func hasEpsilonCycle(code []Instruction) bool {
 		stack := []item{{pc: root, succs: epsilonSuccs(code, root, nil)}}
 		color[root] = grey
 		for len(stack) > 0 {
+			if !poll.tick() {
+				return false
+			}
 			top := &stack[len(stack)-1]
 			if top.next == len(top.succs) {
 				color[top.pc] = black
@@ -356,10 +408,11 @@ func (p *Program) asciiOnly(inst *Instruction) bool {
 // a non-ASCII rune (or decodes to U+FFFD), so those bits are set unless the
 // instruction is ASCII-only.
 func (p *Program) leafBytes(pc int) *[4]uint64 {
-	if s, ok := p.leafCache[pc]; ok {
+	inst := &p.code[pc]
+	key := p.leafKeyOf(inst)
+	if s, ok := p.leafCache[key]; ok {
 		return s
 	}
-	inst := &p.code[pc]
 	var s [4]uint64
 	if lo, ok := p.asciiSetFast(inst); ok {
 		s[0], s[1] = lo[0], lo[1]
@@ -369,8 +422,32 @@ func (p *Program) leafBytes(pc int) *[4]uint64 {
 	if !p.asciiOnly(inst) {
 		s[2], s[3] = ^uint64(0), ^uint64(0)
 	}
-	p.leafCache[pc] = &s
+	p.leafCache[key] = &s
 	return &s
+}
+
+// leafKey is what decides an instruction's leafBytes: the copies of a
+// quantifier's body share their class data, so a program of many copies of a
+// class works out its bytes once, where computing them for each copy (by
+// matching every ASCII rune) dominated compiling such a program.
+type leafKey struct {
+	op                 Opcode
+	ignoreCase, dotAll bool // in effect at the instruction
+	negate             bool
+	char               rune
+	prop               string
+	class              *ClassAtom // the atoms, which are never modified
+	classLen           int
+	set                *CharSet
+	sw                 *RuneSwitch
+}
+
+func (p *Program) leafKeyOf(inst *Instruction) leafKey {
+	return leafKey{
+		op: inst.Op, ignoreCase: p.ignoreCaseAt(inst), dotAll: p.dotAllAt(inst), negate: inst.Negate,
+		char: inst.Char, prop: inst.Prop, class: unsafe.SliceData(inst.Class), classLen: len(inst.Class),
+		set: inst.Set, sw: inst.Switch,
+	}
 }
 
 // asciiSetSlow returns the ASCII runes the single-rune instruction accepts, by

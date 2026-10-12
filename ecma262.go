@@ -27,6 +27,13 @@
 //     stop at that point. Use the Err forms whenever the input or the pattern
 //     is untrusted.
 //
+// SetMaxSteps and SetMaxMemory replace the default budget with fixed limits.
+// To bound an operation in time instead, or as well, match with a copy made by
+// WithContext: its operations stop once the context is done, reporting it as
+// they report an exceeded budget, but with an error wrapping the context's
+// rather than ErrStepLimit. CompileContext does the same for compiling, and
+// WithBudget bounds what compiling may cost before it is paid.
+//
 // # Characters above U+FFFF
 //
 // Without the u or v flag, ECMA-262 matches a string as a sequence of UTF-16
@@ -40,7 +47,9 @@
 // string cannot hold half a pair, and the position between them is no byte
 // offset. What must be expressible depends on what a method returns:
 //
-//   - positions (the *Index methods) must not fall between two halves;
+//   - positions (the *Index methods) must not fall between two halves; the
+//     *Positions methods instead report such a position as SetLastIndex
+//     does, for callers whose strings can hold half a pair;
 //   - strings (FindString, FindAllString, FindStringSubmatch, Split, ...) must
 //     not hold half a pair, so an empty match between the halves is "";
 //   - the result of a replacement must not hold half a pair; as in JavaScript,
@@ -54,6 +63,7 @@
 package ecma262
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -61,9 +71,11 @@ import (
 	"strings"
 	"unicode/utf16"
 	"unicode/utf8"
+	"unsafe"
 
 	"github.com/mgilbir/goecma262/compiler"
 	"github.com/mgilbir/goecma262/flags"
+	"github.com/mgilbir/goecma262/internal/memsize"
 	"github.com/mgilbir/goecma262/parser"
 	"github.com/mgilbir/goecma262/vm"
 )
@@ -80,6 +92,26 @@ var ErrStepLimit = vm.ErrStepLimit
 // produce one: /^./ matches just the first half of "😀". See the package
 // documentation for which results each method must express.
 var ErrSurrogateSplit = errors.New("ecma262: result splits a character into UTF-16 surrogate halves")
+
+// Compile refuses a pattern that exceeds one of this implementation's limits
+// with an error wrapping one of the following, each of which wraps ErrLimit.
+// ECMA-262 has none of these limits, so such a pattern is valid JavaScript:
+// errors.Is(err, ErrLimit) separates "the library refused" from "the pattern
+// is invalid" (a SyntaxError in JavaScript).
+var (
+	// ErrLimit is wrapped by every compile error caused by a limit. It is
+	// parser.ErrLimit.
+	ErrLimit = parser.ErrLimit
+	// ErrNestingTooDeep: the pattern nests more than 200 levels deep.
+	ErrNestingTooDeep = parser.ErrNestingTooDeep
+	// ErrQuantifierTooLarge: a quantifier bound exceeds 10,000, as in
+	// a{10001}.
+	ErrQuantifierTooLarge = compiler.ErrQuantifierTooLarge
+	// ErrProgramTooLarge: the pattern compiles to more than 200,000
+	// instructions, as nested counted quantifiers such as (a{1000}){1000}
+	// do.
+	ErrProgramTooLarge = compiler.ErrProgramTooLarge
+)
 
 // Regexp is the representation of a compiled ECMA-262 regular expression.
 // Without the g or y flag it is safe for concurrent use by multiple
@@ -102,6 +134,8 @@ type Regexp struct {
 	global     bool
 	sticky     bool
 	maxSteps   int
+	maxMemory  int
+	ctx        context.Context // see WithContext; nil for none
 
 	// lastIndex is the starting position for the next match when using g or y flags.
 	// It is set by SetLastIndex and used by stateful match operations.
@@ -126,7 +160,9 @@ const (
 )
 
 type config struct {
-	syntax Syntax
+	syntax          Syntax
+	maxInstructions int
+	maxBytes        int64
 }
 
 // Option configures a Compile call.
@@ -138,9 +174,69 @@ func WithSyntax(s Syntax) Option {
 	return func(c *config) { c.syntax = s }
 }
 
+// WithBudget bounds what Compile may spend on a pattern, so that a pattern
+// from untrusted input is refused before the cost is paid rather than after.
+// A pattern over budget is refused with an error wrapping ErrBudgetExceeded:
+//
+//   - maxInstructions caps the size of the compiled program (every pattern
+//     is held to compiler.MaxProgramSize regardless);
+//   - maxBytes caps memory. A pattern too long to parse within it is refused
+//     before it is parsed (see parser.AllocBound), and one whose compiled
+//     form could hold more is refused before it is compiled (see
+//     compiler.Bound). A Regexp compiled within the budget has a
+//     MemoryFootprint of at most maxBytes.
+//
+// A value of 0 or less leaves that part unbounded. Both checks use upper
+// bounds, which are exact for the instruction count except for v-mode
+// classes holding strings other than one property of strings' members, so
+// such a pattern may be refused near its budget although it would fit. In
+// the library's tests, a compile within a byte budget allocates in all,
+// garbage included, under three times the budget, not counting tables built
+// once per process (such as a property of strings' members).
+func WithBudget(maxInstructions int, maxBytes int64) Option {
+	return func(c *config) { c.maxInstructions, c.maxBytes = maxInstructions, maxBytes }
+}
+
+// ErrBudgetExceeded is wrapped by the error for a pattern refused because it
+// would cost more than the budget given to Compile with WithBudget. It wraps
+// ErrLimit.
+var ErrBudgetExceeded error = &limitError{msg: "pattern exceeds the budget given to Compile"}
+
+// limitError is a sentinel for a limit; it wraps ErrLimit.
+type limitError struct{ msg string }
+
+func (e *limitError) Error() string { return e.msg }
+func (e *limitError) Unwrap() error { return ErrLimit }
+
+// checkBudget refuses ast if compiling it could exceed cfg's budget.
+func (cfg *config) checkBudget(expr string, ast *parser.Pattern, names []string) error {
+	if cfg.maxInstructions <= 0 && cfg.maxBytes <= 0 {
+		return nil
+	}
+	cost, err := compiler.Bound(ast)
+	if err != nil {
+		return fmt.Errorf("compile error: %w", err)
+	}
+	if cfg.maxInstructions > 0 && cost.Instructions > cfg.maxInstructions {
+		return fmt.Errorf("%w: compiles to %d instructions, over the %d allowed", ErrBudgetExceeded, cost.Instructions, cfg.maxInstructions)
+	}
+	if n := memsize.Add(cost.Bytes, ownBytes(expr, names)); cfg.maxBytes > 0 && n > cfg.maxBytes {
+		return fmt.Errorf("%w: may hold %d bytes once compiled, over the %d allowed", ErrBudgetExceeded, n, cfg.maxBytes)
+	}
+	return nil
+}
+
 // Compile parses a regular expression and returns, if successful, a Regexp
 // object that can be used to match against text.
 func Compile(expr string, f flags.Flags, opts ...Option) (*Regexp, error) {
+	return CompileContext(context.Background(), expr, f, opts...)
+}
+
+// CompileContext is Compile, but gives up when ctx is done, returning an error
+// that wraps ctx.Err(). Parsing, compiling and analysing the program each poll
+// ctx as they go, so it returns soon after ctx is done however large the
+// pattern. Matching with the result does not observe ctx; see WithContext.
+func CompileContext(ctx context.Context, expr string, f flags.Flags, opts ...Option) (*Regexp, error) {
 	cfg := config{syntax: SyntaxAnnexB}
 	for _, o := range opts {
 		o(&cfg)
@@ -150,6 +246,10 @@ func Compile(expr string, f flags.Flags, opts ...Option) (*Regexp, error) {
 	// reject the same inputs (u and v are mutually exclusive per ECMA-262).
 	if f.Has(flags.Unicode) && f.Has(flags.UnicodeSets) {
 		return nil, fmt.Errorf("incompatible flags: u and v")
+	}
+
+	if n := parser.AllocBound(len(expr)); cfg.maxBytes > 0 && n > cfg.maxBytes {
+		return nil, fmt.Errorf("%w: parsing %d bytes may allocate %d bytes, over the %d allowed", ErrBudgetExceeded, len(expr), n, cfg.maxBytes)
 	}
 
 	// Annex B leniencies apply only outside Unicode mode.
@@ -165,27 +265,41 @@ func Compile(expr string, f flags.Flags, opts ...Option) (*Regexp, error) {
 		AnnexB:      annexB,
 	})
 
-	ast, err := p.Parse()
+	ast, err := p.ParseContext(ctx)
 	if err != nil {
+		if interrupted(ctx, err) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("parse error: %w", err)
-	}
-
-	// Compile to VM code
-	code, numGroups, err := compiler.Compile(ast)
-	if err != nil {
-		return nil, fmt.Errorf("compile error: %w", err)
 	}
 
 	// Extract group names from AST, indexed by the parse-time group number so
 	// that len(names) == numGroups+1 always holds.
-	names := extractGroupNames(ast.Body, numGroups)
+	names := extractGroupNames(ast.Body, ast.NumGroups)
+
+	if err := cfg.checkBudget(expr, ast, names); err != nil {
+		return nil, err
+	}
+
+	// Compile to VM code
+	code, numGroups, err := compiler.CompileContext(ctx, ast)
+	if err != nil {
+		if interrupted(ctx, err) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("compile error: %w", err)
+	}
+	prog, err := vm.NewProgramContext(ctx, code, f.Has(flags.IgnoreCase), f.Has(flags.Multiline), f.Has(flags.DotAll),
+		f.Has(flags.Unicode) || f.Has(flags.UnicodeSets), false)
+	if err != nil {
+		return nil, err
+	}
 
 	return &Regexp{
-		expr:  expr,
-		flags: f,
-		code:  code,
-		prog: vm.NewProgram(code, f.Has(flags.IgnoreCase), f.Has(flags.Multiline), f.Has(flags.DotAll),
-			f.Has(flags.Unicode) || f.Has(flags.UnicodeSets), false),
+		expr:       expr,
+		flags:      f,
+		code:       code,
+		prog:       prog,
 		numGroups:  numGroups,
 		names:      names,
 		ignoreCase: f.Has(flags.IgnoreCase),
@@ -196,6 +310,12 @@ func Compile(expr string, f flags.Flags, opts ...Option) (*Regexp, error) {
 		sticky:     f.Has(flags.Sticky),
 		maxSteps:   0,
 	}, nil
+}
+
+// interrupted reports whether err is ctx being done.
+func interrupted(ctx context.Context, err error) bool {
+	cerr := ctx.Err()
+	return cerr != nil && errors.Is(err, cerr)
 }
 
 // MustCompile is like Compile but panics if the expression cannot be parsed.
@@ -253,6 +373,35 @@ func (re *Regexp) SetMaxSteps(max int) {
 		max = 0
 	}
 	re.maxSteps = max
+}
+
+// SetMaxMemory sets the most memory, in bytes, that each match operation may
+// hold for backtracking (its backtrack stack and failure memo). A value of 0
+// restores the default, vm.DefaultMaxMemory plus vm.DefaultMemoryPerByte per
+// byte of input; a positive value is a fixed limit regardless of input
+// length. A match operation over it is reported as SetMaxSteps describes, with
+// an error wrapping ErrStepLimit.
+func (re *Regexp) SetMaxMemory(bytes int) {
+	if bytes < 0 {
+		bytes = 0
+	}
+	re.maxMemory = bytes
+}
+
+// WithContext returns a copy of re whose match operations stop once ctx is
+// done. Matching polls ctx every few thousand steps (vm.PollSteps), so an
+// operation returns soon after ctx is done, however long its input. The error
+// forms then return an error wrapping ctx.Err(), which is not ErrStepLimit;
+// the other methods report no match, as for an exceeded budget.
+//
+// The copy shares re's compiled program, and its settings (SetMaxSteps,
+// SetMaxMemory) are re's at the time of the call. With the g or y flag it has
+// a lastIndex of its own, starting at re's: MatchString and
+// FindStringSubmatch on the copy advance the copy's.
+func (re *Regexp) WithContext(ctx context.Context) *Regexp {
+	cp := *re
+	cp.ctx = ctx
+	return &cp
 }
 
 // SetLastIndex sets the starting position for the next match operation.
@@ -481,6 +630,60 @@ func (re *Regexp) FindStringSubmatchIndexErr(s string) ([]int, error) {
 		return nil, ErrSurrogateSplit
 	}
 	return re.submatchIndex(groups), nil
+}
+
+// FindStringSubmatchIndexFromErr is FindStringSubmatchIndexErr, but searches
+// from position start, as JavaScript's RegExp.prototype.exec does from
+// lastIndex: for the leftmost match at or after start, or with the y flag
+// only at start. start is a byte offset, or the position between the halves
+// of a surrogate pair that SetLastIndex accepts; a negative start is 0, and
+// one past the end of s finds no match.
+//
+// Unlike MatchString and FindStringSubmatch it neither reads nor changes
+// lastIndex, whatever the flags, so it is safe for concurrent use. A caller
+// emulating exec keeps lastIndex itself: the end of the match, or 0 when
+// there is none.
+func (re *Regexp) FindStringSubmatchIndexFromErr(s string, start int) ([]int, error) {
+	groups, err := re.doMatchWithError(s, start)
+	if err != nil || groups == nil {
+		return nil, err
+	}
+	if !re.indicesOK(s, groups) {
+		return nil, ErrSurrogateSplit
+	}
+	return re.submatchIndex(groups), nil
+}
+
+// FindStringSubmatchPositionsFromErr is FindStringSubmatchIndexFromErr, but
+// reports a position between the halves of a surrogate pair as SetLastIndex
+// does, as the offset of the character's first byte plus 2, rather than
+// failing with ErrSurrogateSplit. Only a pattern without the u or v flag can
+// produce one, and vm.BetweenSurrogates tells it from a byte offset. It is for
+// callers whose strings can hold half a pair, such as UTF-16 or WTF-8.
+func (re *Regexp) FindStringSubmatchPositionsFromErr(s string, start int) ([]int, error) {
+	groups, err := re.doMatchWithError(s, start)
+	if err != nil || groups == nil {
+		return nil, err
+	}
+	return re.submatchIndex(groups), nil
+}
+
+// FindAllStringSubmatchPositionsErr is FindAllStringSubmatchIndexErr, but
+// reports positions as FindStringSubmatchPositionsFromErr does, so that it
+// iterates over every match, including those that begin or end between the
+// halves of a surrogate pair. It advances as FindAllStringSubmatchIndexErr
+// does: past each match, and past an empty one by a character, which without
+// the u or v flag is a UTF-16 code unit and may end between two halves.
+func (re *Regexp) FindAllStringSubmatchPositionsErr(s string, n int) ([][]int, error) {
+	matches, err := re.findAllMatchesErr(s, n, nil)
+	if err != nil || len(matches) == 0 {
+		return nil, err
+	}
+	result := make([][]int, len(matches))
+	for i, g := range matches {
+		result[i] = re.submatchIndex(g)
+	}
+	return result, nil
 }
 
 // FindAllStringIndex returns a slice of all successive match locations of the
@@ -1055,6 +1258,42 @@ func (re *Regexp) split(s string, n int) ([]string, error) {
 	return append(parts, s[p:]), nil
 }
 
+// ProgramSize returns the number of instructions re compiled to. Nested
+// counted quantifiers multiply it: (a{1000}){100} is about 100,000
+// instructions from a 15-byte pattern. Compile refuses a pattern of more
+// than compiler.MaxProgramSize instructions.
+func (re *Regexp) ProgramSize() int {
+	return len(re.code)
+}
+
+// MemoryFootprint returns the bytes re holds, as the Go allocator sizes them:
+// its instructions and the data they own (class atoms, class sets and the
+// tries of v-mode classes holding strings), the analysis of the program, its
+// group names and its source text. A caller keeping compiled patterns in a
+// byte-bounded cache, or charging them to a memory budget, can use it as
+// their cost. It does not grow with use: matching allocates per operation,
+// within the budget described at ErrStepLimit, and tables shared by every
+// pattern, such as resolved Unicode properties, are not counted.
+//
+// The instruction count alone does not bound it, since one instruction may
+// own a large class. It is computed on first use and is safe to call
+// concurrently.
+func (re *Regexp) MemoryFootprint() int64 {
+	return memsize.Add(re.prog.Footprint(), ownBytes(re.expr, re.names))
+}
+
+// ownBytes is what a Regexp holds besides its program: itself, its source and
+// its group names.
+func ownBytes(expr string, names []string) int64 {
+	n := memsize.Round(int64(unsafe.Sizeof(Regexp{})))
+	n = memsize.Add(n, memsize.RoundNoScan(int64(len(expr))))
+	n = memsize.Add(n, memsize.Round(int64(cap(names))*int64(unsafe.Sizeof(""))))
+	for _, name := range names {
+		n = memsize.Add(n, memsize.RoundNoScan(int64(len(name))))
+	}
+	return n
+}
+
 // NumSubexp returns the number of parenthesized subexpressions in this Regexp
 func (re *Regexp) NumSubexp() int {
 	return re.numGroups
@@ -1104,7 +1343,6 @@ func (re *Regexp) doMatchWithError(s string, startPos int) ([]int, error) {
 	if startPos > len(s) {
 		return nil, nil
 	}
-
 	v := &vm.VM{
 		Code:       re.code,
 		Program:    re.prog,
@@ -1114,6 +1352,8 @@ func (re *Regexp) doMatchWithError(s string, startPos int) ([]int, error) {
 		DotAll:     re.dotAll,
 		Unicode:    re.unicode,
 		MaxSteps:   re.maxSteps,
+		MaxMemory:  re.maxMemory,
+		Context:    re.ctx,
 	}
 
 	// Sticky flag: only attempt match at startPos (anchored)

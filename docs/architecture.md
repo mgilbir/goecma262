@@ -113,6 +113,26 @@ Details worth knowing before touching the VM:
   non-ASCII, and every instruction that can match non-ASCII already admits
   every byte from 0x80 up.
 
+## Cancellation
+
+Every stage can be interrupted. The parser polls its context every 1,024
+calls to `atEnd`, which every loop over the pattern makes; the compiler
+every 1,024 nodes it compiles (a quantifier's body counts once per copy) and
+strings it evaluates in a class set; the analysis in `vm.NewProgram` every
+1,024 instructions of each of its passes. Quick linear passes are not
+polled: the parser's group count and duplicate-name check, and the walks of
+the AST in `compiler.Bound` and in sizing a program.
+
+Matching polls `vm.VM.Context` about every `vm.PollSteps` steps, but never in
+the step loop itself, whose code is unchanged by it: a call there, even on a
+path taken every few thousand steps, made the compiler keep registers on the
+stack and slowed every step. It polls where execution already leaves the
+loop: at each split (`memoVisit`; every loop of a program has a split), as a
+greedy loop gives characters back in `backtrack`, at each start position
+(`prepare`), and after every megabyte a backreference compares, since one
+backreference may compare the whole input in a step. A search that takes
+fewer steps than separate two polls still polls at its first start position.
+
 ## Lookarounds and right-to-left lookbehind
 
 Lookarounds run as nested runs of the same VM over the same input (`vm.run`
@@ -272,12 +292,72 @@ version.
 
 | Limit | Value | Where enforced | Error |
 |---|---|---|---|
-| Nesting depth | 200 | `parser.MaxNestingDepth`, `compiler.MaxNestingDepth` | "pattern too deeply nested" |
-| Single quantifier bound | 10,000 | `compiler.MaxQuantifierRepeat` | "quantifier minimum/maximum … exceeds limit" |
-| Compiled program size | 200,000 instructions | `compiler.MaxProgramSize` | "compiled program too large" |
+| Nesting depth | 200 | `parser.MaxNestingDepth`, `compiler.MaxNestingDepth` | wraps `ErrNestingTooDeep` |
+| Single quantifier bound | 10,000 | `compiler.MaxQuantifierRepeat` | wraps `compiler.ErrQuantifierTooLarge` |
+| Compiled program size | 200,000 instructions | `compiler.MaxProgramSize` | wraps `compiler.ErrProgramTooLarge` |
 | Execution steps | 1,000,000 + 100 per input byte (default; `SetMaxSteps` sets a fixed limit) | `vm.DefaultMaxSteps`, `vm.DefaultStepsPerByte` | `vm.ErrStepLimit` |
 | Backtracking memory | 256 MiB + 32 bytes per input byte (default; `vm.VM.MaxMemory`) | `vm.DefaultMaxMemory`, `vm.DefaultMemoryPerByte` | wraps `vm.ErrStepLimit` |
 
 The first three exist because nested quantifiers multiply: `(a{1000}){1000}`
 is a million instructions from a 16-byte pattern. The execution budget
 catches what static limits cannot — input-dependent backtracking cost.
+
+They are limits of this implementation, not of ECMA-262, so each of their
+errors also wraps `ErrLimit` (`parser.ErrLimit`, re-exported by the compiler
+and the root package): a caller tells a pattern the library refuses from an
+invalid one with `errors.Is`, without reading the message.
+
+### Knowing the cost before paying it
+
+`compiler.Bound` walks the AST as `compiler.Compile` does, but visits a
+quantifier's body once and multiplies, so it takes time linear in the AST
+whatever the program's size. It counts instructions exactly: its rules mirror
+the compiler's node by node, and `TestBoundMatchesCompileOnTest262`,
+`TestBoundMatchesCompileOnRandomPatterns` and `FuzzBound` check it against
+real programs. The exception is a v-mode class whose strings are not exactly
+one property of strings' members (`[\q{ab|cd}]`, `[\p{RGI_Emoji}--\q{x}]`):
+counting its trie would mean evaluating the set, so Bound bounds it by the
+strings' lengths and reports the count as inexact. A property's own trie is
+measured once per process and cached.
+
+`Compile` calls `Bound` first. An exact count over `MaxProgramSize` is
+refused before anything is emitted. An inexact one is made exact by
+evaluating the pattern's class sets first, which compiling needs anyway (the
+compiler keeps them), and measuring their tries. Either way the instruction
+slice is allocated once, at its final size, and the limit is exact: a program
+of `MaxProgramSize` instructions compiles and one more does not.
+
+A counted quantifier compiles its body once per copy. What does not depend on
+where the code goes is computed once and shared by the copies: a class's atoms
+(`([a-z0-9]{1000}){190}` used to hold 190,000 copies of 36 atoms, 425 MB), a
+lookbehind body's reversal, and a v-mode class's evaluation and trie. The
+members of a property of strings are fixed, so their code points
+(`vm.PropertyOfStringsRunes`), their reversal and their evaluation as a set
+are built once per process and shared read-only by every pattern, and set
+operations recognise a property named again (`[\p{RGI_Emoji}\p{RGI_Emoji}]`,
+`[\p{RGI_Emoji}--\p{RGI_Emoji}]`) without going through its strings.
+
+Parsing allocates at most `parser.AllocBound(len(pattern))`, 1 KiB plus 128
+bytes per byte (`TestParseAllocBound` checks every construct; the most
+measured is about 78). Sequences and alternatives are collected on one
+chunked stack and copied out at their exact length, rather than appended to
+a slice each, which allocated about five times their size.
+
+`ecma262.WithBudget` puts these together: a pattern is refused before parsing
+if `AllocBound` exceeds the byte budget, and before compiling if `Bound` puts
+its instruction count or its `MemoryFootprint` over the budget.
+`TestBudgetBoundsCompileAllocation` checks that a compile within a byte
+budget allocates, garbage included, at most three times it.
+
+### What a compiled pattern holds
+
+The instruction count does not bound memory by itself: an instruction may own
+data (class atoms, a class set's `vm.CharSet`, a trie node's `vm.RuneSwitch`).
+`vm.Program.Footprint` adds up what a program holds, counting an object
+several instructions share once and rounding each allocation as the Go
+allocator does (`internal/memsize`, checked against the running runtime);
+`Regexp.MemoryFootprint` adds the `Regexp`'s own fields. A pointer-free object
+under 16 bytes is counted as the whole 16-byte block the runtime's tiny
+allocator may keep alive for it, so the figure is an upper bound;
+`TestMemoryFootprintMatchesRetainedHeap` checks it against the heap a
+compiled pattern retains.

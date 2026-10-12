@@ -2,6 +2,7 @@ package vm
 
 import (
 	"fmt"
+	"math/rand"
 	"testing"
 )
 
@@ -101,4 +102,78 @@ func singleRuneInstructions() []Instruction {
 		}
 	}
 	return insts
+}
+
+// TestLeafBytesCacheKeepsInstructionsApart computes the leaf bytes of every
+// single-rune instruction in one program, whose cache is shared by
+// instructions with the same class data but different negation or flags,
+// and checks each against the bytes computed alone.
+func TestLeafBytesCacheKeepsInstructionsApart(t *testing.T) {
+	insts := singleRuneInstructions()
+	insts = append(insts,
+		Instruction{Op: OpUnicodeProp, Prop: "Lu"}, Instruction{Op: OpNotUnicodeProp, Prop: "Lu"},
+		Instruction{Op: OpUnicodeProp, Prop: "Nd"}, Instruction{Op: OpNotUnicodeProp, Prop: "Nd"},
+		Instruction{Op: OpClassSet, Set: NewCharSetRanges([]RuneRange{{'a', 'c'}})},
+		Instruction{Op: OpClassSet, Set: NewCharSetRanges([]RuneRange{{'x', 'z'}})},
+		Instruction{Op: OpRuneSwitch, Switch: &RuneSwitch{Keys: []rune{'a'}, Targets: []int{0}}},
+		Instruction{Op: OpRuneSwitch, Switch: &RuneSwitch{Keys: []rune{'q'}, Targets: []int{0}}},
+		Instruction{Op: OpUnicodeProp, Prop: "Lu", Mode: ModeSet | ModeIgnoreCase},
+		Instruction{Op: OpNotUnicodeProp, Prop: "Lu", Mode: ModeSet | ModeIgnoreCase})
+	for mask := 0; mask < 16; mask++ {
+		p := testProgram(mask)
+		p.code = insts
+		p.leafCache = make(map[leafKey]*[4]uint64)
+		for pc := range insts {
+			got := *p.leafBytes(pc)
+			alone := testProgram(mask)
+			alone.code = insts[pc : pc+1]
+			alone.leafCache = make(map[leafKey]*[4]uint64)
+			if want := *alone.leafBytes(0); got != want {
+				t.Errorf("flags %04b, %s %v negate %v mode %04b: %x in the program, %x alone", mask, insts[pc], fmt.Sprint(insts[pc].Class), insts[pc].Negate, insts[pc].Mode, got, want)
+			}
+		}
+	}
+}
+
+// TestDirectionsAreTheInnermostLookaround checks computeDirections against
+// the innermost lookaround enclosing each pc, on random programs of nested
+// and adjacent lookarounds of many lengths.
+func TestDirectionsAreTheInnermostLookaround(t *testing.T) {
+	rng := rand.New(rand.NewSource(5))
+	for trial := 0; trial < 200; trial++ {
+		var code []Instruction
+		var gen func(depth int)
+		gen = func(depth int) {
+			for n := rng.Intn(4); n >= 0; n-- {
+				if depth == 0 || rng.Intn(3) == 0 {
+					for k := rng.Intn(3); k >= 0; k-- {
+						code = append(code, Instruction{Op: OpChar, Char: 'a'})
+					}
+					continue
+				}
+				jmp := len(code)
+				code = append(code, Instruction{Op: OpJmp})
+				start := len(code)
+				gen(depth - 1)
+				op := []Opcode{OpLookahead, OpNegLookahead, OpLookbehind, OpNegLookbehind}[rng.Intn(4)]
+				code = append(code, Instruction{Op: op, A: start, B: len(code)})
+				code[jmp].A = len(code) - 1
+			}
+		}
+		gen(4)
+		backward := rng.Intn(2) == 0
+		p := &Program{code: code, backward: backward}
+		p.computeDirections()
+		for pc := range code {
+			want, size := backward, len(code)+1
+			for _, inst := range code {
+				if isLookaround(inst.Op) && inst.A <= pc && pc < inst.B && inst.B-inst.A < size {
+					want, size = inst.Op == OpLookbehind || inst.Op == OpNegLookbehind, inst.B-inst.A
+				}
+			}
+			if p.dir[pc] != want {
+				t.Fatalf("trial %d: pc %d of %d runs backward %v, want %v", trial, pc, len(code), p.dir[pc], want)
+			}
+		}
+	}
 }

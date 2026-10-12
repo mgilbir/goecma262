@@ -191,10 +191,13 @@ code point. A result that begins or ends between the two halves has no Go
 form (a Go string cannot hold half a pair, and the position between them is
 no byte offset), so the `Err` methods return `ErrSurrogateSplit` for it; the
 others report no match, `FindAll*` and `Split` stop there, and `ReplaceAll*`
-return the input unchanged. Results that can be expressed are returned in
-full: `/x*/g` finds three empty matches in `"😀"`, and replacing them with
-`""` gives `"😀"` back. `lastIndex` may fall between the halves, at the
-character's first byte plus 2 (see `SetLastIndex`).
+return the input unchanged. `FindStringSubmatchPositionsFromErr` and
+`FindAllStringSubmatchPositionsErr` instead report such a position as
+`lastIndex` holds it, for callers whose strings can hold half a pair (UTF-16,
+WTF-8). Results that can be expressed are returned in full: `/x*/g` finds
+three empty matches in `"😀"`, and replacing them with `""` gives `"😀"`
+back. `lastIndex` may fall between the halves, at the character's first byte
+plus 2 (see `SetLastIndex`).
 
 **Bounded matching (ReDoS protection).** Matching backtracks on an explicit,
 heap-allocated stack, so no input can overflow the goroutine stack. Every
@@ -211,7 +214,9 @@ as no match. The error-returning forms report it as `ErrStepLimit`:
 the package-level `MatchString` and `Match`, and the methods ending in `Err`
 (`MatchStringErr`, `MatchErr`, `FindStringIndexErr`,
 `FindStringSubmatchIndexErr`, `FindAllStringSubmatchIndexErr`,
-`ReplaceAllStringErr`, `SplitErr`). The other methods have no error result:
+`ReplaceAllStringErr`, `SplitErr`). `FindStringSubmatchIndexFromErr` searches
+from a given position, as JavaScript's `exec` does from `lastIndex` (with
+`y`, only there), without reading or changing the `Regexp`'s own `lastIndex`. The other methods have no error result:
 they report an exceeded budget as **no match**, and the iterating ones
 (`FindAll*`, `ReplaceAll*`, `Split`) stop at that point. If you match untrusted
 patterns or inputs, use the error-returning forms:
@@ -223,12 +228,47 @@ if errors.Is(err, ecma262.ErrStepLimit) {
 }
 ```
 
+`SetMaxMemory` lowers the memory part of the budget, as `SetMaxSteps` fixes
+the step part. To stop at a deadline, match with `re.WithContext(ctx)`: its
+operations poll `ctx` every few thousand steps and stop once it is done,
+returning an error that wraps `ctx.Err()` (not `ErrStepLimit`).
+`CompileContext` does the same for parsing, compiling and analysing a
+pattern.
+
 **Errors.** `Compile` wraps failures as `parse error: …` or
 `compile error: …` and rejects `u`+`v` as `incompatible flags`. `flags.Parse`
 returns typed errors (`InvalidFlagError`, `DuplicateFlagError`,
-`IncompatibleFlagsError`). An exceeded execution budget is `ErrStepLimit`
-(the same value as `vm.ErrStepLimit`; the memory form wraps it), comparable
-with `errors.Is`. A result with no Go form (see above) is `ErrSurrogateSplit`.
+`IncompatibleFlagsError`). A pattern refused by one of the compile-time
+limits below is valid JavaScript, so its error wraps `ErrLimit` (and one of
+`ErrNestingTooDeep`, `ErrQuantifierTooLarge` or `ErrProgramTooLarge`) rather
+than reading as a syntax error. An exceeded execution budget is `ErrStepLimit`
+(the same value as `vm.ErrStepLimit`; the memory form wraps it). All of these
+are comparable with `errors.Is`. A result with no Go form (see above) is
+`ErrSurrogateSplit`.
+
+**Cost of a compiled pattern.** A short pattern can compile to a large
+program: `(a{1000}){100}` is about 100,000 instructions. `ProgramSize`
+reports a `Regexp`'s instruction count and `MemoryFootprint` the bytes it
+holds (its instructions and the data they own, the program's analysis, its
+group names and source), for callers that keep compiled patterns in a
+byte-bounded cache or charge them to a memory budget.
+
+That cost is known before it is paid. `compiler.Bound` computes a parsed
+pattern's instruction count (exactly, except for some v-mode classes of
+strings, which it bounds) and a bound on its footprint, in time linear in
+the pattern, and `parser.AllocBound` bounds what parsing allocates by the
+pattern's length. `Compile` refuses a pattern over the 200,000-instruction
+limit before emitting anything, and `WithBudget(maxInstructions, maxBytes)`
+refuses one over a caller's own budget, with `ErrBudgetExceeded`, before
+parsing it if it is too long and before compiling it if it is too large. A
+`Regexp` compiled within a budget holds at most `maxBytes`:
+
+```go
+re, err := ecma262.Compile(untrusted, f, ecma262.WithBudget(10_000, 4<<20))
+if errors.Is(err, ecma262.ErrBudgetExceeded) {
+    // too expensive: refused before the cost was paid
+}
+```
 
 ## Architecture
 
@@ -248,8 +288,8 @@ how right-to-left lookbehind and the ReDoS bounds work — are in
 Basic performance on an AMD Ryzen 9 6900HX (`go test ./tests/ -bench . -benchmem`):
 
 ```
-BenchmarkMatch-16            782073    1536 ns/op    1000 B/op    28 allocs/op
-BenchmarkCompileAndMatch-16  399681    2691 ns/op    3256 B/op    50 allocs/op
+BenchmarkMatch-16            1810467    636 ns/op     808 B/op    12 allocs/op
+BenchmarkCompileAndMatch-16   410583   2838 ns/op    3616 B/op    48 allocs/op
 ```
 
 ## Testing and Test262 compliance
@@ -272,7 +312,7 @@ suite and maintain the skip list is covered in
 
 1. **Unicode property escapes** - Names and values are matched exactly, as in JavaScript: `\p{Lu}`, `\p{Uppercase_Letter}` and `\p{sc=Latn}` are valid, `\p{uppercase_letter}` is not. The one spelling V8 accepts beyond ECMA-262's table, Unicode's `WSpace` alias for `White_Space`, is rejected here as the spec requires (use `White_Space` or `space`). Every general category, script (`Script=` and `Script_Extensions=`, with every alias in `PropertyValueAliases.txt`) and binary property ECMA-262 lists is supported, and each matches the same code points as node's on Unicode 17.0. Where Go's `unicode` package has no table for a property (the emoji properties, `Script_Extensions`, and derived ones such as `ID_Start` or `Changes_When_Casefolded`), the data is generated from the UCD by `tools/genemoji` and `tools/genpropnames`.
 2. **HasIndices flag** (`d`) - Parsed and accepted, but it has no effect: match indices are always available through the `*Index` methods (`FindStringSubmatchIndex`, `FindAllStringSubmatchIndex`, etc.), which return `[start, end)` byte-offset pairs per group (`-1` for a non-participating group). Named-group indices (JavaScript's `indices.groups`) are obtained by combining `SubexpIndex(name)` with those pairs.
-3. **Compile-time limits** - Patterns nested more than 200 levels deep, with a single quantifier bound above 10,000 (`a{10001}`), or compiling to more than 200,000 instructions are rejected at compile time.
+3. **Compile-time limits** - Patterns nested more than 200 levels deep, with a single quantifier bound above 10,000 (`a{10001}`), or compiling to more than 200,000 instructions are rejected at compile time, before any code is emitted, with an error wrapping `ErrLimit`.
 4. **Case folding** - Case-insensitive matching uses Unicode simple case folding under the `u` flag, and the legacy `Canonicalize` (uppercase-based, with the "don't map non-ASCII to ASCII" guard) otherwise — matching JavaScript in both modes. A handful of full-mapping edge cases (e.g. `ß`↔`SS`) are not folded, as in most engines.
 
 ## Contributing

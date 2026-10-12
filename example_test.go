@@ -1,6 +1,7 @@
 package ecma262_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -211,4 +212,86 @@ func ExampleWithSyntax() {
 	// Output:
 	// true
 	// true
+}
+
+// A pattern refused by one of the library's limits is valid JavaScript, which
+// a caller emulating RegExp must not report as a SyntaxError.
+func ExampleErrLimit() {
+	for _, p := range []string{`(a{1000}){1000}`, `a{2,1}`} {
+		_, err := ecma262.Compile(p, flags.Flags(0))
+		switch {
+		case errors.Is(err, ecma262.ErrLimit):
+			fmt.Println(p, "is too expensive:", errors.Is(err, ecma262.ErrProgramTooLarge))
+		case err != nil:
+			fmt.Println(p, "is invalid")
+		}
+	}
+	// Output:
+	// (a{1000}){1000} is too expensive: true
+	// a{2,1} is invalid
+}
+
+// A few bytes of source can compile to a large program; ProgramSize and
+// MemoryFootprint report what a compiled pattern costs, for example to charge
+// it to a byte-bounded cache.
+func ExampleRegexp_MemoryFootprint() {
+	small := ecma262.MustCompile(`a{10}`, flags.Flags(0))
+	large := ecma262.MustCompile(`(a{1000}){100}`, flags.Flags(0))
+	fmt.Println(small.ProgramSize(), large.ProgramSize())
+	fmt.Println(large.MemoryFootprint() > 10<<20)
+	// Output:
+	// 13 100302
+	// true
+}
+
+// A pattern from untrusted input can be refused by what it would cost before
+// that cost is paid: (a{1000}){1000} would compile to a million instructions.
+func ExampleWithBudget() {
+	budget := ecma262.WithBudget(10_000, 4<<20) // instructions, bytes
+	for _, p := range []string{`^[a-z]+@[a-z]+\.com$`, `(a{1000}){1000}`} {
+		re, err := ecma262.Compile(p, flags.Flags(0), budget)
+		if errors.Is(err, ecma262.ErrBudgetExceeded) {
+			fmt.Println(p, "refused")
+			continue
+		}
+		fmt.Println(p, "compiled to", re.ProgramSize(), "instructions")
+	}
+	// Output:
+	// ^[a-z]+@[a-z]+\.com$ compiled to 16 instructions
+	// (a{1000}){1000} refused
+}
+
+// A match can be stopped by a deadline or a cancellation: the copy made by
+// WithContext polls the context as it matches.
+func ExampleRegexp_WithContext() {
+	re := ecma262.MustCompile(`(a|aa)*b`, flags.Flags(0))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := re.WithContext(ctx).MatchStringErr(strings.Repeat("a", 1<<20))
+	fmt.Println(errors.Is(err, context.Canceled), errors.Is(err, ecma262.ErrStepLimit))
+	// Output:
+	// true false
+}
+
+// JavaScript's exec with the g or y flag searches from lastIndex, which the
+// caller keeps: the end of each match, or 0 when there is none.
+func ExampleRegexp_FindStringSubmatchIndexFromErr() {
+	re := ecma262.MustCompile(`(\d+)-(\d+)`, flags.Global)
+	input := "1-2 33-44 x 555-666"
+	lastIndex := 0
+	for {
+		m, err := re.FindStringSubmatchIndexFromErr(input, lastIndex)
+		if err != nil {
+			panic(err) // the budget ran out: no answer
+		}
+		if m == nil {
+			break
+		}
+		fmt.Println(input[m[2]:m[3]], input[m[4]:m[5]])
+		lastIndex = m[1]
+	}
+	// Output:
+	// 1 2
+	// 33 44
+	// 555 666
 }

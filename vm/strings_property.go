@@ -40,6 +40,28 @@ func PropertyOfStrings(name string) ([]string, bool) {
 	return members, ok
 }
 
+// PropertyOfStringsRunes is PropertyOfStrings with each member as code
+// points. The result is built once per property and shared by every caller,
+// so that naming a property of strings costs a pattern nothing (RGI_Emoji has
+// nearly 4,000 members); it must not be modified.
+func PropertyOfStringsRunes(name string) ([][]rune, bool) {
+	if v, ok := propertyRunes.Load(name); ok {
+		return v.([][]rune), true
+	}
+	members, ok := PropertyOfStrings(name)
+	if !ok {
+		return nil, false
+	}
+	strs := make([][]rune, len(members))
+	for i, m := range members {
+		strs[i] = []rune(m)
+	}
+	v, _ := propertyRunes.LoadOrStore(name, strs)
+	return v.([][]rune), true
+}
+
+var propertyRunes sync.Map // name -> [][]rune; one entry per property of strings
+
 // emojiProperty returns the membership test for an emoji binary property.
 func emojiProperty(name string) func(rune) bool {
 	ranges, ok := emojiProperties[name]
