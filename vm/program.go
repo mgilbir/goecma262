@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"slices"
 	"sync"
 	"unsafe"
 )
@@ -201,12 +202,11 @@ func (p *Program) computeDirections() {
 			spans = append(spans, span{inst.A, inst.B, inst.Op == OpLookbehind || inst.Op == OpNegLookbehind})
 		}
 	}
-	// Insertion sort by decreasing length; lookaround counts are small.
-	for i := 1; i < len(spans); i++ {
-		for j := i; j > 0 && spans[j].b-spans[j].a > spans[j-1].b-spans[j-1].a; j-- {
-			spans[j], spans[j-1] = spans[j-1], spans[j]
-		}
-	}
+	// By decreasing length. A counted quantifier can make tens of thousands
+	// of lookarounds, so this must not be quadratic (an insertion sort took
+	// a second over (?:(?:(?=a)){5000}){5}(?:(?:(?=ab)){5000}){5}). Spans of
+	// equal length are disjoint, so their order does not matter.
+	slices.SortStableFunc(spans, func(x, y span) int { return (y.b - y.a) - (x.b - x.a) })
 	for _, s := range spans {
 		for pc := s.a; pc < s.b; pc++ {
 			p.dir[pc] = s.back
