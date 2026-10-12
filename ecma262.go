@@ -47,7 +47,9 @@
 // string cannot hold half a pair, and the position between them is no byte
 // offset. What must be expressible depends on what a method returns:
 //
-//   - positions (the *Index methods) must not fall between two halves;
+//   - positions (the *Index methods) must not fall between two halves; the
+//     *Positions methods instead report such a position as SetLastIndex
+//     does, for callers whose strings can hold half a pair;
 //   - strings (FindString, FindAllString, FindStringSubmatch, Split, ...) must
 //     not hold half a pair, so an empty match between the halves is "";
 //   - the result of a replacement must not hold half a pair; as in JavaScript,
@@ -628,6 +630,60 @@ func (re *Regexp) FindStringSubmatchIndexErr(s string) ([]int, error) {
 		return nil, ErrSurrogateSplit
 	}
 	return re.submatchIndex(groups), nil
+}
+
+// FindStringSubmatchIndexFromErr is FindStringSubmatchIndexErr, but searches
+// from position start, as JavaScript's RegExp.prototype.exec does from
+// lastIndex: for the leftmost match at or after start, or with the y flag
+// only at start. start is a byte offset, or the position between the halves
+// of a surrogate pair that SetLastIndex accepts; a negative start is 0, and
+// one past the end of s finds no match.
+//
+// Unlike MatchString and FindStringSubmatch it neither reads nor changes
+// lastIndex, whatever the flags, so it is safe for concurrent use. A caller
+// emulating exec keeps lastIndex itself: the end of the match, or 0 when
+// there is none.
+func (re *Regexp) FindStringSubmatchIndexFromErr(s string, start int) ([]int, error) {
+	groups, err := re.doMatchWithError(s, start)
+	if err != nil || groups == nil {
+		return nil, err
+	}
+	if !re.indicesOK(s, groups) {
+		return nil, ErrSurrogateSplit
+	}
+	return re.submatchIndex(groups), nil
+}
+
+// FindStringSubmatchPositionsFromErr is FindStringSubmatchIndexFromErr, but
+// reports a position between the halves of a surrogate pair as SetLastIndex
+// does, as the offset of the character's first byte plus 2, rather than
+// failing with ErrSurrogateSplit. Only a pattern without the u or v flag can
+// produce one, and vm.BetweenSurrogates tells it from a byte offset. It is for
+// callers whose strings can hold half a pair, such as UTF-16 or WTF-8.
+func (re *Regexp) FindStringSubmatchPositionsFromErr(s string, start int) ([]int, error) {
+	groups, err := re.doMatchWithError(s, start)
+	if err != nil || groups == nil {
+		return nil, err
+	}
+	return re.submatchIndex(groups), nil
+}
+
+// FindAllStringSubmatchPositionsErr is FindAllStringSubmatchIndexErr, but
+// reports positions as FindStringSubmatchPositionsFromErr does, so that it
+// iterates over every match, including those that begin or end between the
+// halves of a surrogate pair. It advances as FindAllStringSubmatchIndexErr
+// does: past each match, and past an empty one by a character, which without
+// the u or v flag is a UTF-16 code unit and may end between two halves.
+func (re *Regexp) FindAllStringSubmatchPositionsErr(s string, n int) ([][]int, error) {
+	matches, err := re.findAllMatchesErr(s, n, nil)
+	if err != nil || len(matches) == 0 {
+		return nil, err
+	}
+	result := make([][]int, len(matches))
+	for i, g := range matches {
+		result[i] = re.submatchIndex(g)
+	}
+	return result, nil
 }
 
 // FindAllStringIndex returns a slice of all successive match locations of the

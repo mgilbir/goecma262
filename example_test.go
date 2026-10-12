@@ -272,3 +272,26 @@ func ExampleRegexp_WithContext() {
 	// Output:
 	// true false
 }
+
+// JavaScript's exec with the g or y flag searches from lastIndex, which the
+// caller keeps: the end of each match, or 0 when there is none.
+func ExampleRegexp_FindStringSubmatchIndexFromErr() {
+	re := ecma262.MustCompile(`(\d+)-(\d+)`, flags.Global)
+	input := "1-2 33-44 x 555-666"
+	lastIndex := 0
+	for {
+		m, err := re.FindStringSubmatchIndexFromErr(input, lastIndex)
+		if err != nil {
+			panic(err) // the budget ran out: no answer
+		}
+		if m == nil {
+			break
+		}
+		fmt.Println(input[m[2]:m[3]], input[m[4]:m[5]])
+		lastIndex = m[1]
+	}
+	// Output:
+	// 1 2
+	// 33 44
+	// 555 666
+}

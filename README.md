@@ -191,10 +191,13 @@ code point. A result that begins or ends between the two halves has no Go
 form (a Go string cannot hold half a pair, and the position between them is
 no byte offset), so the `Err` methods return `ErrSurrogateSplit` for it; the
 others report no match, `FindAll*` and `Split` stop there, and `ReplaceAll*`
-return the input unchanged. Results that can be expressed are returned in
-full: `/x*/g` finds three empty matches in `"😀"`, and replacing them with
-`""` gives `"😀"` back. `lastIndex` may fall between the halves, at the
-character's first byte plus 2 (see `SetLastIndex`).
+return the input unchanged. `FindStringSubmatchPositionsFromErr` and
+`FindAllStringSubmatchPositionsErr` instead report such a position as
+`lastIndex` holds it, for callers whose strings can hold half a pair (UTF-16,
+WTF-8). Results that can be expressed are returned in full: `/x*/g` finds
+three empty matches in `"😀"`, and replacing them with `""` gives `"😀"`
+back. `lastIndex` may fall between the halves, at the character's first byte
+plus 2 (see `SetLastIndex`).
 
 **Bounded matching (ReDoS protection).** Matching backtracks on an explicit,
 heap-allocated stack, so no input can overflow the goroutine stack. Every
@@ -211,7 +214,9 @@ as no match. The error-returning forms report it as `ErrStepLimit`:
 the package-level `MatchString` and `Match`, and the methods ending in `Err`
 (`MatchStringErr`, `MatchErr`, `FindStringIndexErr`,
 `FindStringSubmatchIndexErr`, `FindAllStringSubmatchIndexErr`,
-`ReplaceAllStringErr`, `SplitErr`). The other methods have no error result:
+`ReplaceAllStringErr`, `SplitErr`). `FindStringSubmatchIndexFromErr` searches
+from a given position, as JavaScript's `exec` does from `lastIndex` (with
+`y`, only there), without reading or changing the `Regexp`'s own `lastIndex`. The other methods have no error result:
 they report an exceeded budget as **no match**, and the iterating ones
 (`FindAll*`, `ReplaceAll*`, `Split`) stop at that point. If you match untrusted
 patterns or inputs, use the error-returning forms:
