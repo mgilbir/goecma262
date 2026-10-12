@@ -61,9 +61,11 @@ import (
 	"strings"
 	"unicode/utf16"
 	"unicode/utf8"
+	"unsafe"
 
 	"github.com/mgilbir/goecma262/compiler"
 	"github.com/mgilbir/goecma262/flags"
+	"github.com/mgilbir/goecma262/internal/memsize"
 	"github.com/mgilbir/goecma262/parser"
 	"github.com/mgilbir/goecma262/vm"
 )
@@ -1073,6 +1075,37 @@ func (re *Regexp) split(s string, n int) ([]string, error) {
 		return fail(ErrSurrogateSplit)
 	}
 	return append(parts, s[p:]), nil
+}
+
+// ProgramSize returns the number of instructions re compiled to. Nested
+// counted quantifiers multiply it: (a{1000}){100} is about 100,000
+// instructions from a 15-byte pattern. Compile refuses a pattern of more
+// than compiler.MaxProgramSize instructions.
+func (re *Regexp) ProgramSize() int {
+	return len(re.code)
+}
+
+// MemoryFootprint returns the bytes re holds, as the Go allocator sizes them:
+// its instructions and the data they own (class atoms, class sets and the
+// tries of v-mode classes holding strings), the analysis of the program, its
+// group names and its source text. A caller keeping compiled patterns in a
+// byte-bounded cache, or charging them to a memory budget, can use it as
+// their cost. It does not grow with use: matching allocates per operation,
+// within the budget described at ErrStepLimit, and tables shared by every
+// pattern, such as resolved Unicode properties, are not counted.
+//
+// The instruction count alone does not bound it, since one instruction may
+// own a large class. It is computed on first use and is safe to call
+// concurrently.
+func (re *Regexp) MemoryFootprint() int64 {
+	n := re.prog.Footprint()
+	n = memsize.Add(n, memsize.Round(int64(unsafe.Sizeof(*re))))
+	n = memsize.Add(n, memsize.RoundNoScan(int64(len(re.expr))))
+	n = memsize.Add(n, memsize.Round(int64(cap(re.names))*int64(unsafe.Sizeof(""))))
+	for _, name := range re.names {
+		n = memsize.Add(n, memsize.RoundNoScan(int64(len(name))))
+	}
+	return n
 }
 
 // NumSubexp returns the number of parenthesized subexpressions in this Regexp

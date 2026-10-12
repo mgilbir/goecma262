@@ -234,6 +234,13 @@ than reading as a syntax error. An exceeded execution budget is `ErrStepLimit`
 are comparable with `errors.Is`. A result with no Go form (see above) is
 `ErrSurrogateSplit`.
 
+**Cost of a compiled pattern.** A short pattern can compile to a large
+program: `(a{1000}){100}` is about 100,000 instructions. `ProgramSize`
+reports a `Regexp`'s instruction count and `MemoryFootprint` the bytes it
+holds (its instructions and the data they own, the program's analysis, its
+group names and source), for callers that keep compiled patterns in a
+byte-bounded cache or charge them to a memory budget.
+
 ## Architecture
 
 Pattern strings are parsed to an AST (`parser/`), compiled to bytecode

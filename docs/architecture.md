@@ -286,3 +286,14 @@ They are limits of this implementation, not of ECMA-262, so each of their
 errors also wraps `ErrLimit` (`parser.ErrLimit`, re-exported by the compiler
 and the root package): a caller tells a pattern the library refuses from an
 invalid one with `errors.Is`, without reading the message.
+
+The instruction count does not bound memory by itself: an instruction may own
+data (class atoms, a class set's `vm.CharSet`, a trie node's `vm.RuneSwitch`).
+`vm.Program.Footprint` adds up what a program holds, counting an object
+several instructions share once and rounding each allocation as the Go
+allocator does (`internal/memsize`, checked against the running runtime);
+`Regexp.MemoryFootprint` adds the `Regexp`'s own fields. A pointer-free object
+under 16 bytes is counted as the whole 16-byte block the runtime's tiny
+allocator may keep alive for it, so the figure is an upper bound;
+`TestMemoryFootprintMatchesRetainedHeap` checks it against the heap a
+compiled pattern retains.

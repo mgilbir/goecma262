@@ -229,3 +229,16 @@ func ExampleErrLimit() {
 	// (a{1000}){1000} is too expensive: true
 	// a{2,1} is invalid
 }
+
+// A few bytes of source can compile to a large program; ProgramSize and
+// MemoryFootprint report what a compiled pattern costs, for example to charge
+// it to a byte-bounded cache.
+func ExampleRegexp_MemoryFootprint() {
+	small := ecma262.MustCompile(`a{10}`, flags.Flags(0))
+	large := ecma262.MustCompile(`(a{1000}){100}`, flags.Flags(0))
+	fmt.Println(small.ProgramSize(), large.ProgramSize())
+	fmt.Println(large.MemoryFootprint() > 10<<20)
+	// Output:
+	// 13 100302
+	// true
+}

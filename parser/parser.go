@@ -3,6 +3,7 @@ package parser
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"unicode"
 	"unicode/utf16"
@@ -133,6 +134,7 @@ func (p *Parser) Parse() (pat *Pattern, err error) {
 		// would let a backreference index past the captures.
 		p.fail("internal error: counted %d capturing groups, parsed %d", p.totalGroups, p.groupCount)
 	}
+	var alts map[string][]int
 	for _, br := range p.pendingNamed {
 		indices, ok := p.namedGroups[br.name]
 		if !ok {
@@ -141,7 +143,18 @@ func (p *Parser) Parse() (pat *Pattern, err error) {
 		br.node.Index = indices[0]
 		br.node.Name = br.name
 		if len(indices) > 1 {
-			br.node.AltIndices = indices[1:]
+			// Every reference to the name shares one copy, of its own exact
+			// size, which the compiled pattern holds once. (A copy per
+			// reference would cost groups × references.)
+			alt, ok := alts[br.name]
+			if !ok {
+				alt = slices.Clone(indices[1:])
+				if alts == nil {
+					alts = make(map[string][]int)
+				}
+				alts[br.name] = alt
+			}
+			br.node.AltIndices = alt
 		}
 	}
 	if _, err := p.pathNames(body); err != nil {
@@ -643,7 +656,9 @@ func (p *Parser) parseGroupName() string {
 	if sb.Len() == 0 {
 		p.fail("empty capture group name")
 	}
-	return sb.String()
+	// A copy, so that the compiled pattern holds no more than the name: the
+	// builder's buffer may be up to twice as long.
+	return strings.Clone(sb.String())
 }
 
 // isIdentifierStart is IdentifierStartChar: ID_Start, $ or _.

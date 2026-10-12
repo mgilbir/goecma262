@@ -1,6 +1,9 @@
 package vm
 
-import "unsafe"
+import (
+	"sync"
+	"unsafe"
+)
 
 // Program is the read-only analysis of a compiled instruction slice for one
 // flag configuration. The VM uses it to execute without a backtracking entry
@@ -27,6 +30,9 @@ type Program struct {
 	first     []*firstSet  // indexed by pc; set for split targets and loop exits
 	loops     []greedyLoop // indexed by pc; ok for recognised loops
 	leafCache map[int]*[4]uint64
+
+	footprintOnce sync.Once
+	footprint     int64
 }
 
 // firstSet over-approximates what an execution starting at some pc can do
