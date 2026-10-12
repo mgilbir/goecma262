@@ -226,9 +226,13 @@ if errors.Is(err, ecma262.ErrStepLimit) {
 **Errors.** `Compile` wraps failures as `parse error: …` or
 `compile error: …` and rejects `u`+`v` as `incompatible flags`. `flags.Parse`
 returns typed errors (`InvalidFlagError`, `DuplicateFlagError`,
-`IncompatibleFlagsError`). An exceeded execution budget is `ErrStepLimit`
-(the same value as `vm.ErrStepLimit`; the memory form wraps it), comparable
-with `errors.Is`. A result with no Go form (see above) is `ErrSurrogateSplit`.
+`IncompatibleFlagsError`). A pattern refused by one of the compile-time
+limits below is valid JavaScript, so its error wraps `ErrLimit` (and one of
+`ErrNestingTooDeep`, `ErrQuantifierTooLarge` or `ErrProgramTooLarge`) rather
+than reading as a syntax error. An exceeded execution budget is `ErrStepLimit`
+(the same value as `vm.ErrStepLimit`; the memory form wraps it). All of these
+are comparable with `errors.Is`. A result with no Go form (see above) is
+`ErrSurrogateSplit`.
 
 ## Architecture
 
@@ -272,7 +276,7 @@ suite and maintain the skip list is covered in
 
 1. **Unicode property escapes** - Names and values are matched exactly, as in JavaScript: `\p{Lu}`, `\p{Uppercase_Letter}` and `\p{sc=Latn}` are valid, `\p{uppercase_letter}` is not. The one spelling V8 accepts beyond ECMA-262's table, Unicode's `WSpace` alias for `White_Space`, is rejected here as the spec requires (use `White_Space` or `space`). Every general category, script (`Script=` and `Script_Extensions=`, with every alias in `PropertyValueAliases.txt`) and binary property ECMA-262 lists is supported, and each matches the same code points as node's on Unicode 17.0. Where Go's `unicode` package has no table for a property (the emoji properties, `Script_Extensions`, and derived ones such as `ID_Start` or `Changes_When_Casefolded`), the data is generated from the UCD by `tools/genemoji` and `tools/genpropnames`.
 2. **HasIndices flag** (`d`) - Parsed and accepted, but it has no effect: match indices are always available through the `*Index` methods (`FindStringSubmatchIndex`, `FindAllStringSubmatchIndex`, etc.), which return `[start, end)` byte-offset pairs per group (`-1` for a non-participating group). Named-group indices (JavaScript's `indices.groups`) are obtained by combining `SubexpIndex(name)` with those pairs.
-3. **Compile-time limits** - Patterns nested more than 200 levels deep, with a single quantifier bound above 10,000 (`a{10001}`), or compiling to more than 200,000 instructions are rejected at compile time.
+3. **Compile-time limits** - Patterns nested more than 200 levels deep, with a single quantifier bound above 10,000 (`a{10001}`), or compiling to more than 200,000 instructions are rejected at compile time, with an error wrapping `ErrLimit`.
 4. **Case folding** - Case-insensitive matching uses Unicode simple case folding under the `u` flag, and the legacy `Canonicalize` (uppercase-based, with the "don't map non-ASCII to ASCII" guard) otherwise — matching JavaScript in both modes. A handful of full-mapping edge cases (e.g. `ß`↔`SS`) are not folded, as in most engines.
 
 ## Contributing

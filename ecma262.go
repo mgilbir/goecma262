@@ -81,6 +81,26 @@ var ErrStepLimit = vm.ErrStepLimit
 // documentation for which results each method must express.
 var ErrSurrogateSplit = errors.New("ecma262: result splits a character into UTF-16 surrogate halves")
 
+// Compile refuses a pattern that exceeds one of this implementation's limits
+// with an error wrapping one of the following, each of which wraps ErrLimit.
+// ECMA-262 has none of these limits, so such a pattern is valid JavaScript:
+// errors.Is(err, ErrLimit) separates "the library refused" from "the pattern
+// is invalid" (a SyntaxError in JavaScript).
+var (
+	// ErrLimit is wrapped by every compile error caused by a limit. It is
+	// parser.ErrLimit.
+	ErrLimit = parser.ErrLimit
+	// ErrNestingTooDeep: the pattern nests more than 200 levels deep.
+	ErrNestingTooDeep = parser.ErrNestingTooDeep
+	// ErrQuantifierTooLarge: a quantifier bound exceeds 10,000, as in
+	// a{10001}.
+	ErrQuantifierTooLarge = compiler.ErrQuantifierTooLarge
+	// ErrProgramTooLarge: the pattern compiles to more than 200,000
+	// instructions, as nested counted quantifiers such as (a{1000}){1000}
+	// do.
+	ErrProgramTooLarge = compiler.ErrProgramTooLarge
+)
+
 // Regexp is the representation of a compiled ECMA-262 regular expression.
 // Without the g or y flag it is safe for concurrent use by multiple
 // goroutines. With g or y, MatchString, Match and FindStringSubmatch read

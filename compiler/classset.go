@@ -73,7 +73,7 @@ func (c *Compiler) compileClassSet(e *parser.ClassSetExpression) error {
 		return err
 	}
 	if len(c.code) > MaxProgramSize {
-		return fmt.Errorf("compiled program too large (limit: %d instructions)", MaxProgramSize)
+		return errProgramTooLarge()
 	}
 	return nil
 }

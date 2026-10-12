@@ -272,12 +272,17 @@ version.
 
 | Limit | Value | Where enforced | Error |
 |---|---|---|---|
-| Nesting depth | 200 | `parser.MaxNestingDepth`, `compiler.MaxNestingDepth` | "pattern too deeply nested" |
-| Single quantifier bound | 10,000 | `compiler.MaxQuantifierRepeat` | "quantifier minimum/maximum … exceeds limit" |
-| Compiled program size | 200,000 instructions | `compiler.MaxProgramSize` | "compiled program too large" |
+| Nesting depth | 200 | `parser.MaxNestingDepth`, `compiler.MaxNestingDepth` | wraps `ErrNestingTooDeep` |
+| Single quantifier bound | 10,000 | `compiler.MaxQuantifierRepeat` | wraps `compiler.ErrQuantifierTooLarge` |
+| Compiled program size | 200,000 instructions | `compiler.MaxProgramSize` | wraps `compiler.ErrProgramTooLarge` |
 | Execution steps | 1,000,000 + 100 per input byte (default; `SetMaxSteps` sets a fixed limit) | `vm.DefaultMaxSteps`, `vm.DefaultStepsPerByte` | `vm.ErrStepLimit` |
 | Backtracking memory | 256 MiB + 32 bytes per input byte (default; `vm.VM.MaxMemory`) | `vm.DefaultMaxMemory`, `vm.DefaultMemoryPerByte` | wraps `vm.ErrStepLimit` |
 
 The first three exist because nested quantifiers multiply: `(a{1000}){1000}`
 is a million instructions from a 16-byte pattern. The execution budget
 catches what static limits cannot — input-dependent backtracking cost.
+
+They are limits of this implementation, not of ECMA-262, so each of their
+errors also wraps `ErrLimit` (`parser.ErrLimit`, re-exported by the compiler
+and the root package): a caller tells a pattern the library refuses from an
+invalid one with `errors.Is`, without reading the message.

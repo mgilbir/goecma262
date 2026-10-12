@@ -15,6 +15,46 @@ const (
 	MaxProgramSize      = 200_000 // Max total emitted instructions
 )
 
+// Errors for the compilation limits. Each wraps ErrLimit, so
+// errors.Is(err, ErrLimit) tells a pattern this implementation refuses from an
+// invalid one.
+var (
+	// ErrLimit is parser.ErrLimit.
+	ErrLimit = parser.ErrLimit
+	// ErrNestingTooDeep is parser.ErrNestingTooDeep: the AST nests more than
+	// MaxNestingDepth deep.
+	ErrNestingTooDeep = parser.ErrNestingTooDeep
+	// ErrProgramTooLarge: the program would exceed MaxProgramSize
+	// instructions.
+	ErrProgramTooLarge error = &limitError{msg: "compiled program too large"}
+	// ErrQuantifierTooLarge: a quantifier bound exceeds MaxQuantifierRepeat.
+	ErrQuantifierTooLarge error = &limitError{msg: "quantifier bound too large"}
+)
+
+// limitError is a sentinel for one compilation limit; it wraps ErrLimit.
+type limitError struct{ msg string }
+
+func (e *limitError) Error() string { return e.msg }
+func (e *limitError) Unwrap() error { return ErrLimit }
+
+// limitf returns an error with the given message that wraps the limit
+// sentinel err.
+func limitf(err error, format string, args ...any) error {
+	return &wrapped{msg: fmt.Sprintf(format, args...), err: err}
+}
+
+type wrapped struct {
+	msg string
+	err error
+}
+
+func (e *wrapped) Error() string { return e.msg }
+func (e *wrapped) Unwrap() error { return e.err }
+
+func errProgramTooLarge() error {
+	return limitf(ErrProgramTooLarge, "compiled program too large (limit: %d instructions)", MaxProgramSize)
+}
+
 // Compiler compiles regex AST to VM bytecode
 type Compiler struct {
 	code      []vm.Instruction
@@ -108,11 +148,11 @@ func (c *Compiler) compileNode(node parser.Node) error {
 	// nested quantifiers multiply (e.g. ((a{100}){100}){100} ~ 10^6 instrs), so
 	// the product must be bounded independently to prevent memory blowup.
 	if len(c.code) > MaxProgramSize {
-		return fmt.Errorf("compiled program too large (limit: %d instructions)", MaxProgramSize)
+		return errProgramTooLarge()
 	}
 	c.depth++
 	if c.depth > MaxNestingDepth {
-		return fmt.Errorf("pattern too deeply nested (limit: %d)", MaxNestingDepth)
+		return limitf(ErrNestingTooDeep, "pattern too deeply nested (limit: %d)", MaxNestingDepth)
 	}
 	defer func() { c.depth-- }()
 
@@ -310,10 +350,10 @@ func (c *Compiler) compileCharacterClass(cc *parser.CharacterClass) error {
 func (c *Compiler) compileQuantifier(q *parser.Quantifier) error {
 	// Enforce complexity limits
 	if q.Min > MaxQuantifierRepeat {
-		return fmt.Errorf("quantifier minimum %d exceeds limit %d", q.Min, MaxQuantifierRepeat)
+		return limitf(ErrQuantifierTooLarge, "quantifier minimum %d exceeds limit %d", q.Min, MaxQuantifierRepeat)
 	}
 	if q.Max > MaxQuantifierRepeat {
-		return fmt.Errorf("quantifier maximum %d exceeds limit %d", q.Max, MaxQuantifierRepeat)
+		return limitf(ErrQuantifierTooLarge, "quantifier maximum %d exceeds limit %d", q.Max, MaxQuantifierRepeat)
 	}
 	if q.Max == 0 {
 		// {0} and {0,0}: the body never runs (ECMA-262 RepeatMatcher step 1).

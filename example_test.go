@@ -212,3 +212,20 @@ func ExampleWithSyntax() {
 	// true
 	// true
 }
+
+// A pattern refused by one of the library's limits is valid JavaScript, which
+// a caller emulating RegExp must not report as a SyntaxError.
+func ExampleErrLimit() {
+	for _, p := range []string{`(a{1000}){1000}`, `a{2,1}`} {
+		_, err := ecma262.Compile(p, flags.Flags(0))
+		switch {
+		case errors.Is(err, ecma262.ErrLimit):
+			fmt.Println(p, "is too expensive:", errors.Is(err, ecma262.ErrProgramTooLarge))
+		case err != nil:
+			fmt.Println(p, "is invalid")
+		}
+	}
+	// Output:
+	// (a{1000}){1000} is too expensive: true
+	// a{2,1} is invalid
+}
