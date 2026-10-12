@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"slices"
@@ -80,7 +81,16 @@ type Parser struct {
 	pendingNamed []pendingNamed
 
 	stack termStack
+
+	// ctx, when it can be cancelled, is polled every pollEvery calls to
+	// atEnd, which every loop over the pattern makes; ticks counts down to
+	// the next poll.
+	ctx   context.Context
+	ticks int
 }
+
+// pollEvery is how much parsing work separates two polls of the context.
+const pollEvery = 1024
 
 type pendingNamed struct {
 	name string
@@ -124,7 +134,20 @@ func (p *Parser) enter() {
 func (p *Parser) leave() { p.depth-- }
 
 // Parse parses the pattern and returns the AST
-func (p *Parser) Parse() (pat *Pattern, err error) {
+func (p *Parser) Parse() (*Pattern, error) {
+	return p.ParseContext(context.Background())
+}
+
+// ParseContext is Parse, but gives up when ctx is done, returning an error
+// that wraps ctx.Err(). It polls ctx every so often as it reads the pattern,
+// so it returns soon after ctx is done, whatever the pattern's length. (Its
+// quick linear passes, counting groups before and checking duplicate names
+// after, do not poll.)
+func (p *Parser) ParseContext(ctx context.Context) (pat *Pattern, err error) {
+	if ctx.Done() != nil {
+		p.ctx = ctx
+	}
+	p.ticks = pollEvery
 	defer func() {
 		if r := recover(); r != nil {
 			se, ok := r.(*syntaxError)
@@ -219,7 +242,23 @@ func codeUnits(src []rune) []rune {
 
 // ------------------------------------------------------------------ scanning
 
-func (p *Parser) atEnd() bool { return p.pos >= len(p.src) }
+func (p *Parser) atEnd() bool {
+	if p.ticks--; p.ticks <= 0 {
+		p.poll()
+	}
+	return p.pos >= len(p.src)
+}
+
+// poll aborts parsing if the context is done.
+func (p *Parser) poll() {
+	p.ticks = pollEvery
+	if p.ctx == nil {
+		return
+	}
+	if err := p.ctx.Err(); err != nil {
+		panic(&syntaxError{msg: "pattern parsing interrupted: " + err.Error(), err: err})
+	}
+}
 
 func (p *Parser) peek() rune { return p.src[p.pos] }
 

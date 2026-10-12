@@ -1,6 +1,8 @@
 package vm
 
 import (
+	"context"
+	"fmt"
 	"slices"
 	"sync"
 	"unsafe"
@@ -75,6 +77,21 @@ const firstSetNodeLimit = 64
 // NewProgram analyses code for the given flags. backward is the direction the
 // top-level program runs in (false for every program the compiler emits).
 func NewProgram(code []Instruction, ignoreCase, multiline, dotAll, unicode, backward bool) *Program {
+	p, _ := NewProgramContext(context.Background(), code, ignoreCase, multiline, dotAll, unicode, backward)
+	return p
+}
+
+// NewProgramContext is NewProgram, but gives up when ctx is done, returning
+// an error that wraps ctx.Err(). The analysis takes time linear in the
+// program, and polls ctx as it goes.
+func NewProgramContext(ctx context.Context, code []Instruction, ignoreCase, multiline, dotAll, unicode, backward bool) (*Program, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("analysing the program interrupted: %w", err)
+	}
+	poll := &analysisPoll{}
+	if ctx.Done() != nil {
+		poll.ctx = ctx
+	}
 	p := &Program{
 		code:       code,
 		ignoreCase: ignoreCase,
@@ -102,10 +119,10 @@ func NewProgram(code []Instruction, ignoreCase, multiline, dotAll, unicode, back
 	if !optimize {
 		p.exact = true
 		p.leafCache = nil
-		return p
+		return p, nil
 	}
 	p.computeDirections()
-	p.exact = hasBackref(code) || hasEpsilonCycle(code) || tooManyMarks
+	p.exact = hasBackref(code) || hasEpsilonCycle(code, poll) || tooManyMarks
 	p.anchored = !backward && len(code) > 1 &&
 		code[0].Op == OpSaveStart && code[0].A == 0 && code[1].Op == OpStartLine && !p.multilineAt(&code[1])
 
@@ -116,6 +133,9 @@ func NewProgram(code []Instruction, ignoreCase, multiline, dotAll, unicode, back
 		}
 	}
 	for pc := range code {
+		if !poll.tick() {
+			break
+		}
 		if code[pc].Op != OpSplit {
 			continue
 		}
@@ -135,7 +155,30 @@ func NewProgram(code []Instruction, ignoreCase, multiline, dotAll, unicode, back
 		}
 	}
 	p.leafCache = nil // only needed during construction; keeps Program immutable
-	return p
+	if poll.err != nil {
+		return nil, poll.err
+	}
+	return p, nil
+}
+
+// analysisPoll polls a context every so many units of analysis.
+type analysisPoll struct {
+	ctx context.Context // nil if it cannot be cancelled
+	n   int
+	err error
+}
+
+// tick counts a unit of work, reporting whether the analysis may go on.
+func (a *analysisPoll) tick() bool {
+	if a.ctx == nil || a.err != nil {
+		return a.err == nil
+	}
+	if a.n++; a.n%1024 == 0 {
+		if err := a.ctx.Err(); err != nil {
+			a.err = fmt.Errorf("analysing the program interrupted: %w", err)
+		}
+	}
+	return a.err == nil
 }
 
 // matches reports whether p was built for exactly this configuration.
@@ -255,7 +298,7 @@ func epsilonSuccs(code []Instruction, pc int, out []int) []int {
 // subtree known to fail. The compiler guards every loop whose body can match
 // empty with a progress check (see epsilonSuccs), so this holds only for
 // hand-built programs.
-func hasEpsilonCycle(code []Instruction) bool {
+func hasEpsilonCycle(code []Instruction, poll *analysisPoll) bool {
 	const (
 		white = iota
 		grey
@@ -274,6 +317,9 @@ func hasEpsilonCycle(code []Instruction) bool {
 		stack := []item{{pc: root, succs: epsilonSuccs(code, root, nil)}}
 		color[root] = grey
 		for len(stack) > 0 {
+			if !poll.tick() {
+				return false
+			}
 			top := &stack[len(stack)-1]
 			if top.next == len(top.succs) {
 				color[top.pc] = black

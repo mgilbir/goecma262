@@ -1,6 +1,7 @@
 package ecma262_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -258,4 +259,16 @@ func ExampleWithBudget() {
 	// Output:
 	// ^[a-z]+@[a-z]+\.com$ compiled to 16 instructions
 	// (a{1000}){1000} refused
+}
+
+// A match can be stopped by a deadline or a cancellation: the copy made by
+// WithContext polls the context as it matches.
+func ExampleRegexp_WithContext() {
+	re := ecma262.MustCompile(`(a|aa)*b`, flags.Flags(0))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := re.WithContext(ctx).MatchStringErr(strings.Repeat("a", 1<<20))
+	fmt.Println(errors.Is(err, context.Canceled), errors.Is(err, ecma262.ErrStepLimit))
+	// Output:
+	// true false
 }

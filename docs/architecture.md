@@ -113,6 +113,26 @@ Details worth knowing before touching the VM:
   non-ASCII, and every instruction that can match non-ASCII already admits
   every byte from 0x80 up.
 
+## Cancellation
+
+Every stage can be interrupted. The parser polls its context every 1,024
+calls to `atEnd`, which every loop over the pattern makes; the compiler
+every 1,024 nodes it compiles (a quantifier's body counts once per copy) and
+strings it evaluates in a class set; the analysis in `vm.NewProgram` every
+1,024 instructions of each of its passes. Quick linear passes are not
+polled: the parser's group count and duplicate-name check, and the walks of
+the AST in `compiler.Bound` and in sizing a program.
+
+Matching polls `vm.VM.Context` about every `vm.PollSteps` steps, but never in
+the step loop itself, whose code is unchanged by it: a call there, even on a
+path taken every few thousand steps, made the compiler keep registers on the
+stack and slowed every step. It polls where execution already leaves the
+loop: at each split (`memoVisit`; every loop of a program has a split), as a
+greedy loop gives characters back in `backtrack`, at each start position
+(`prepare`), and after every megabyte a backreference compares, since one
+backreference may compare the whole input in a step. A search that takes
+fewer steps than separate two polls still polls at its first start position.
+
 ## Lookarounds and right-to-left lookbehind
 
 Lookarounds run as nested runs of the same VM over the same input (`vm.run`

@@ -2,6 +2,7 @@
 package vm
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -265,6 +266,12 @@ type VM struct {
 	MaxMemory  int // bytes; 0 means DefaultMaxMemory + DefaultMemoryPerByte*len(Input)
 	Err        error
 
+	// Context, if it can be cancelled, is polled while matching: once it is
+	// done the match stops, as when the budget runs out, with Err wrapping
+	// Context.Err() instead of ErrStepLimit. It is polled about every
+	// PollSteps steps (see PollSteps for where).
+	Context context.Context
+
 	// Backward runs the engine right-to-left: character instructions consume the
 	// rune ending at pos (pos decreases), and group save ops record the group's
 	// far/near edge accordingly. Used for lookbehind, whose body is compiled in
@@ -282,6 +289,9 @@ type VM struct {
 	stepLimit int
 	memLimit  int
 	memoBytes int // memory held by active failure memos
+	polling   bool
+	nextPoll  int // the step at or after which Context is next polled, if polling
+	work      int // characters compared by backreferences since the last poll
 
 	stack   []frame
 	choices []int // stack indices of the choice frames, innermost last
@@ -606,6 +616,18 @@ func (vm *VM) prepare(input string) {
 	if vm.memLimit <= 0 {
 		vm.memLimit = scaledLimit(DefaultMaxMemory, DefaultMemoryPerByte, len(input))
 	}
+	vm.polling = vm.Context != nil && vm.Context.Done() != nil
+	if vm.polling {
+		// Successive MatchAt calls share the poll schedule, as they share
+		// the budget: each may take fewer than PollSteps steps. A schedule
+		// beyond one poll ahead is from before Match reset the steps.
+		if vm.nextPoll > vm.steps+PollSteps {
+			vm.nextPoll = vm.steps + PollSteps
+		}
+		if vm.nextPoll <= vm.steps {
+			vm.poll() // due, or the first; MatchAt checks Err
+		}
+	}
 }
 
 // scaledLimit returns base + perByte*n, saturating instead of overflowing int
@@ -631,6 +653,43 @@ func (vm *VM) step() bool {
 		vm.Err = ErrStepLimit
 		return false
 	}
+	return true
+}
+
+// PollSteps is about how many steps separate two polls of a VM's Context.
+// Context is polled where execution already leaves the step loop, so that
+// polling costs the loop nothing: at each split (every loop of a program has
+// one), as a greedy loop gives back characters, at each start position, and
+// as backreferences compare text.
+const PollSteps = 4096
+
+// pollDue reports whether Context is due a poll.
+func (vm *VM) pollDue() bool { return vm.polling && vm.steps >= vm.nextPoll }
+
+// pollWork is how many characters backreferences may compare between two
+// polls, since one backreference may compare the whole input.
+const pollWork = 1 << 20
+
+// compared counts n characters compared by a backreference (negative when
+// matching backward), polling Context once pollWork have been.
+//
+//go:noinline
+func (vm *VM) compared(n int) bool {
+	if vm.work += max(n, -n); vm.work > pollWork {
+		return vm.poll()
+	}
+	return true
+}
+
+// poll reports whether matching may go on, setting Err if Context is done,
+// and schedules the next poll.
+func (vm *VM) poll() bool {
+	if err := vm.Context.Err(); err != nil {
+		vm.Err = fmt.Errorf("matching interrupted: %w", err)
+		return false
+	}
+	vm.work = 0
+	vm.nextPoll = vm.steps + PollSteps
 	return true
 }
 
@@ -688,6 +747,9 @@ func (vm *VM) setGroup(st *runState, slot, val int) bool {
 // exact value instead would make the states of an empty-matching loop
 // quadratic in the input.
 func (vm *VM) memoVisit(st *runState, pc, pos int) (visited, ok bool) {
+	if vm.pollDue() && !vm.poll() {
+		return false, false
+	}
 	before := st.memo.bytes
 	key := memoKey{pc: pc}
 	lo := min(vm.prog.markLo, len(st.groups))
@@ -776,7 +838,7 @@ func (vm *VM) backtrack(st *runState) (pc, pos int, found bool) {
 			vm.choices = vm.choices[:len(vm.choices)-1]
 			return int(f.pc), f.a, true
 		case frameGreedy:
-			if !vm.step() {
+			if !vm.step() || vm.pollDue() && !vm.poll() {
 				return 0, 0, false
 			}
 			p := vm.retreat(f.a, f.b, st.backward)
@@ -971,7 +1033,11 @@ func (vm *VM) run(st *runState, pc, pos int) (bool, int) {
 
 			case OpBackref:
 				var matched bool
+				from := pos
 				pos, matched = vm.matchBackref(inst, st.groups, pos, back)
+				if vm.polling && !vm.compared(pos-from) {
+					return false, 0
+				}
 				if matched {
 					pc++
 				} else {

@@ -42,6 +42,9 @@ func (v classSetValue) sameProperty(o classSetValue) bool {
 // children, the longer strings, before ending the string there.
 func (c *Compiler) compileClassSet(e *parser.ClassSetExpression) error {
 	v := c.setValue(e)
+	if c.poll.err != nil {
+		return c.poll.err
+	}
 	if len(v.strings) == 0 {
 		c.emit(vm.Instruction{Op: vm.OpClassSet, Set: v.chars})
 		return nil
@@ -183,6 +186,9 @@ func (c *Compiler) evalStrings(n *parser.ClassStrings) classSetValue {
 	var singles []vm.RuneRange
 	strs := map[string]bool{}
 	for _, s := range n.Strings {
+		if c.poll.tick() != nil {
+			break // the caller stops on poll.err
+		}
 		if len(s) == 1 {
 			singles = append(singles, vm.RuneRange{Start: s[0], End: s[0]})
 			continue

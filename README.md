@@ -223,6 +223,13 @@ if errors.Is(err, ecma262.ErrStepLimit) {
 }
 ```
 
+`SetMaxMemory` lowers the memory part of the budget, as `SetMaxSteps` fixes
+the step part. To stop at a deadline, match with `re.WithContext(ctx)`: its
+operations poll `ctx` every few thousand steps and stop once it is done,
+returning an error that wraps `ctx.Err()` (not `ErrStepLimit`).
+`CompileContext` does the same for parsing, compiling and analysing a
+pattern.
+
 **Errors.** `Compile` wraps failures as `parse error: …` or
 `compile error: …` and rejects `u`+`v` as `incompatible flags`. `flags.Parse`
 returns typed errors (`InvalidFlagError`, `DuplicateFlagError`,

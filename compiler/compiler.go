@@ -2,6 +2,7 @@
 package compiler
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/mgilbir/goecma262/parser"
@@ -76,6 +77,34 @@ type Compiler struct {
 	classAtoms map[*parser.CharacterClass][]vm.ClassAtom
 	reversed   map[parser.Expression]parser.Expression
 	classSets  map[*parser.ClassSetExpression]*classSetValue
+
+	poll poller
+}
+
+// poller polls a context every pollEvery units of work, and remembers why
+// the work must stop.
+type poller struct {
+	ctx   context.Context // nil if it cannot be cancelled
+	ticks int
+	err   error
+}
+
+// pollEvery is how much compiling work separates two polls of the context.
+const pollEvery = 1024
+
+// tick counts a unit of work, returning an error once the context is done.
+func (p *poller) tick() error {
+	if p.ctx == nil || p.err != nil {
+		return p.err
+	}
+	if p.ticks--; p.ticks > 0 {
+		return nil
+	}
+	p.ticks = pollEvery
+	if err := p.ctx.Err(); err != nil {
+		p.err = fmt.Errorf("compiling interrupted: %w", err)
+	}
+	return p.err
 }
 
 // Compile compiles a regex pattern AST to VM instructions.
@@ -89,6 +118,16 @@ type Compiler struct {
 // emitted (see Bound), so a pattern over the limit is refused before the cost
 // is paid, and the instruction slice is allocated once at its final size.
 func Compile(pattern *parser.Pattern) ([]vm.Instruction, int, error) {
+	return CompileContext(context.Background(), pattern)
+}
+
+// CompileContext is Compile, but gives up when ctx is done, returning an error
+// that wraps ctx.Err(). It polls ctx as it works, so it returns soon after ctx
+// is done, whatever the size of the program.
+func CompileContext(ctx context.Context, pattern *parser.Pattern) ([]vm.Instruction, int, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, 0, fmt.Errorf("compiling interrupted: %w", err)
+	}
 	cost, err := Bound(pattern)
 	if err != nil {
 		return nil, 0, err
@@ -102,6 +141,9 @@ func Compile(pattern *parser.Pattern) ([]vm.Instruction, int, error) {
 		multiline:   pattern.Flags.Multiline,
 		dotAll:      pattern.Flags.DotAll,
 		unicodeSets: pattern.Flags.UnicodeSets,
+	}
+	if ctx.Done() != nil {
+		c.poll = poller{ctx: ctx, ticks: pollEvery}
 	}
 	n := cost.Instructions
 	if !cost.Exact {
@@ -178,6 +220,9 @@ func (c *Compiler) patchJump(idx, target int) {
 }
 
 func (c *Compiler) compileNode(node parser.Node) error {
+	if err := c.poll.tick(); err != nil {
+		return err
+	}
 	c.depth++
 	if c.depth > MaxNestingDepth {
 		return limitf(ErrNestingTooDeep, "pattern too deeply nested (limit: %d)", MaxNestingDepth)
