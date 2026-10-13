@@ -238,3 +238,72 @@ func TestSetMaxMemory(t *testing.T) {
 		t.Errorf("with the default restored: %v, %v", ok, err)
 	}
 }
+
+// A compile whose context ends before its program is allocated allocates
+// none: on v0.3.0, a context that ended at the compiler's first poll, after
+// Bound, still cost the whole program, 19.3 MB here.
+func TestCancelledCompileAllocatesNoProgram(t *testing.T) {
+	ast, err := parser.New(`(a{1000}){150}`, parser.Flags{}).Parse()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for n := 1; n <= 2; n++ {
+		var err error
+		allocated := allocatedBy(func() { _, _, err = compiler.CompileContext(newPollCtx(n), ast) })
+		checkInterrupted(t, "compile", err)
+		if allocated > 64<<10 {
+			t.Errorf("cancelled at poll %d: allocated %d bytes", n, allocated)
+		}
+	}
+}
+
+// Bound walks the whole AST, which a long pattern makes large, so it polls.
+func TestBoundContextPolls(t *testing.T) {
+	const n = 40_000
+	ast, err := parser.New(strings.Repeat("(?:a|b)", n), parser.Flags{}).Parse()
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodes := 4 * n // a group's disjunction and two literals, and the sequence
+	total := polls(func(ctx context.Context) {
+		if _, err := compiler.BoundContext(ctx, ast); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if total < nodes/1024 {
+		t.Errorf("Bound polled %d times over %d nodes", total, nodes)
+	}
+	_, err = compiler.BoundContext(newPollCtx(3), ast)
+	checkInterrupted(t, "Bound", err)
+	if !strings.Contains(err.Error(), "bounding interrupted") {
+		t.Errorf("error %q", err)
+	}
+	// Compiling bounds the pattern first; interrupted there, it allocates
+	// no program.
+	var cerr error
+	allocated := allocatedBy(func() { _, _, cerr = compiler.CompileContext(newPollCtx(3), ast) })
+	checkInterrupted(t, "compile", cerr)
+	if allocated > 64<<10 {
+		t.Errorf("a compile cancelled while bounding allocated %d bytes", allocated)
+	}
+}
+
+// A pattern whose classes Bound bounds rather than counts is walked three
+// times by a compile, to bound it, to count it exactly and to emit it, and
+// each walk polls.
+func TestCompilePollsEachWalk(t *testing.T) {
+	const n = 30_000
+	ast, err := parser.New(`[\q{ab}]`+strings.Repeat("(?:a|b)", n), parser.Flags{UnicodeSets: true}).Parse()
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodes := 4 * n
+	total := polls(func(ctx context.Context) {
+		if _, _, err := compiler.CompileContext(ctx, ast); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if total < 3*nodes/1024 {
+		t.Errorf("compiling polled %d times over three walks of %d nodes", total, nodes)
+	}
+}

@@ -1,6 +1,7 @@
 package compiler
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"unsafe"
@@ -37,18 +38,29 @@ type Cost struct {
 // Compile refuses a pattern whose exact size is over it before emitting
 // anything.
 func Bound(pattern *parser.Pattern) (Cost, error) {
-	return bound(pattern, nil)
+	return bound(pattern, nil, nil)
+}
+
+// BoundContext is Bound, but gives up when ctx is done, returning an error
+// that wraps ctx.Err(). It polls ctx every 1,024 nodes of the AST.
+func BoundContext(ctx context.Context, pattern *parser.Pattern) (Cost, error) {
+	if err := ctx.Err(); err != nil {
+		return Cost{}, fmt.Errorf("bounding interrupted: %w", err)
+	}
+	return bound(pattern, nil, newPoller(ctx, "bounding"))
 }
 
 // bound is Bound, stopping with an error wrapping ErrBudgetExceeded as soon
-// as the cost is over lim, if lim is not nil.
-func bound(pattern *parser.Pattern, lim *Limits) (Cost, error) {
+// as the cost is over lim, if lim is not nil, and polling poll, if it is not
+// nil.
+func bound(pattern *parser.Pattern, lim *Limits, poll *poller) (Cost, error) {
 	b := &bounder{
 		ignoreCase:  pattern.Flags.IgnoreCase,
 		unicodeSets: pattern.Flags.UnicodeSets,
 		exact:       true,
 		mult:        1,
 		lim:         lim,
+		poll:        poll,
 	}
 	// Group 0's saves and the final match.
 	if err := b.add(emits(3, 0)); err != nil {
@@ -114,6 +126,8 @@ type bounder struct {
 	// then counts exactly, evaluating class sets through c, which keeps them
 	// for the code; Bytes is not computed.
 	c *Compiler
+	// poll, if set, is polled for every node.
+	poll *poller
 }
 
 // size is the cost of some code.
@@ -181,6 +195,9 @@ func (b *bounder) checkLimits(done bool) error {
 }
 
 func (b *bounder) node(node parser.Node) error {
+	if err := b.poll.tick(); err != nil {
+		return err
+	}
 	b.depth++
 	if b.depth > MaxNestingDepth {
 		return limitf(ErrNestingTooDeep, "pattern too deeply nested (limit: %d)", MaxNestingDepth)

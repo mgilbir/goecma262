@@ -117,11 +117,15 @@ Details worth knowing before touching the VM:
 
 Every stage can be interrupted. The parser polls its context every 1,024
 calls to `atEnd`, which every loop over the pattern makes; the compiler
-every 1,024 nodes it compiles (a quantifier's body counts once per copy) and
-strings it evaluates in a class set; the analysis in `vm.NewProgram` every
-1,024 instructions of each of its passes. Quick linear passes are not
-polled: the parser's group count and duplicate-name check, and the walks of
-the AST in `compiler.Bound` and in sizing a program.
+every 1,024 nodes it walks, in bounding the pattern (`compiler.Bound`, or
+`BoundContext` alone), in counting it exactly when Bound could not, and in
+compiling it (where a quantifier's body counts once per copy), and every
+1,024 strings it evaluates in a class set; it polls once more just before it
+allocates the program, its largest allocation, so a compile whose context
+ended while the program was being sized allocates none. The analysis in
+`vm.NewProgram` polls every 1,024 instructions of each of its passes. The
+parser's quick linear passes, its group count and duplicate-name check, are
+not polled.
 
 Matching polls `vm.VM.Context` about every `vm.PollSteps` steps, but never in
 the step loop itself, whose code is unchanged by it: a call there, even on a

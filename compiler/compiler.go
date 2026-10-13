@@ -78,7 +78,7 @@ type Compiler struct {
 	reversed   map[parser.Expression]parser.Expression
 	classSets  map[*parser.ClassSetExpression]*classSetValue
 
-	poll poller
+	poll *poller
 }
 
 // poller polls a context every pollEvery units of work, and remembers why
@@ -87,22 +87,55 @@ type poller struct {
 	ctx   context.Context // nil if it cannot be cancelled
 	ticks int
 	err   error
+	what  string // the work, for the error: "compiling", "bounding"
+}
+
+// newPoller returns a poller of ctx, or nil, which polls nothing, if ctx
+// cannot be cancelled.
+func newPoller(ctx context.Context, what string) *poller {
+	if ctx.Done() == nil {
+		return nil
+	}
+	return &poller{ctx: ctx, ticks: pollEvery, what: what}
 }
 
 // pollEvery is how much compiling work separates two polls of the context.
 const pollEvery = 1024
 
 // tick counts a unit of work, returning an error once the context is done.
+// A nil poller polls nothing.
 func (p *poller) tick() error {
+	if p == nil {
+		return nil
+	}
 	if p.ctx == nil || p.err != nil {
 		return p.err
 	}
 	if p.ticks--; p.ticks > 0 {
 		return nil
 	}
+	return p.now()
+}
+
+// now polls the context at once, whatever the count.
+func (p *poller) now() error {
+	if p == nil {
+		return nil
+	}
+	if p.ctx == nil || p.err != nil {
+		return p.err
+	}
 	p.ticks = pollEvery
 	if err := p.ctx.Err(); err != nil {
-		p.err = fmt.Errorf("compiling interrupted: %w", err)
+		p.err = fmt.Errorf("%s interrupted: %w", p.what, err)
+	}
+	return p.err
+}
+
+// stopped returns why the work must stop, if a poll found the context done.
+func (p *poller) stopped() error {
+	if p == nil {
+		return nil
 	}
 	return p.err
 }
@@ -156,7 +189,8 @@ func compile(ctx context.Context, pattern *parser.Pattern, lim *Limits, check fu
 	if err := ctx.Err(); err != nil {
 		return nil, 0, fmt.Errorf("compiling interrupted: %w", err)
 	}
-	cost, err := bound(pattern, lim)
+	poll := newPoller(ctx, "compiling")
+	cost, err := bound(pattern, lim, poll)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -174,9 +208,7 @@ func compile(ctx context.Context, pattern *parser.Pattern, lim *Limits, check fu
 		multiline:   pattern.Flags.Multiline,
 		dotAll:      pattern.Flags.DotAll,
 		unicodeSets: pattern.Flags.UnicodeSets,
-	}
-	if ctx.Done() != nil {
-		c.poll = poller{ctx: ctx, ticks: pollEvery}
+		poll:        poll,
 	}
 	n := cost.Instructions
 	if !cost.Exact {
@@ -184,7 +216,7 @@ func compile(ctx context.Context, pattern *parser.Pattern, lim *Limits, check fu
 		// far over (a subtraction may remove them all). Compiling evaluates
 		// the sets anyway, so do it first and count their tries exactly; the
 		// code then reuses them.
-		b := &bounder{c: c, ignoreCase: c.ignoreCase, unicodeSets: c.unicodeSets, exact: true, mult: 1}
+		b := &bounder{c: c, ignoreCase: c.ignoreCase, unicodeSets: c.unicodeSets, exact: true, mult: 1, poll: poll}
 		if err := b.add(emits(3, 0)); err != nil { // group 0's saves and the match
 			return nil, 0, err
 		}
@@ -196,6 +228,11 @@ func compile(ctx context.Context, pattern *parser.Pattern, lim *Limits, check fu
 			return nil, 0, errProgramTooLarge()
 		}
 		n = int(b.total.instructions)
+	}
+	// The program is the compile's largest allocation: not if ctx ended
+	// while it was being sized.
+	if err := poll.now(); err != nil {
+		return nil, 0, err
 	}
 	c.code = make([]vm.Instruction, 0, n)
 
