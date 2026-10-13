@@ -2,6 +2,8 @@
 // object, so that the library can report what a compiled pattern holds.
 package memsize
 
+import "unsafe"
+
 // sizeClasses are the object sizes of the Go runtime's small size classes
 // (internal/runtime/gc.SizeClassToSize, unchanged since Go 1.12). A small
 // object takes the smallest class that holds it.
@@ -10,13 +12,42 @@ var sizeClasses = [...]uint16{8, 16, 24, 32, 48, 64, 80, 96, 112, 128, 144, 160,
 const (
 	maxSmallSize = 32768
 	pageSize     = 8192
+
+	// The malloc header of a small object with pointers, and the size above
+	// which such an object has one (internal/runtime/gc.MallocHeaderSize and
+	// MinSizeForMallocHeader: 512 bytes on 64-bit platforms, 128 on 32-bit).
+	mallocHeaderSize       = 8
+	minSizeForMallocHeader = int64(unsafe.Sizeof(uintptr(0)) * unsafe.Sizeof(uintptr(0)) * 8)
 )
 
-// Round returns the bytes the Go allocator takes for an object of n bytes: its
-// size class for a small object, whole pages for a large one. It saturates
-// rather than overflow. TestRoundMatchesRuntime checks it against the running
-// runtime.
+// Round returns the bytes the Go allocator takes for an object of n bytes
+// that holds pointers: its size class for a small object, whole pages for a
+// large one. Since Go 1.22 a small object with pointers of more than
+// minSizeForMallocHeader bytes carries a header describing them, which the
+// size class must hold too. It saturates rather than overflow.
+// TestRoundMatchesRuntime checks it against the running runtime.
 func Round(n int64) int64 {
+	if n > minSizeForMallocHeader && n <= maxSmallSize-mallocHeaderSize {
+		return sizeClass(n + mallocHeaderSize)
+	}
+	return sizeClass(n)
+}
+
+// RoundNoScan is Round for an object that holds no pointers, such as a
+// string or a slice of integers. Such an object has no header. The runtime
+// packs those under 16 bytes into shared 16-byte blocks, and one live object
+// keeps its whole block alive, so RoundNoScan counts the block: an upper
+// bound for these objects, never an under-count.
+func RoundNoScan(n int64) int64 {
+	if n > 0 && n < tinySize {
+		return tinySize
+	}
+	return sizeClass(n)
+}
+
+// sizeClass returns the bytes the allocator takes for a block of n bytes,
+// any header included.
+func sizeClass(n int64) int64 {
 	switch {
 	case n <= 0:
 		return 0
@@ -35,18 +66,6 @@ func Round(n int64) int64 {
 		return maxInt64
 	}
 	return (n + pageSize - 1) / pageSize * pageSize
-}
-
-// RoundNoScan is Round for an object that holds no pointers, such as a
-// string or a slice of integers. The runtime packs such objects under 16
-// bytes into shared 16-byte blocks, and one live object keeps its whole block
-// alive, so RoundNoScan counts the block: an upper bound for these objects,
-// never an under-count.
-func RoundNoScan(n int64) int64 {
-	if n > 0 && n < tinySize {
-		return tinySize
-	}
-	return Round(n)
 }
 
 const tinySize = 16
