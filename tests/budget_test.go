@@ -1,13 +1,16 @@
 package ecma262_test
 
 import (
+	"context"
 	"errors"
 	"math/rand"
 	"strings"
 	"testing"
 
 	"github.com/mgilbir/goecma262"
+	"github.com/mgilbir/goecma262/compiler"
 	"github.com/mgilbir/goecma262/flags"
+	"github.com/mgilbir/goecma262/parser"
 )
 
 func compileBudget(p, fl string, instructions int, bytes int64) (*ecma262.Regexp, error) {
@@ -145,4 +148,46 @@ func TestBudgetBoundsCompileAllocation(t *testing.T) {
 		check(p, "v")
 	}
 	t.Logf("at most %.2f times the budget", worst)
+}
+
+// CompileChecked shows its check the cost Bound reports, once, before any
+// code is emitted, and returns the check's refusal as it is.
+func TestCompileCheckedChecksTheCostOnce(t *testing.T) {
+	for _, p := range []string{`a`, `(a{1000}){190}`, `[\q{ab|cd}]{3}`, `(?<=\p{RGI_Emoji})x`, `(a{1000}){1000}`} {
+		ast, err := parser.New(p, parser.Flags{UnicodeSets: true}).Parse()
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, err := compiler.Bound(ast)
+		if err != nil {
+			t.Fatal(err)
+		}
+		calls := 0
+		var got compiler.Cost
+		_, _, err = compiler.CompileChecked(context.Background(), ast, func(c compiler.Cost) error {
+			calls++
+			got = c
+			return nil
+		})
+		if calls != 1 || got != want {
+			t.Errorf("%s: check called %d times with %+v; want once with %+v", p, calls, got, want)
+		}
+		if want.Instructions <= compiler.MaxProgramSize && err != nil {
+			t.Errorf("%s: %v", p, err)
+		}
+
+		refusal := errors.New("refused")
+		var cerr error
+		allocated := allocatedBy(func() {
+			_, _, cerr = compiler.CompileChecked(context.Background(), ast, func(compiler.Cost) error { return refusal })
+		})
+		// The refusal comes first, even for a pattern over MaxProgramSize,
+		// and before the program is allocated.
+		if cerr != refusal {
+			t.Errorf("%s: error %v, want the check's", p, cerr)
+		}
+		if allocated > 16<<10 {
+			t.Errorf("%s: a refused compile allocated %d bytes", p, allocated)
+		}
+	}
 }

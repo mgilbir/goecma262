@@ -125,12 +125,28 @@ func Compile(pattern *parser.Pattern) ([]vm.Instruction, int, error) {
 // that wraps ctx.Err(). It polls ctx as it works, so it returns soon after ctx
 // is done, whatever the size of the program.
 func CompileContext(ctx context.Context, pattern *parser.Pattern) ([]vm.Instruction, int, error) {
+	return CompileChecked(ctx, pattern, nil)
+}
+
+// CompileChecked is CompileContext, but first passes the pattern's cost, as
+// Bound reports it, to check, and if check returns an error returns that
+// error without compiling. It lets a caller refuse a pattern over a budget of
+// its own before the cost is paid, without computing the cost twice. A nil
+// check accepts every cost. check is called once, before any code is
+// emitted, and before the pattern is compared with MaxProgramSize, so its
+// refusal takes precedence.
+func CompileChecked(ctx context.Context, pattern *parser.Pattern, check func(Cost) error) ([]vm.Instruction, int, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, 0, fmt.Errorf("compiling interrupted: %w", err)
 	}
 	cost, err := Bound(pattern)
 	if err != nil {
 		return nil, 0, err
+	}
+	if check != nil {
+		if err := check(cost); err != nil {
+			return nil, 0, err
+		}
 	}
 	if cost.Exact && cost.Instructions > MaxProgramSize {
 		return nil, 0, errProgramTooLarge()

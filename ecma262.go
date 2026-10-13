@@ -208,22 +208,21 @@ type limitError struct{ msg string }
 func (e *limitError) Error() string { return e.msg }
 func (e *limitError) Unwrap() error { return ErrLimit }
 
-// checkBudget refuses ast if compiling it could exceed cfg's budget.
-func (cfg *config) checkBudget(expr string, ast *parser.Pattern, names []string) error {
+// budgetCheck returns the check, for compiler.CompileChecked, that refuses a
+// pattern whose cost is over cfg's budget, or nil without a budget.
+func (cfg *config) budgetCheck(expr string, names []string) func(compiler.Cost) error {
 	if cfg.maxInstructions <= 0 && cfg.maxBytes <= 0 {
 		return nil
 	}
-	cost, err := compiler.Bound(ast)
-	if err != nil {
-		return fmt.Errorf("compile error: %w", err)
+	return func(cost compiler.Cost) error {
+		if cfg.maxInstructions > 0 && cost.Instructions > cfg.maxInstructions {
+			return fmt.Errorf("%w: compiles to %d instructions, over the %d allowed", ErrBudgetExceeded, cost.Instructions, cfg.maxInstructions)
+		}
+		if n := memsize.Add(cost.Bytes, ownBytes(expr, names)); cfg.maxBytes > 0 && n > cfg.maxBytes {
+			return fmt.Errorf("%w: may hold %d bytes once compiled, over the %d allowed", ErrBudgetExceeded, n, cfg.maxBytes)
+		}
+		return nil
 	}
-	if cfg.maxInstructions > 0 && cost.Instructions > cfg.maxInstructions {
-		return fmt.Errorf("%w: compiles to %d instructions, over the %d allowed", ErrBudgetExceeded, cost.Instructions, cfg.maxInstructions)
-	}
-	if n := memsize.Add(cost.Bytes, ownBytes(expr, names)); cfg.maxBytes > 0 && n > cfg.maxBytes {
-		return fmt.Errorf("%w: may hold %d bytes once compiled, over the %d allowed", ErrBudgetExceeded, n, cfg.maxBytes)
-	}
-	return nil
 }
 
 // Compile parses a regular expression and returns, if successful, a Regexp
@@ -277,14 +276,11 @@ func CompileContext(ctx context.Context, expr string, f flags.Flags, opts ...Opt
 	// that len(names) == numGroups+1 always holds.
 	names := extractGroupNames(ast.Body, ast.NumGroups)
 
-	if err := cfg.checkBudget(expr, ast, names); err != nil {
-		return nil, err
-	}
-
-	// Compile to VM code
-	code, numGroups, err := compiler.CompileContext(ctx, ast)
+	// Compile to VM code, refusing a pattern over budget before any is
+	// emitted.
+	code, numGroups, err := compiler.CompileChecked(ctx, ast, cfg.budgetCheck(expr, names))
 	if err != nil {
-		if interrupted(ctx, err) {
+		if interrupted(ctx, err) || errors.Is(err, ErrBudgetExceeded) {
 			return nil, err
 		}
 		return nil, fmt.Errorf("compile error: %w", err)
