@@ -122,13 +122,11 @@ func TestLeafBytesCacheKeepsInstructionsApart(t *testing.T) {
 	for mask := 0; mask < 16; mask++ {
 		p := testProgram(mask)
 		p.code = insts
-		p.leafCache = make(map[leafKey]*[4]uint64)
 		for pc := range insts {
-			got := *p.leafBytes(pc)
+			got := p.leafBytes(pc)
 			alone := testProgram(mask)
 			alone.code = insts[pc : pc+1]
-			alone.leafCache = make(map[leafKey]*[4]uint64)
-			if want := *alone.leafBytes(0); got != want {
+			if want := alone.leafBytes(0); got != want {
 				t.Errorf("flags %04b, %s %v negate %v mode %04b: %x in the program, %x alone", mask, insts[pc], fmt.Sprint(insts[pc].Class), insts[pc].Negate, insts[pc].Mode, got, want)
 			}
 		}
