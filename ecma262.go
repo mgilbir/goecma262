@@ -199,31 +199,25 @@ func WithBudget(maxInstructions int, maxBytes int64) Option {
 
 // ErrBudgetExceeded is wrapped by the error for a pattern refused because it
 // would cost more than the budget given to Compile with WithBudget. It wraps
-// ErrLimit.
-var ErrBudgetExceeded error = &limitError{msg: "pattern exceeds the budget given to Compile"}
+// ErrLimit, and is compiler.ErrBudgetExceeded.
+var ErrBudgetExceeded = compiler.ErrBudgetExceeded
 
-// limitError is a sentinel for a limit; it wraps ErrLimit.
-type limitError struct{ msg string }
-
-func (e *limitError) Error() string { return e.msg }
-func (e *limitError) Unwrap() error { return ErrLimit }
-
-// checkBudget refuses ast if compiling it could exceed cfg's budget.
-func (cfg *config) checkBudget(expr string, ast *parser.Pattern, names []string) error {
+// limits returns cfg's budget as the compiler's Limits on the program, which
+// the Regexp's own fields (see ownBytes) come out of, or an error if they
+// alone are over it. ok is false without a budget.
+func (cfg *config) limits(expr string, names []string) (lim compiler.Limits, ok bool, err error) {
 	if cfg.maxInstructions <= 0 && cfg.maxBytes <= 0 {
-		return nil
+		return lim, false, nil
 	}
-	cost, err := compiler.Bound(ast)
-	if err != nil {
-		return fmt.Errorf("compile error: %w", err)
+	lim.Instructions = cfg.maxInstructions
+	if cfg.maxBytes > 0 {
+		own := ownBytes(expr, names)
+		if own >= cfg.maxBytes {
+			return lim, false, fmt.Errorf("%w: its source and group names hold %d bytes, of the %d allowed", ErrBudgetExceeded, own, cfg.maxBytes)
+		}
+		lim.Bytes = cfg.maxBytes - own
 	}
-	if cfg.maxInstructions > 0 && cost.Instructions > cfg.maxInstructions {
-		return fmt.Errorf("%w: compiles to %d instructions, over the %d allowed", ErrBudgetExceeded, cost.Instructions, cfg.maxInstructions)
-	}
-	if n := memsize.Add(cost.Bytes, ownBytes(expr, names)); cfg.maxBytes > 0 && n > cfg.maxBytes {
-		return fmt.Errorf("%w: may hold %d bytes once compiled, over the %d allowed", ErrBudgetExceeded, n, cfg.maxBytes)
-	}
-	return nil
+	return lim, true, nil
 }
 
 // Compile parses a regular expression and returns, if successful, a Regexp
@@ -277,14 +271,21 @@ func CompileContext(ctx context.Context, expr string, f flags.Flags, opts ...Opt
 	// that len(names) == numGroups+1 always holds.
 	names := extractGroupNames(ast.Body, ast.NumGroups)
 
-	if err := cfg.checkBudget(expr, ast, names); err != nil {
+	// Compile to VM code, refusing a pattern over budget before any is
+	// emitted, and as soon as it is known to be.
+	lim, budgeted, err := cfg.limits(expr, names)
+	if err != nil {
 		return nil, err
 	}
-
-	// Compile to VM code
-	code, numGroups, err := compiler.CompileContext(ctx, ast)
+	var code []vm.Instruction
+	var numGroups int
+	if budgeted {
+		code, numGroups, err = compiler.CompileLimited(ctx, ast, lim)
+	} else {
+		code, numGroups, err = compiler.CompileContext(ctx, ast)
+	}
 	if err != nil {
-		if interrupted(ctx, err) {
+		if interrupted(ctx, err) || errors.Is(err, ErrBudgetExceeded) {
 			return nil, err
 		}
 		return nil, fmt.Errorf("compile error: %w", err)

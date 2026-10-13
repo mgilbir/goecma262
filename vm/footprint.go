@@ -132,3 +132,11 @@ func FootprintBound(n, splits, owned int64) int64 {
 	b = memsize.Add(b, memsize.RoundNoScan(n))
 	return b
 }
+
+// MinBytesPerInstruction is the least FootprintBound counts for each
+// instruction: the instruction and its entries in the analysis's tables,
+// before the allocator rounds them up. FootprintBound(n, splits, owned) is at
+// least n*MinBytesPerInstruction + owned, so a caller can compare that
+// cheaply with a limit as a program's size grows, and call FootprintBound
+// once at the end.
+const MinBytesPerInstruction = int64(unsafe.Sizeof(Instruction{}) + unsafe.Sizeof((*firstSet)(nil)) + unsafe.Sizeof(greedyLoop{}) + unsafe.Sizeof(false))

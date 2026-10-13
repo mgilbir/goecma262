@@ -122,13 +122,11 @@ func TestLeafBytesCacheKeepsInstructionsApart(t *testing.T) {
 	for mask := 0; mask < 16; mask++ {
 		p := testProgram(mask)
 		p.code = insts
-		p.leafCache = make(map[leafKey]*[4]uint64)
 		for pc := range insts {
-			got := *p.leafBytes(pc)
+			got := p.leafBytes(pc)
 			alone := testProgram(mask)
 			alone.code = insts[pc : pc+1]
-			alone.leafCache = make(map[leafKey]*[4]uint64)
-			if want := *alone.leafBytes(0); got != want {
+			if want := alone.leafBytes(0); got != want {
 				t.Errorf("flags %04b, %s %v negate %v mode %04b: %x in the program, %x alone", mask, insts[pc], fmt.Sprint(insts[pc].Class), insts[pc].Negate, insts[pc].Mode, got, want)
 			}
 		}
@@ -174,6 +172,20 @@ func TestDirectionsAreTheInnermostLookaround(t *testing.T) {
 			if p.dir[pc] != want {
 				t.Fatalf("trial %d: pc %d of %d runs backward %v, want %v", trial, pc, len(code), p.dir[pc], want)
 			}
+		}
+	}
+}
+
+// MinBytesPerInstruction is a lower bound of FootprintBound, as its users
+// rely on.
+func TestMinBytesPerInstructionIsALowerBound(t *testing.T) {
+	rng := rand.New(rand.NewSource(9))
+	for i := 0; i < 100_000; i++ {
+		n := rng.Int63n(1 << uint(rng.Intn(30)))
+		splits := rng.Int63n(n + 1)
+		owned := rng.Int63n(1 << uint(rng.Intn(30)))
+		if got, min := FootprintBound(n, splits, owned), n*MinBytesPerInstruction+owned; got < min {
+			t.Fatalf("FootprintBound(%d, %d, %d) = %d, under %d", n, splits, owned, got, min)
 		}
 	}
 }

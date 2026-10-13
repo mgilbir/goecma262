@@ -28,11 +28,11 @@ type Program struct {
 	// markLo is the first iteration-mark slot (marks occupy markLo..slots-1),
 	// or noMarks when there are none or the memo must key on every slot's
 	// exact value (more marks than its bitmask holds).
-	markLo    int
-	dir       []bool
-	first     []*firstSet  // indexed by pc; set for split targets and loop exits
-	loops     []greedyLoop // indexed by pc; ok for recognised loops
-	leafCache map[leafKey]*[4]uint64
+	markLo int
+	dir    []bool
+	first  []*firstSet  // indexed by pc; set for split targets and loop exits
+	loops  []greedyLoop // indexed by pc; ok for recognised loops
+	leaves leafCache    // only during construction
 
 	footprintOnce sync.Once
 	footprint     int64
@@ -99,7 +99,6 @@ func NewProgramContext(ctx context.Context, code []Instruction, ignoreCase, mult
 		dotAll:     dotAll,
 		unicode:    unicode,
 		backward:   backward,
-		leafCache:  make(map[leafKey]*[4]uint64),
 	}
 	p.first = make([]*firstSet, len(code))
 	p.loops = make([]greedyLoop, len(code))
@@ -118,7 +117,7 @@ func NewProgramContext(ctx context.Context, code []Instruction, ignoreCase, mult
 	}
 	if !optimize {
 		p.exact = true
-		p.leafCache = nil
+		p.leaves = leafCache{}
 		return p, nil
 	}
 	p.computeDirections()
@@ -154,7 +153,7 @@ func NewProgramContext(ctx context.Context, code []Instruction, ignoreCase, mult
 			p.loops[pc] = greedyLoop{body: body, exit: exit, ok: true, possessive: possessive}
 		}
 	}
-	p.leafCache = nil // only needed during construction; keeps Program immutable
+	p.leaves = leafCache{} // only needed during construction; keeps Program immutable
 	if poll.err != nil {
 		return nil, poll.err
 	}
@@ -407,47 +406,107 @@ func (p *Program) asciiOnly(inst *Instruction) bool {
 // rune in either direction, so those bits are exact; any other byte belongs to
 // a non-ASCII rune (or decodes to U+FFFD), so those bits are set unless the
 // instruction is ASCII-only.
-func (p *Program) leafBytes(pc int) *[4]uint64 {
+func (p *Program) leafBytes(pc int) [4]uint64 {
 	inst := &p.code[pc]
-	key := p.leafKeyOf(inst)
-	if s, ok := p.leafCache[key]; ok {
-		return s
-	}
 	var s [4]uint64
 	if lo, ok := p.asciiSetFast(inst); ok {
 		s[0], s[1] = lo[0], lo[1]
 	} else {
-		s[0], s[1] = p.asciiSetSlow(inst)
+		// Matching every ASCII rune is the costly part, which the copies of
+		// an instruction share.
+		key := p.leafKeyOf(inst)
+		set, cached := p.leaves.get(key)
+		if !cached {
+			set[0], set[1] = p.asciiSetSlow(inst)
+			p.leaves.put(key, set)
+		}
+		s[0], s[1] = set[0], set[1]
 	}
 	if !p.asciiOnly(inst) {
 		s[2], s[3] = ^uint64(0), ^uint64(0)
 	}
-	p.leafCache[key] = &s
-	return &s
+	return s
 }
 
-// leafKey is what decides an instruction's leafBytes: the copies of a
-// quantifier's body share their class data, so a program of many copies of a
-// class works out its bytes once, where computing them for each copy (by
-// matching every ASCII rune) dominated compiling such a program.
-type leafKey struct {
-	op                 Opcode
-	ignoreCase, dotAll bool // in effect at the instruction
-	negate             bool
-	char               rune
-	prop               string
-	class              *ClassAtom // the atoms, which are never modified
-	classLen           int
-	set                *CharSet
-	sw                 *RuneSwitch
+// leafCache holds the ASCII sets worked out by matching every ASCII rune.
+// Few instructions need that unless a program is large, so the first few are
+// kept in a slice searched in order, and a map is made only past them: a map
+// of these keys from the start cost every small compile about a kilobyte.
+type leafCache struct {
+	few  []leafEntry
+	many map[leafKey][2]uint64
 }
+
+type leafEntry struct {
+	key leafKey
+	set [2]uint64
+}
+
+const leafFew = 8
+
+func (c *leafCache) get(k leafKey) ([2]uint64, bool) {
+	for i := range c.few {
+		if c.few[i].key == k {
+			return c.few[i].set, true
+		}
+	}
+	s, ok := c.many[k]
+	return s, ok
+}
+
+func (c *leafCache) put(k leafKey, s [2]uint64) {
+	if len(c.few) < leafFew {
+		if c.few == nil {
+			c.few = make([]leafEntry, 0, leafFew)
+		}
+		c.few = append(c.few, leafEntry{k, s})
+		return
+	}
+	if c.many == nil {
+		c.many = make(map[leafKey][2]uint64)
+	}
+	c.many[k] = s
+}
+
+// leafKey identifies an instruction's ASCII set: the copies of a
+// quantifier's body share their class data, so a program of many copies of a
+// class works out its set once, where matching every ASCII rune for each copy
+// dominated compiling such a program. The operand that owns data is keyed by
+// its identity, which identifies its content, since none is ever modified.
+type leafKey struct {
+	op    Opcode
+	flags uint8 // leafIgnoreCase (in effect at the instruction) and leafNegate
+	char  rune
+	ptr   unsafe.Pointer // the class atoms, class set, rune switch or property name
+	n     int            // the number of atoms, or the property name's length
+}
+
+// Only . reads the s flag, and its set is never matched out, so the key has
+// no need of it.
+const (
+	leafIgnoreCase = 1 << iota
+	leafNegate
+)
 
 func (p *Program) leafKeyOf(inst *Instruction) leafKey {
-	return leafKey{
-		op: inst.Op, ignoreCase: p.ignoreCaseAt(inst), dotAll: p.dotAllAt(inst), negate: inst.Negate,
-		char: inst.Char, prop: inst.Prop, class: unsafe.SliceData(inst.Class), classLen: len(inst.Class),
-		set: inst.Set, sw: inst.Switch,
+	k := leafKey{op: inst.Op, char: inst.Char}
+	if p.ignoreCaseAt(inst) {
+		k.flags |= leafIgnoreCase
 	}
+	if inst.Negate {
+		k.flags |= leafNegate
+	}
+	switch {
+	case inst.Class != nil:
+		k.ptr, k.n = unsafe.Pointer(unsafe.SliceData(inst.Class)), len(inst.Class)
+	case inst.Set != nil:
+		k.ptr = unsafe.Pointer(inst.Set)
+	case inst.Switch != nil:
+		k.ptr = unsafe.Pointer(inst.Switch)
+	case inst.Prop != "":
+		k.ptr, k.n = unsafe.Pointer(unsafe.StringData(inst.Prop)), len(inst.Prop)
+	}
+	return k
 }
 
 // asciiSetSlow returns the ASCII runes the single-rune instruction accepts, by

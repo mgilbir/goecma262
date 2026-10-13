@@ -36,40 +36,48 @@ func (e *DuplicateFlagError) Error() string {
 
 // Parse parses a flag string and returns the corresponding Flags value.
 // Returns an error for invalid flags, duplicate flags, or incompatible flags (u and v).
+// It allocates nothing but its error, however long s is: the flags seen so
+// far are a Flags value, and an invalid character fails at once.
 func Parse(s string) (Flags, error) {
 	var f Flags
-	seen := make(map[rune]bool, len(s))
 	for _, c := range s {
-		if seen[c] {
-			return 0, &DuplicateFlagError{Flag: c}
-		}
-		seen[c] = true
-		switch c {
-		case 'i':
-			f |= IgnoreCase
-		case 'g':
-			f |= Global
-		case 'm':
-			f |= Multiline
-		case 's':
-			f |= DotAll
-		case 'u':
-			f |= Unicode
-		case 'v':
-			f |= UnicodeSets
-		case 'y':
-			f |= Sticky
-		case 'd':
-			f |= HasIndices
-		default:
+		flag := flagOf(c)
+		if flag == 0 {
 			return 0, &InvalidFlagError{Flag: c}
 		}
+		if f.Has(flag) {
+			return 0, &DuplicateFlagError{Flag: c}
+		}
+		f |= flag
 	}
 	// u and v flags are mutually exclusive
 	if f&Unicode != 0 && f&UnicodeSets != 0 {
 		return 0, &IncompatibleFlagsError{Flags: "u and v"}
 	}
 	return f, nil
+}
+
+// flagOf returns the flag c names, or 0 if it names none.
+func flagOf(c rune) Flags {
+	switch c {
+	case 'i':
+		return IgnoreCase
+	case 'g':
+		return Global
+	case 'm':
+		return Multiline
+	case 's':
+		return DotAll
+	case 'u':
+		return Unicode
+	case 'v':
+		return UnicodeSets
+	case 'y':
+		return Sticky
+	case 'd':
+		return HasIndices
+	}
+	return 0
 }
 
 // String returns the string representation of flags

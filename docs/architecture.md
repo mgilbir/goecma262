@@ -117,11 +117,15 @@ Details worth knowing before touching the VM:
 
 Every stage can be interrupted. The parser polls its context every 1,024
 calls to `atEnd`, which every loop over the pattern makes; the compiler
-every 1,024 nodes it compiles (a quantifier's body counts once per copy) and
-strings it evaluates in a class set; the analysis in `vm.NewProgram` every
-1,024 instructions of each of its passes. Quick linear passes are not
-polled: the parser's group count and duplicate-name check, and the walks of
-the AST in `compiler.Bound` and in sizing a program.
+every 1,024 nodes it walks, in bounding the pattern (`compiler.Bound`, or
+`BoundContext` alone), in counting it exactly when Bound could not, and in
+compiling it (where a quantifier's body counts once per copy), and every
+1,024 strings it evaluates in a class set; it polls once more just before it
+allocates the program, its largest allocation, so a compile whose context
+ended while the program was being sized allocates none. The analysis in
+`vm.NewProgram` polls every 1,024 instructions of each of its passes. The
+parser's quick linear passes, its group count and duplicate-name check, are
+not polled.
 
 Matching polls `vm.VM.Context` about every `vm.PollSteps` steps, but never in
 the step loop itself, whose code is unchanged by it: a call there, even on a
@@ -345,7 +349,15 @@ a slice each, which allocated about five times their size.
 
 `ecma262.WithBudget` puts these together: a pattern is refused before parsing
 if `AllocBound` exceeds the byte budget, and before compiling if `Bound` puts
-its instruction count or its `MemoryFootprint` over the budget.
+its instruction count or its `MemoryFootprint` over the budget. It compiles
+with `compiler.CompileLimited`, whose walk adds up the cost from the root
+down, each node's code times the copies it is emitted in, so that the cost
+so far is known at every node: it refuses as soon as that passes the
+budget, so refusing a pattern costs only the part of it that fits, and the
+cost of one that fits is computed once. (While walking it compares bytes by
+a cheap lower bound, `vm.MinBytesPerInstruction` per instruction, and
+decides by `vm.FootprintBound` at the end.) `compiler.CompileChecked`
+instead shows a caller the whole cost to decide on.
 `TestBudgetBoundsCompileAllocation` checks that a compile within a byte
 budget allocates, garbage included, at most three times it.
 

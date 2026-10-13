@@ -1,13 +1,16 @@
 package ecma262_test
 
 import (
+	"context"
 	"errors"
 	"math/rand"
 	"strings"
 	"testing"
 
 	"github.com/mgilbir/goecma262"
+	"github.com/mgilbir/goecma262/compiler"
 	"github.com/mgilbir/goecma262/flags"
+	"github.com/mgilbir/goecma262/parser"
 )
 
 func compileBudget(p, fl string, instructions int, bytes int64) (*ecma262.Regexp, error) {
@@ -145,4 +148,108 @@ func TestBudgetBoundsCompileAllocation(t *testing.T) {
 		check(p, "v")
 	}
 	t.Logf("at most %.2f times the budget", worst)
+}
+
+// CompileChecked shows its check the cost Bound reports, once, before any
+// code is emitted, and returns the check's refusal as it is.
+func TestCompileCheckedChecksTheCostOnce(t *testing.T) {
+	for _, p := range []string{`a`, `(a{1000}){190}`, `[\q{ab|cd}]{3}`, `(?<=\p{RGI_Emoji})x`, `(a{1000}){1000}`} {
+		ast, err := parser.New(p, parser.Flags{UnicodeSets: true}).Parse()
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, err := compiler.Bound(ast)
+		if err != nil {
+			t.Fatal(err)
+		}
+		calls := 0
+		var got compiler.Cost
+		_, _, err = compiler.CompileChecked(context.Background(), ast, func(c compiler.Cost) error {
+			calls++
+			got = c
+			return nil
+		})
+		if calls != 1 || got != want {
+			t.Errorf("%s: check called %d times with %+v; want once with %+v", p, calls, got, want)
+		}
+		if want.Instructions <= compiler.MaxProgramSize && err != nil {
+			t.Errorf("%s: %v", p, err)
+		}
+
+		refusal := errors.New("refused")
+		var cerr error
+		allocated := allocatedBy(func() {
+			_, _, cerr = compiler.CompileChecked(context.Background(), ast, func(compiler.Cost) error { return refusal })
+		})
+		// The refusal comes first, even for a pattern over MaxProgramSize,
+		// and before the program is allocated.
+		if cerr != refusal {
+			t.Errorf("%s: error %v, want the check's", p, cerr)
+		}
+		if allocated > 16<<10 {
+			t.Errorf("%s: a refused compile allocated %d bytes", p, allocated)
+		}
+	}
+}
+
+// CompileLimited refuses as soon as the cost passes its limits: here the
+// walk stops in the first quantifier, and never reaches the one past the
+// repeat limit, which a walk of the whole pattern would report first.
+func TestCompileLimitedStopsEarly(t *testing.T) {
+	pattern := `(?:a{1000}){5}` + strings.Repeat(`(?:x|y)`, 10_000) + `a{10001}`
+	ast, err := parser.New(pattern, parser.Flags{}).Parse()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, lim := range []compiler.Limits{{Instructions: 2000}, {Bytes: 256 << 10}} {
+		_, _, err := compiler.CompileLimited(context.Background(), ast, lim)
+		if !errors.Is(err, compiler.ErrBudgetExceeded) || !errors.Is(err, compiler.ErrLimit) {
+			t.Errorf("%+v: error %v, want ErrBudgetExceeded", lim, err)
+		}
+	}
+	// Without limits, the walk reaches it.
+	if _, _, err := compiler.CompileLimited(context.Background(), ast, compiler.Limits{}); !errors.Is(err, compiler.ErrQuantifierTooLarge) {
+		t.Errorf("without limits: error %v, want ErrQuantifierTooLarge", err)
+	}
+}
+
+// CompileLimited accepts a pattern exactly when Bound puts its cost within
+// the limits: its early refusals are never premature.
+func TestCompileLimitedAcceptsExactlyWithinLimits(t *testing.T) {
+	checked := 0
+	seen := map[[2]string]bool{}
+	for _, tc := range test262GeneratedCases {
+		k := [2]string{tc.pattern, tc.flags}
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		ast, err := parser.New(tc.pattern, parserFlags(tc.flags)).Parse()
+		if err != nil {
+			continue
+		}
+		cost, err := compiler.Bound(ast)
+		if err != nil || cost.Instructions > compiler.MaxProgramSize {
+			continue
+		}
+		for _, lim := range []compiler.Limits{
+			{Instructions: cost.Instructions}, {Bytes: cost.Bytes}, {Instructions: cost.Instructions, Bytes: cost.Bytes},
+		} {
+			if _, _, err := compiler.CompileLimited(context.Background(), ast, lim); err != nil {
+				t.Fatalf("/%s/%s within %+v (cost %+v): %v", tc.pattern, tc.flags, lim, cost, err)
+			}
+		}
+		for _, lim := range []compiler.Limits{{Instructions: cost.Instructions - 1}, {Bytes: cost.Bytes - 1}} {
+			if lim.Instructions == 0 && lim.Bytes == 0 {
+				continue // a limit of 0 is no limit
+			}
+			if _, _, err := compiler.CompileLimited(context.Background(), ast, lim); !errors.Is(err, compiler.ErrBudgetExceeded) {
+				t.Fatalf("/%s/%s over %+v (cost %+v): error %v", tc.pattern, tc.flags, lim, cost, err)
+			}
+		}
+		checked++
+	}
+	if checked < 1000 {
+		t.Fatalf("only %d patterns checked", checked)
+	}
 }
