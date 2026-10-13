@@ -82,6 +82,44 @@ func TestMemoryFootprintMatchesRetainedHeap(t *testing.T) {
 	}
 }
 
+// A small pattern's footprint is too close to the runtime's own allocations
+// to measure one compile against it, so this measures many copies at once:
+// an error of a few dozen bytes per copy then shows. Capture groups and loops
+// make programs with pointers over 512 bytes, which carry a malloc header.
+func TestMemoryFootprintOfSmallPatterns(t *testing.T) {
+	const copies = 2048
+	for _, pattern := range []string{
+		`a`, `\d`, `\w`, `(x)`, `(a)(b)(c)`, `\d+`, `[0-9]+`, `x(\d+)`, `a|b`,
+		`(a|b)+c`, `(?<n>x)\k<n>`, `[a-z]{50}`, `[a-z]{3,50}x(\d+)`,
+	} {
+		t.Run(pattern, func(t *testing.T) {
+			if _, err := ecma262.CompileFlags(pattern, ""); err != nil {
+				t.Fatal(err)
+			}
+			// The slice holding the copies is allocated before measuring.
+			res := make([]*ecma262.Regexp, copies)
+			_, heap := retained(func() any {
+				for i := range res {
+					res[i] = ecma262.MustCompile(strings.Clone(pattern), 0)
+				}
+				return nil
+			})
+			fp := res[0].MemoryFootprint()
+			t.Logf("footprint %d, retained %.1f per copy (%.3f)", fp, float64(heap)/copies, float64(fp*copies)/float64(heap))
+			// slack absorbs what the runtime itself allocates: 16 bytes a
+			// copy, where the malloc header alone was 128 for (x).
+			const slack = 32 << 10
+			if fp*copies < heap-slack {
+				t.Errorf("footprint %d under-counts the %.1f bytes retained per copy", fp, float64(heap)/copies)
+			}
+			if fp*copies > heap+heap/20+slack {
+				t.Errorf("footprint %d over-counts the %.1f bytes retained per copy by more than 5%%", fp, float64(heap)/copies)
+			}
+			runtime.KeepAlive(res)
+		})
+	}
+}
+
 func TestProgramSize(t *testing.T) {
 	cases := map[string]int{
 		`a`:      4, // save 0, char, save 0, match

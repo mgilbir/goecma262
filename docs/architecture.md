@@ -367,9 +367,11 @@ The instruction count does not bound memory by itself: an instruction may own
 data (class atoms, a class set's `vm.CharSet`, a trie node's `vm.RuneSwitch`).
 `vm.Program.Footprint` adds up what a program holds, counting an object
 several instructions share once and rounding each allocation as the Go
-allocator does (`internal/memsize`, checked against the running runtime);
+allocator does (`internal/memsize`, checked against the running runtime),
+including the 8-byte header an object with pointers carries above 512 bytes;
 `Regexp.MemoryFootprint` adds the `Regexp`'s own fields. A pointer-free object
 under 16 bytes is counted as the whole 16-byte block the runtime's tiny
 allocator may keep alive for it, so the figure is an upper bound;
-`TestMemoryFootprintMatchesRetainedHeap` checks it against the heap a
-compiled pattern retains.
+`TestMemoryFootprintMatchesRetainedHeap` checks it against the heap a large
+compiled pattern retains, and `TestMemoryFootprintOfSmallPatterns` against
+many copies of a small one.
