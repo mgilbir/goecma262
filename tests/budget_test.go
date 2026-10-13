@@ -191,3 +191,65 @@ func TestCompileCheckedChecksTheCostOnce(t *testing.T) {
 		}
 	}
 }
+
+// CompileLimited refuses as soon as the cost passes its limits: here the
+// walk stops in the first quantifier, and never reaches the one past the
+// repeat limit, which a walk of the whole pattern would report first.
+func TestCompileLimitedStopsEarly(t *testing.T) {
+	pattern := `(?:a{1000}){5}` + strings.Repeat(`(?:x|y)`, 10_000) + `a{10001}`
+	ast, err := parser.New(pattern, parser.Flags{}).Parse()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, lim := range []compiler.Limits{{Instructions: 2000}, {Bytes: 256 << 10}} {
+		_, _, err := compiler.CompileLimited(context.Background(), ast, lim)
+		if !errors.Is(err, compiler.ErrBudgetExceeded) || !errors.Is(err, compiler.ErrLimit) {
+			t.Errorf("%+v: error %v, want ErrBudgetExceeded", lim, err)
+		}
+	}
+	// Without limits, the walk reaches it.
+	if _, _, err := compiler.CompileLimited(context.Background(), ast, compiler.Limits{}); !errors.Is(err, compiler.ErrQuantifierTooLarge) {
+		t.Errorf("without limits: error %v, want ErrQuantifierTooLarge", err)
+	}
+}
+
+// CompileLimited accepts a pattern exactly when Bound puts its cost within
+// the limits: its early refusals are never premature.
+func TestCompileLimitedAcceptsExactlyWithinLimits(t *testing.T) {
+	checked := 0
+	seen := map[[2]string]bool{}
+	for _, tc := range test262GeneratedCases {
+		k := [2]string{tc.pattern, tc.flags}
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		ast, err := parser.New(tc.pattern, parserFlags(tc.flags)).Parse()
+		if err != nil {
+			continue
+		}
+		cost, err := compiler.Bound(ast)
+		if err != nil || cost.Instructions > compiler.MaxProgramSize {
+			continue
+		}
+		for _, lim := range []compiler.Limits{
+			{Instructions: cost.Instructions}, {Bytes: cost.Bytes}, {Instructions: cost.Instructions, Bytes: cost.Bytes},
+		} {
+			if _, _, err := compiler.CompileLimited(context.Background(), ast, lim); err != nil {
+				t.Fatalf("/%s/%s within %+v (cost %+v): %v", tc.pattern, tc.flags, lim, cost, err)
+			}
+		}
+		for _, lim := range []compiler.Limits{{Instructions: cost.Instructions - 1}, {Bytes: cost.Bytes - 1}} {
+			if lim.Instructions == 0 && lim.Bytes == 0 {
+				continue // a limit of 0 is no limit
+			}
+			if _, _, err := compiler.CompileLimited(context.Background(), ast, lim); !errors.Is(err, compiler.ErrBudgetExceeded) {
+				t.Fatalf("/%s/%s over %+v (cost %+v): error %v", tc.pattern, tc.flags, lim, cost, err)
+			}
+		}
+		checked++
+	}
+	if checked < 1000 {
+		t.Fatalf("only %d patterns checked", checked)
+	}
+}

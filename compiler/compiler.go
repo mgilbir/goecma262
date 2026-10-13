@@ -130,16 +130,33 @@ func CompileContext(ctx context.Context, pattern *parser.Pattern) ([]vm.Instruct
 
 // CompileChecked is CompileContext, but first passes the pattern's cost, as
 // Bound reports it, to check, and if check returns an error returns that
-// error without compiling. It lets a caller refuse a pattern over a budget of
-// its own before the cost is paid, without computing the cost twice. A nil
-// check accepts every cost. check is called once, before any code is
+// error without compiling. It lets a caller decide on the whole cost, without
+// computing it twice; CompileLimited instead stops working out the cost once
+// it is over given limits. A nil check accepts every cost. check is called once, before any code is
 // emitted, and before the pattern is compared with MaxProgramSize, so its
 // refusal takes precedence.
 func CompileChecked(ctx context.Context, pattern *parser.Pattern, check func(Cost) error) ([]vm.Instruction, int, error) {
+	return compile(ctx, pattern, nil, check)
+}
+
+// CompileLimited is CompileContext, but refuses a pattern whose cost Bound
+// puts over lim, with an error wrapping ErrBudgetExceeded, before emitting
+// any code. It refuses as soon as the walk that bounds the cost passes lim,
+// so refusing a pattern costs only the part of it that fits. Like Bound, it
+// counts a v-mode class whose strings Bound bounds rather than counts at
+// that bound, so such a pattern may be refused near lim although it would
+// fit. A Limits field of 0 or less leaves that part unbounded.
+func CompileLimited(ctx context.Context, pattern *parser.Pattern, lim Limits) ([]vm.Instruction, int, error) {
+	return compile(ctx, pattern, &lim, nil)
+}
+
+// compile is CompileLimited with lim, if not nil, then CompileChecked with
+// check, if not nil.
+func compile(ctx context.Context, pattern *parser.Pattern, lim *Limits, check func(Cost) error) ([]vm.Instruction, int, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, 0, fmt.Errorf("compiling interrupted: %w", err)
 	}
-	cost, err := Bound(pattern)
+	cost, err := bound(pattern, lim)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -167,15 +184,18 @@ func CompileChecked(ctx context.Context, pattern *parser.Pattern, check func(Cos
 		// far over (a subtraction may remove them all). Compiling evaluates
 		// the sets anyway, so do it first and count their tries exactly; the
 		// code then reuses them.
-		exact, err := (&bounder{c: c, ignoreCase: c.ignoreCase, unicodeSets: c.unicodeSets, exact: true}).node(pattern.Body)
-		if err != nil {
+		b := &bounder{c: c, ignoreCase: c.ignoreCase, unicodeSets: c.unicodeSets, exact: true, mult: 1}
+		if err := b.add(emits(3, 0)); err != nil { // group 0's saves and the match
+			return nil, 0, err
+		}
+		if err := b.node(pattern.Body); err != nil {
 			return nil, 0, err
 		}
 		c.ignoreCase = pattern.Flags.IgnoreCase
-		if exact.instructions+3 > MaxProgramSize {
+		if b.total.instructions > MaxProgramSize {
 			return nil, 0, errProgramTooLarge()
 		}
-		n = int(exact.instructions + 3)
+		n = int(b.total.instructions)
 	}
 	c.code = make([]vm.Instruction, 0, n)
 

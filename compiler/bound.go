@@ -37,21 +37,35 @@ type Cost struct {
 // Compile refuses a pattern whose exact size is over it before emitting
 // anything.
 func Bound(pattern *parser.Pattern) (Cost, error) {
+	return bound(pattern, nil)
+}
+
+// bound is Bound, stopping with an error wrapping ErrBudgetExceeded as soon
+// as the cost is over lim, if lim is not nil.
+func bound(pattern *parser.Pattern, lim *Limits) (Cost, error) {
 	b := &bounder{
 		ignoreCase:  pattern.Flags.IgnoreCase,
 		unicodeSets: pattern.Flags.UnicodeSets,
 		exact:       true,
-	}
-	body, err := b.node(pattern.Body)
-	if err != nil {
-		return Cost{}, err
+		mult:        1,
+		lim:         lim,
 	}
 	// Group 0's saves and the final match.
-	n := memsize.Add(body.instructions, 3)
-	owned := memsize.Add(b.shared, body.owned)
+	if err := b.add(emits(3, 0)); err != nil {
+		return Cost{}, err
+	}
+	if err := b.node(pattern.Body); err != nil {
+		return Cost{}, err
+	}
+	if b.lim != nil {
+		if err := b.checkLimits(true); err != nil {
+			return Cost{}, err
+		}
+	}
+	n := b.total.instructions
 	cost := Cost{
 		Instructions: int(min(n, int64(maxInt))),
-		Bytes:        vm.FootprintBound(n, body.splits, owned),
+		Bytes:        b.bytes(),
 		Exact:        b.exact,
 	}
 	return cost, nil
@@ -59,18 +73,42 @@ func Bound(pattern *parser.Pattern) (Cost, error) {
 
 const maxInt = int(^uint(0) >> 1)
 
-// bounder walks an AST as Compile does, but visits a quantifier's body once
-// and multiplies, where Compile emits it once per copy.
+// Limits bounds what a compile may cost (see CompileLimited). A field of 0 or
+// less leaves that part to the library's own limits.
+type Limits struct {
+	// Instructions is the most instructions the program may have.
+	Instructions int
+	// Bytes is the most memory the program may hold: the Footprint of the
+	// vm.Program built from it.
+	Bytes int64
+}
+
+// ErrBudgetExceeded is wrapped by the error for a pattern that would cost
+// more than the Limits given to CompileLimited. It wraps ErrLimit.
+var ErrBudgetExceeded error = &limitError{msg: "pattern exceeds its budget"}
+
+// bounder walks an AST as Compile does, adding up what each node emits times
+// the copies it is emitted in, so that the cost so far is known at every
+// node: Compile emits a quantifier's body once per copy, where the bounder
+// visits it once.
 type bounder struct {
 	depth int
 	// ignoreCase is the i flag in effect, which a modifier group changes,
 	// and backward is whether the code is emitted for a lookbehind body.
 	ignoreCase, backward, unicodeSets bool
 	exact                             bool
-	// shared adds up the data the copies of a node share (see the Compiler's
-	// memo fields): it is counted once, however many copies there are.
+	// mult is the number of copies of the code being walked: the product of
+	// the copies of the quantifiers around it.
+	mult int64
+	// total is the program's cost so far, and shared the data the copies
+	// of a node share (see the Compiler's memo fields), counted once
+	// however many copies there are.
+	total   size
 	shared  int64
 	altSeen map[*int]bool // the group lists of backreferences counted
+	// lim, if set, stops the walk once the cost so far is over it, which
+	// the whole cost can only exceed further.
+	lim *Limits
 
 	// c, if set, is the compiler about to compile the pattern. The bounder
 	// then counts exactly, evaluating class sets through c, which keeps them
@@ -78,7 +116,7 @@ type bounder struct {
 	c *Compiler
 }
 
-// size is the cost of one copy of a node's code.
+// size is the cost of some code.
 type size struct {
 	instructions, splits int64
 	owned                int64 // data each copy owns: rune switches, \P{…} under v
@@ -96,12 +134,56 @@ func (s size) times(n int64) size {
 // OpSplit.
 func emits(n, splits int64) size { return size{instructions: n, splits: splits} }
 
-func (b *bounder) share(bytes int64) { b.shared = memsize.Add(b.shared, bytes) }
+// add adds code emitted once in each copy of the code being walked.
+func (b *bounder) add(s size) error {
+	b.total = b.total.plus(s.times(b.mult))
+	if b.lim == nil {
+		return nil
+	}
+	return b.checkLimits(false)
+}
 
-func (b *bounder) node(node parser.Node) (size, error) {
+// share adds data every copy shares.
+func (b *bounder) share(bytes int64) error {
+	b.shared = memsize.Add(b.shared, bytes)
+	if b.lim == nil {
+		return nil
+	}
+	return b.checkLimits(false)
+}
+
+// bytes bounds what the program walked so far holds.
+func (b *bounder) bytes() int64 {
+	return vm.FootprintBound(b.total.instructions, b.total.splits, memsize.Add(b.shared, b.total.owned))
+}
+
+// checkLimits reports whether the cost so far is over lim. Before the walk
+// is done it compares bytes by a lower bound of the program's, cheaper than
+// vm.FootprintBound (each allocation unrounded, and only what grows with the
+// instructions and their data), which the program can only exceed: so it
+// never refuses early what would fit, and the exact comparison, once done,
+// decides.
+func (b *bounder) checkLimits(done bool) error {
+	if b.lim.Instructions > 0 && b.total.instructions > int64(b.lim.Instructions) {
+		return fmt.Errorf("%w: compiles to more than the %d instructions allowed", ErrBudgetExceeded, b.lim.Instructions)
+	}
+	if b.lim.Bytes <= 0 {
+		return nil
+	}
+	held := memsize.Add(memsize.Add(memsize.Mul(b.total.instructions, vm.MinBytesPerInstruction), b.total.owned), b.shared)
+	if done {
+		held = b.bytes()
+	}
+	if held > b.lim.Bytes {
+		return fmt.Errorf("%w: may hold more than the %d bytes allowed once compiled", ErrBudgetExceeded, b.lim.Bytes)
+	}
+	return nil
+}
+
+func (b *bounder) node(node parser.Node) error {
 	b.depth++
 	if b.depth > MaxNestingDepth {
-		return size{}, limitf(ErrNestingTooDeep, "pattern too deeply nested (limit: %d)", MaxNestingDepth)
+		return limitf(ErrNestingTooDeep, "pattern too deeply nested (limit: %d)", MaxNestingDepth)
 	}
 	defer func() { b.depth-- }()
 
@@ -109,40 +191,41 @@ func (b *bounder) node(node parser.Node) (size, error) {
 	case *parser.Disjunction:
 		// A split and a jump for every alternative but the last.
 		k := int64(len(n.Alternatives))
-		s := emits(2*(k-1), k-1)
+		if err := b.add(emits(2*(k-1), k-1)); err != nil {
+			return err
+		}
 		for _, alt := range n.Alternatives {
-			as, err := b.node(alt)
-			if err != nil {
-				return size{}, err
+			if err := b.node(alt); err != nil {
+				return err
 			}
-			s = s.plus(as)
 		}
-		return s, nil
+		return nil
 	case *parser.Sequence:
-		var s size
 		for _, el := range n.Elements {
-			es, err := b.node(el)
-			if err != nil {
-				return size{}, err
+			if err := b.node(el); err != nil {
+				return err
 			}
-			s = s.plus(es)
 		}
-		return s, nil
+		return nil
 	case *parser.Literal, *parser.Dot, *parser.Anchor,
 		*parser.WordChar, *parser.NonWordChar, *parser.Digit, *parser.NonDigit,
 		*parser.Whitespace, *parser.NonWhitespace:
-		return emits(1, 0), nil
+		return b.add(emits(1, 0))
 	case *parser.CharacterClass:
 		// The atoms, shared by every copy.
-		b.share(memsize.Round(memsize.Mul(int64(len(n.Atoms)), int64(unsafe.Sizeof(vm.ClassAtom{})))))
+		if err := b.share(memsize.Round(memsize.Mul(int64(len(n.Atoms)), int64(unsafe.Sizeof(vm.ClassAtom{}))))); err != nil {
+			return err
+		}
 		for _, a := range n.Atoms {
 			if e, ok := a.(*parser.ClassEscape); ok {
-				b.share(memsize.RoundNoScan(int64(len(e.Property))))
+				if err := b.share(memsize.RoundNoScan(int64(len(e.Property)))); err != nil {
+					return err
+				}
 			}
 		}
-		return emits(1, 0), nil
+		return b.add(emits(1, 0))
 	case *parser.ClassSetExpression:
-		return b.classSet(n), nil
+		return b.classSet(n)
 	case *parser.Quantifier:
 		return b.quantifier(n)
 	case *parser.Group:
@@ -159,9 +242,9 @@ func (b *bounder) node(node parser.Node) (size, error) {
 		if n.Remove&parser.ModIgnoreCase != 0 {
 			b.ignoreCase = false
 		}
-		s, err := b.node(n.Body)
+		err := b.node(n.Body)
 		b.ignoreCase = ic
-		return s, err
+		return err
 	case *parser.Lookahead:
 		return b.lookaround(n.Body, false)
 	case *parser.NegativeLookahead:
@@ -172,7 +255,7 @@ func (b *bounder) node(node parser.Node) (size, error) {
 		return b.lookaround(n.Body, true)
 	case *parser.Backreference:
 		if n.Fallback != nil {
-			return emits(int64(len(n.Fallback)), 0), nil
+			return b.add(emits(int64(len(n.Fallback)), 0))
 		}
 		// The parser gives every reference to a name the same list.
 		if alt := unsafe.SliceData(n.AltIndices); alt != nil && !b.altSeen[alt] {
@@ -180,58 +263,58 @@ func (b *bounder) node(node parser.Node) (size, error) {
 				b.altSeen = make(map[*int]bool)
 			}
 			b.altSeen[alt] = true
-			b.share(memsize.RoundNoScan(memsize.Mul(int64(cap(n.AltIndices)), int64(unsafe.Sizeof(int(0))))))
+			if err := b.share(memsize.RoundNoScan(memsize.Mul(int64(cap(n.AltIndices)), int64(unsafe.Sizeof(int(0)))))); err != nil {
+				return err
+			}
 		}
-		return emits(1, 0), nil
+		return b.add(emits(1, 0))
 	case *parser.UnicodeProperty:
-		b.share(memsize.RoundNoScan(int64(len(n.Property))))
+		if err := b.share(memsize.RoundNoScan(int64(len(n.Property)))); err != nil {
+			return err
+		}
 		s := emits(1, 0)
 		if n.Negated && b.unicodeSets {
 			// A class set of its own, built for each copy.
 			s.owned = memsize.Round(int64(unsafe.Sizeof(vm.CharSet{})))
 		}
-		return s, nil
+		return b.add(s)
 	}
-	return size{}, fmt.Errorf("unknown node type: %T", node)
+	return fmt.Errorf("unknown node type: %T", node)
 }
 
-// wrapped is the size of body plus extra instructions around it.
-func (b *bounder) wrapped(body parser.Expression, extra int64) (size, error) {
-	s, err := b.node(body)
-	if err != nil {
-		return size{}, err
+// wrapped walks body with extra instructions around it.
+func (b *bounder) wrapped(body parser.Expression, extra int64) error {
+	if err := b.add(emits(extra, 0)); err != nil {
+		return err
 	}
-	return s.plus(emits(extra, 0)), nil
+	return b.node(body)
 }
 
-// lookaround is the size of a lookaround: its body between a jump and the
-// lookaround instruction.
-func (b *bounder) lookaround(body parser.Expression, behind bool) (size, error) {
+// lookaround walks a lookaround: its body between a jump and the lookaround
+// instruction.
+func (b *bounder) lookaround(body parser.Expression, behind bool) error {
 	if behind && b.c != nil {
 		// What the compiler compiles, so that it finds the sets evaluated.
 		body = b.c.reverseBody(body)
 	}
 	back := b.backward
 	b.backward = behind
-	s, err := b.wrapped(body, 2)
+	err := b.wrapped(body, 2)
 	b.backward = back
-	return s, err
+	return err
 }
 
-// quantifier mirrors compileQuantifier.
-func (b *bounder) quantifier(q *parser.Quantifier) (size, error) {
+// quantifier mirrors compileQuantifier: what it emits around the copies of
+// its body, and the body, walked once for all of its copies.
+func (b *bounder) quantifier(q *parser.Quantifier) error {
 	if q.Min > MaxQuantifierRepeat {
-		return size{}, limitf(ErrQuantifierTooLarge, "quantifier minimum %d exceeds limit %d", q.Min, MaxQuantifierRepeat)
+		return limitf(ErrQuantifierTooLarge, "quantifier minimum %d exceeds limit %d", q.Min, MaxQuantifierRepeat)
 	}
 	if q.Max > MaxQuantifierRepeat {
-		return size{}, limitf(ErrQuantifierTooLarge, "quantifier maximum %d exceeds limit %d", q.Max, MaxQuantifierRepeat)
+		return limitf(ErrQuantifierTooLarge, "quantifier maximum %d exceeds limit %d", q.Max, MaxQuantifierRepeat)
 	}
 	if q.Max == 0 {
-		return size{}, nil
-	}
-	body, err := b.node(q.Body)
-	if err != nil {
-		return size{}, err
+		return nil
 	}
 	var reset, checks int64
 	if _, _, has := groupIndexRange(q.Body); has {
@@ -240,42 +323,54 @@ func (b *bounder) quantifier(q *parser.Quantifier) (size, error) {
 	if canMatchEmpty(q.Body) {
 		checks = 2 // a mark and a progress check
 	}
-	// An unbounded tail (and +): a split, the checks, the reset, the body
-	// and a jump.
-	loop := body.plus(emits(2+checks+reset, 1))
-	if q.Min == 0 && q.Max == -1 || q.Min == 1 && q.Max == -1 {
-		return loop, nil
+	// An unbounded tail (and +) is one copy with a split, the checks, the
+	// reset and a jump.
+	copies, around := int64(1), emits(2+checks+reset, 1)
+	if !(q.Min == 0 && q.Max == -1 || q.Min == 1 && q.Max == -1) {
+		lo, hi := int64(q.Min), int64(q.Max)
+		around = size{}
+		if lo > 0 {
+			// The mandatory copies, with a reset before each after the
+			// first.
+			around = emits(memsize.Mul(lo-1, reset), 0)
+		}
+		if q.Max == -1 {
+			copies, around = lo+1, around.plus(emits(2+checks+reset, 1))
+		} else {
+			// The optional copies, each with a split, the checks and the
+			// reset.
+			copies, around = hi, around.plus(emits(1+checks+reset, 1).times(hi-lo))
+		}
 	}
-	lo, hi := int64(q.Min), int64(q.Max)
-	var s size
-	if lo > 0 {
-		// The mandatory copies, with a reset before each after the first.
-		s = body.times(lo).plus(emits(memsize.Mul(lo-1, reset), 0))
+	if err := b.add(around); err != nil {
+		return err
 	}
-	if q.Max == -1 {
-		return s.plus(loop), nil
-	}
-	// The optional copies: a split, the checks, the reset and the body.
-	return s.plus(body.plus(emits(1+checks+reset, 1)).times(hi - lo)), nil
+	mult := b.mult
+	b.mult = memsize.Mul(mult, copies)
+	err := b.node(q.Body)
+	b.mult = mult
+	return err
 }
 
-// classSet mirrors compileClassSet: the instructions of one copy, which owns
+// classSet mirrors compileClassSet: the instructions of each copy, which owns
 // its trie's rune switches, while the evaluated set is shared.
-func (b *bounder) classSet(e *parser.ClassSetExpression) size {
+func (b *bounder) classSet(e *parser.ClassSetExpression) error {
 	var t trieSize
 	if b.c != nil {
 		b.c.ignoreCase = b.ignoreCase
 		v := b.c.setValue(e)
 		if len(v.strings) == 0 {
-			return emits(1, 0)
+			return b.add(emits(1, 0))
 		}
 		t = measureTrie(v.trie)
 	} else {
 		strs, chars, _ := b.setNode(e)
-		b.share(chars)
+		if err := b.share(chars); err != nil {
+			return err
+		}
 		switch strs.kind {
 		case noStrings:
-			return emits(1, 0)
+			return b.add(emits(1, 0))
 		case oneTable:
 			t = tableStats(strs.table).trie
 		default:
@@ -292,11 +387,11 @@ func (b *bounder) classSet(e *parser.ClassSetExpression) size {
 	if t.empty {
 		alts++
 	}
-	return size{
+	return b.add(size{
 		instructions: memsize.Add(t.instructions, 1+2*(alts-1)),
 		splits:       memsize.Add(t.splits, alts-1),
 		owned:        t.switchBytes,
-	}
+	})
 }
 
 // stringsBound describes the strings, other than single characters, that a

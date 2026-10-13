@@ -175,3 +175,17 @@ func TestDirectionsAreTheInnermostLookaround(t *testing.T) {
 		}
 	}
 }
+
+// MinBytesPerInstruction is a lower bound of FootprintBound, as its users
+// rely on.
+func TestMinBytesPerInstructionIsALowerBound(t *testing.T) {
+	rng := rand.New(rand.NewSource(9))
+	for i := 0; i < 100_000; i++ {
+		n := rng.Int63n(1 << uint(rng.Intn(30)))
+		splits := rng.Int63n(n + 1)
+		owned := rng.Int63n(1 << uint(rng.Intn(30)))
+		if got, min := FootprintBound(n, splits, owned), n*MinBytesPerInstruction+owned; got < min {
+			t.Fatalf("FootprintBound(%d, %d, %d) = %d, under %d", n, splits, owned, got, min)
+		}
+	}
+}

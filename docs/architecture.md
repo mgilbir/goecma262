@@ -346,8 +346,14 @@ a slice each, which allocated about five times their size.
 `ecma262.WithBudget` puts these together: a pattern is refused before parsing
 if `AllocBound` exceeds the byte budget, and before compiling if `Bound` puts
 its instruction count or its `MemoryFootprint` over the budget. It compiles
-with `compiler.CompileChecked`, which shows the budget the cost it computes
-anyway before emitting anything, so the cost is computed once.
+with `compiler.CompileLimited`, whose walk adds up the cost from the root
+down, each node's code times the copies it is emitted in, so that the cost
+so far is known at every node: it refuses as soon as that passes the
+budget, so refusing a pattern costs only the part of it that fits, and the
+cost of one that fits is computed once. (While walking it compares bytes by
+a cheap lower bound, `vm.MinBytesPerInstruction` per instruction, and
+decides by `vm.FootprintBound` at the end.) `compiler.CompileChecked`
+instead shows a caller the whole cost to decide on.
 `TestBudgetBoundsCompileAllocation` checks that a compile within a byte
 budget allocates, garbage included, at most three times it.
 
