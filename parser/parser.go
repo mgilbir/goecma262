@@ -202,8 +202,10 @@ func (p *Parser) ParseContext(ctx context.Context) (pat *Pattern, err error) {
 		}
 	}
 	if p.hasNamedGroups {
-		if _, err := p.pathNames(body); err != nil {
-			return nil, err
+		var dup dupName
+		p.pathNames(body, &dup)
+		if dup.index != 0 {
+			return nil, fmt.Errorf("duplicate group name: %s", dup.name)
 		}
 	}
 
@@ -1503,95 +1505,114 @@ func isClassSetReservedDoublePunctuator(r rune) bool {
 
 // ------------------------------------------------------------- validation
 
-type nameSet map[string]struct{}
+// nameSet maps each capture-group name reachable along a match path to the
+// lowest group number (source order of the opening parenthesis) carrying it.
+type nameSet map[string]int
+
+// dupName records the duplicate group name to report. ES2025 forbids a name
+// twice on one match path, and a pattern can hold several such duplicates;
+// which one is reported must not depend on the order a traversal or a Go map
+// happens to visit them in. The rule is: the name of the group that is
+// defined a second time earliest in the source, i.e. the lowest group number
+// that has the same name as a group before it on the same path. For
+// (?<A0>)(?<A>)(((?<A0>)(?<A>))0) that is A0. (V8 reports no name.)
+type dupName struct {
+	name  string
+	index int // group number of the later definition; 0 if none yet
+}
+
+func (d *dupName) note(name string, index int) {
+	if d.index == 0 || index < d.index {
+		d.name, d.index = name, index
+	}
+}
 
 // pathNames returns the set of capture-group names reachable along a single
-// match path through node, rejecting any name that can appear twice on the same
-// path (ES2022 permits duplicate names only across different alternatives of a
-// disjunction). It runs in linear time: a Disjunction unions its alternatives'
-// name sets without conflict, while a Sequence errors if two elements share a
-// name. (Materializing the cartesian product of all alternatives instead is
+// match path through node, noting in dup every name that can appear twice on
+// the same path (ES2022 permits duplicate names only across different
+// alternatives of a disjunction). It does not stop at the first duplicate,
+// so that dup ends up holding the earliest one in the source. It runs in
+// linear time: a Disjunction unions its alternatives' name sets without
+// conflict, while a Sequence notes the names two elements share.
+// (Materializing the cartesian product of all alternatives instead is
 // exponential — e.g. 30 nested (a|b) groups.) A subtree without names yields
 // nil, so only named groups cost an allocation, and a set returned to a
 // caller belongs to it: merging grows the larger of two sets.
-func (p *Parser) pathNames(node Expression) (nameSet, error) {
+func (p *Parser) pathNames(node Expression, dup *dupName) nameSet {
 	switch n := node.(type) {
 	case *Disjunction:
 		var result nameSet
 		for _, alt := range n.Alternatives {
-			s, err := p.pathNames(alt)
-			if err != nil {
-				return nil, err
-			}
 			// Names in different alternatives may coincide; just union them.
-			result, _ = mergeNames(result, s, false)
+			result = mergeNames(result, p.pathNames(alt, dup), nil)
 		}
-		return result, nil
+		return result
 	case *Sequence:
 		var result nameSet
 		for _, elem := range n.Elements {
-			s, err := p.pathNames(elem)
-			if err != nil {
-				return nil, err
-			}
-			var dup string
-			if result, dup = mergeNames(result, s, true); dup != "" {
-				return nil, fmt.Errorf("duplicate group name: %s", dup)
-			}
+			result = mergeNames(result, p.pathNames(elem, dup), dup)
 		}
-		return result, nil
+		return result
 	case *Group:
-		return p.pathNames(n.Body)
+		return p.pathNames(n.Body, dup)
 	case *NamedGroup:
-		bodyNames, err := p.pathNames(n.Body)
-		if err != nil {
-			return nil, err
-		}
-		if _, dup := bodyNames[n.Name]; dup {
-			return nil, fmt.Errorf("duplicate group name: %s", n.Name)
+		bodyNames := p.pathNames(n.Body, dup)
+		if inner, clash := bodyNames[n.Name]; clash {
+			// The group encloses another of the same name; the inner one,
+			// opened later, is the second definition.
+			dup.note(n.Name, inner)
 		}
 		if bodyNames == nil {
 			bodyNames = nameSet{}
 		}
-		bodyNames[n.Name] = struct{}{}
-		return bodyNames, nil
+		bodyNames[n.Name] = n.Index // lower than any group in the body
+		return bodyNames
 	case *NonCapturingGroup:
-		return p.pathNames(n.Body)
+		return p.pathNames(n.Body, dup)
 	case *ModifierGroup:
 		// Transparent to naming: names inside collide with names outside.
-		return p.pathNames(n.Body)
+		return p.pathNames(n.Body, dup)
 	case *Lookahead:
-		return p.pathNames(n.Body)
+		return p.pathNames(n.Body, dup)
 	case *NegativeLookahead:
-		return p.pathNames(n.Body)
+		return p.pathNames(n.Body, dup)
 	case *Lookbehind:
-		return p.pathNames(n.Body)
+		return p.pathNames(n.Body, dup)
 	case *NegativeLookbehind:
-		return p.pathNames(n.Body)
+		return p.pathNames(n.Body, dup)
 	case *Quantifier:
-		return p.pathNames(n.Body)
+		return p.pathNames(n.Body, dup)
 	default:
-		return nil, nil
+		return nil
 	}
 }
 
-// mergeNames returns the union of a and b, which it may build in either. With
-// checkDup it instead stops at a name in both, returning it.
-func mergeNames(a, b nameSet, checkDup bool) (nameSet, string) {
-	if len(a) < len(b) {
-		a, b = b, a
+// mergeNames returns the union of earlier and later, which it may build in
+// either, keeping the lowest group number of each name. With dup non-nil it
+// notes, for each name in both, the lowest group number the name has in
+// later: the earliest group of that name defined after one in earlier.
+func mergeNames(earlier, later nameSet, dup *dupName) nameSet {
+	small, large := later, earlier
+	smallIsEarlier := len(earlier) < len(later)
+	if smallIsEarlier {
+		small, large = earlier, later
 	}
-	if checkDup {
-		for k := range b {
-			if _, dup := a[k]; dup {
-				return a, k
+	for k, si := range small {
+		li, both := large[k]
+		if !both {
+			large[k] = si
+			continue
+		}
+		if dup != nil {
+			if smallIsEarlier {
+				dup.note(k, li)
+			} else {
+				dup.note(k, si)
 			}
 		}
+		large[k] = min(si, li)
 	}
-	for k := range b {
-		a[k] = struct{}{}
-	}
-	return a, ""
+	return large
 }
 
 // -------------------------------------------------------------- characters
