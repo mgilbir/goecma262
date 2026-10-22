@@ -39,7 +39,7 @@ func TestUnicodeVersion_NewCharacters(t *testing.T) {
 		{`\p{L}`, flags.Unicode, "\U00010D50", true},
 		{`\p{Script=Garay}`, flags.Unicode, "\U00010D50", true},
 		{`\P{Script=Garay}`, flags.Unicode, "\U00010D50", false},
-		// U+11DB0 TOLONG SIKI LETTER A (Unicode 16).
+		// U+11DB0 TOLONG SIKI LETTER I (Unicode 17).
 		{`\p{Script=Tolong_Siki}`, flags.Unicode, "\U00011DB0", true},
 	}
 	for _, tc := range cases {
