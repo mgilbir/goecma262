@@ -61,6 +61,7 @@ func TestDuplicateGroupNameReportIsDeterministic(t *testing.T) {
 		{"enclosing group", `(?<a>(?<b>)(?<a>)(?<b>))`, "a"},
 		{"quantified", `(?<a>x){2}(?<c>)(?<c>)(?<a>)`, "c"},
 		{"modifier group", `(?<m>)(?i:(?<n>)(?<n>))(?<m>)`, "n"},
+		{"earlier name kept when merging into a larger set", `(?<k>)(?<m>)(?:(?<k>)(?:(?<m>)(?<b>)(?<k>)))`, "k"},
 		{"many forward", manyFwd, wantFwd},
 		{"many reversed", manyRev, wantRev},
 	} {
