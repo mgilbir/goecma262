@@ -6,8 +6,11 @@ For how the engine works internally, see [docs/architecture.md](docs/architectur
 
 ## Development setup
 
-Go 1.23+ is all you need to build and test. Node.js (a recent version, no
-`npm install` required) is needed only if you regenerate the Test262 suite.
+Go 1.27+ is all you need to build and test. The minimum is not arbitrary: the
+library takes its case folding and its general category and script tables from
+Go's `unicode` package, which is Unicode 17.0 from Go 1.27 (Go 1.26 has
+Unicode 15), the version ES2025 engines such as V8 in node 24 ship. Node.js (a recent
+version, no `npm install` required) is needed only if you regenerate the Test262 suite.
 
 ```bash
 go build ./...

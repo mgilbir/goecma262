@@ -19,6 +19,11 @@ bounded by an execution budget that grows linearly with the input
 go get github.com/mgilbir/goecma262
 ```
 
+Requires Go 1.27 or later. The library takes its Unicode data (case folding,
+general categories, scripts) from Go's standard library, which is Unicode 17.0
+from Go 1.27, the version ES2025 engines such as V8 in node 24 ship. Older Go
+releases carry older Unicode and would give different results.
+
 ## Quick start
 
 ```go
